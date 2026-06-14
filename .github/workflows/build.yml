@@ -135,8 +135,10 @@ jobs:
       - name: Commit UPSTREAM_VLLM_VERSION = ${{ env.VLLM_TAG }}
         run: |
           echo "$VLLM_TAG" > UPSTREAM_VLLM_VERSION
-          git config user.name  "vllm-ampere-ci"
-          git config user.email "ci@users.noreply.github.com"
+          # canonical github-actions bot identity (id 41898282) so CI commits attribute to the bot,
+          # NOT to a random GitHub user who happens to own the ci@... noreply email.
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git diff --quiet UPSTREAM_VLLM_VERSION; then
             echo "marker already up to date"; exit 0
           fi
