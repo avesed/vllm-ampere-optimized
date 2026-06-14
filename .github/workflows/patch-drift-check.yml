@@ -1,0 +1,50 @@
+name: patch-drift-check
+
+# Early-warning canary, decoupled from a full build: every day (and on PRs that touch
+# patches/), check whether the patch series still applies to the LATEST upstream tag.
+# If it stopped applying, open a tracking issue so a human refreshes the diff.
+
+on:
+  schedule:
+    - cron: '30 5 * * *'
+  workflow_dispatch: {}
+  pull_request:
+    paths: ['patches/**']
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve latest upstream tag
+        id: up
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "tag=$(gh api repos/vllm-project/vllm/releases/latest --jq .tag_name)" >> "$GITHUB_OUTPUT"
+      - name: git apply --check against ${{ steps.up.outputs.tag }}
+        id: chk
+        run: |
+          git clone --depth 1 --branch "${{ steps.up.outputs.tag }}" https://github.com/vllm-project/vllm.git vllm
+          cd vllm
+          if git apply --check ../patches/*.patch; then
+            echo "patches apply cleanly to ${{ steps.up.outputs.tag }}"
+          else
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+      - name: Open drift issue
+        if: failure() && steps.chk.outputs.drift == 'true' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          TITLE="patch drift: series no longer applies to vLLM $TAG"
+          # avoid duplicate issues for the same tag
+          if [ -z "$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number')" ]; then
+            gh issue create --title "$TITLE" \
+              --body "The patch series in \`patches/\` failed \`git apply --check\` against upstream \`$TAG\`. Refresh per docs/PATCHING.md (clone the tag, run \`python patches/regenerate.py vllm\`, \`cd vllm && git diff > ../patches/0001-marlin-w4a8-int8-ampere.patch\`)."
+          fi

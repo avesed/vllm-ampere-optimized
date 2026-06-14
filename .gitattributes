@@ -1,0 +1,9 @@
+# Force LF for everything that runs on Linux CI — CRLF would break shebangs, YAML, patches.
+* text=auto eol=lf
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.py   text eol=lf
+*.hcl  text eol=lf
+*.patch text eol=lf
+LICENSE text eol=lf

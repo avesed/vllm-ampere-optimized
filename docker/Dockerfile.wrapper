@@ -1,0 +1,15 @@
+# Optional thin wrapper over the published Ampere image: adds an exposed port and a
+# healthcheck (upstream's docker/Dockerfile sets neither). Does NOT fork upstream.
+# Build AFTER the ghcr image exists:
+#   docker build -f docker/Dockerfile.wrapper \
+#     --build-arg BASE=ghcr.io/<owner>/vllm-ampere-optimized:v0.23.0-ampere-cu130 \
+#     -t <owner>/vllm-ampere-serve:v0.23.0 .
+ARG BASE=ghcr.io/OWNER/vllm-ampere-optimized:latest
+FROM ${BASE}
+
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=5 \
+  CMD curl -fsS http://localhost:8000/health || exit 1
+
+# upstream ENTRYPOINT ["vllm","serve"] is inherited; supply the model + flags as args:
+#   docker run --gpus all -p 8000:8000 <img> --model <hf-id> --max-model-len 8192

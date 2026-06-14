@@ -1,0 +1,76 @@
+diff --git a/vllm/model_executor/kernels/linear/mixed_precision/marlin.py b/vllm/model_executor/kernels/linear/mixed_precision/marlin.py
+index eb14f9e..a4e30dd 100644
+--- a/vllm/model_executor/kernels/linear/mixed_precision/marlin.py
++++ b/vllm/model_executor/kernels/linear/mixed_precision/marlin.py
+@@ -70,8 +70,8 @@ class MarlinLinearKernel(MPLinearKernel):
+         is_a_8bit = c.act_type is not None and c.act_type.itemsize == 1
+ 
+         if is_a_8bit:
+-            assert c.weight_type == scalar_types.uint4b8, (
+-                "W8A8 is not supported by marlin kernel."
++            assert c.weight_type in (scalar_types.uint4b8, scalar_types.int4), (
++                "W4A8-INT8 marlin only supports uint4b8 or int4 weights."
+             )
+ 
+         if c.act_type == torch.float8_e4m3fn:
+@@ -95,7 +95,18 @@ class MarlinLinearKernel(MPLinearKernel):
+ 
+         def transform_w_q(x):
+             assert isinstance(x, BasevLLMParameter)
+-            permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
++            if c.weight_type == scalar_types.int4:
++                w = x.data
++                assert w.shape[1] % 8 == 0, (
++                    f"int4 marlin: in dim {w.shape[1]} must be a multiple of 8"
++                )
++                w_u4 = (w.to(torch.int32) + 8) & 0xF
++                w_u4 = w_u4.reshape(w.shape[0], w.shape[1] // 8, 8)
++                shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=w.device)
++                packed = (w_u4 << shifts[None, None, :]).sum(dim=2).to(torch.int32)
++                x.data = packed.T.contiguous()
++            else:
++                permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
+             x.data = ops.gptq_marlin_repack(
+                 x.data.contiguous(),
+                 perm=layer.g_idx_sort_indices,
+@@ -190,7 +201,11 @@ class MarlinLinearKernel(MPLinearKernel):
+             g_idx=w_gidx,  # type: ignore
+             g_idx_sort_indices=layer.g_idx_sort_indices,
+             workspace=self.workspace,
+-            wtype=c.weight_type,
++            wtype=(
++                scalar_types.uint4b8
++                if c.weight_type == scalar_types.int4
++                else c.weight_type
++            ),
+             input_size_per_partition=c.partition_weight_shape[0],
+             output_size_per_partition=c.partition_weight_shape[1],
+             is_k_full=self.is_k_full,
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a8_int.py b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a8_int.py
+index 1822df5..b5a240a 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a8_int.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a8_int.py
+@@ -96,8 +96,8 @@ class CompressedTensorsW4A8Int(CompressedTensorsScheme):
+                 output_size_per_partition,
+             ),
+             weight_type=self.quant_type,
+-            act_type=params_dtype,
+-            group_size=effective_group_size,
++            act_type=torch.int8,
++            group_size=-1 if self.group_size == -1 else effective_group_size,
+             zero_points=False,
+             has_g_idx=False,
+         )
+diff --git a/vllm/model_executor/layers/quantization/utils/marlin_utils.py b/vllm/model_executor/layers/quantization/utils/marlin_utils.py
+index 19f2605..37f9033 100644
+--- a/vllm/model_executor/layers/quantization/utils/marlin_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/marlin_utils.py
+@@ -77,7 +77,7 @@ def query_marlin_supported_quant_types(
+         return [scalar_types.uint4]
+     else:
+         # GPTQ style, unsigned + symmetric bias
+-        res = [scalar_types.uint4b8, scalar_types.uint8b128]
++        res = [scalar_types.uint4b8, scalar_types.uint8b128, scalar_types.int4]
+         if include_fp_type:
+             res += [scalar_types.float8_e4m3fn, scalar_types.float4_e2m1f]
+         return res

@@ -1,0 +1,123 @@
+name: build
+
+# Rebuild upstream vLLM for Ampere (sm_80 + sm_86) with our patch series, then
+# publish a pip-installable wheel (GitHub Release) and a Docker image (ghcr.io).
+# Dispatched by watch-upstream.yml on a new release, or manually for any tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      vllm_tag:
+        description: 'Upstream vLLM tag to build (e.g. v0.23.0)'
+        required: true
+        type: string
+      cuda_version:
+        description: 'CUDA toolkit version for the image (13.0.2 -> cu130 default; 12.9.1 -> cu129 broad-compat)'
+        required: false
+        default: '13.0.2'
+        type: string
+  repository_dispatch:
+    types: [build-vllm]
+
+permissions:
+  contents: write          # GH Release upload + marker commit
+  packages: write          # ghcr.io push
+
+concurrency:
+  group: build-${{ inputs.vllm_tag || github.event.client_payload.vllm_tag }}
+  cancel-in-progress: false
+
+env:
+  VLLM_TAG: ${{ inputs.vllm_tag || github.event.client_payload.vllm_tag }}
+  CUDA_VERSION: ${{ inputs.cuda_version || '13.0.2' }}
+  TORCH_CUDA_ARCH_LIST: '8.0 8.6'   # all Ampere: A100 (sm_80) + 3090/A40/A6000/A10 (sm_86)
+
+jobs:
+  # ---- 1. drift canary: do the patches still apply to this tag? gates everything ----
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: git apply --check the patch series
+        run: |
+          git clone --depth 1 --branch "$VLLM_TAG" https://github.com/vllm-project/vllm.git vllm
+          cd vllm
+          if ! git apply --check ../patches/*.patch; then
+            echo "::error::patch series does not apply cleanly to $VLLM_TAG — refresh patches/ (see docs/PATCHING.md)"
+            exit 1
+          fi
+          echo "patches apply cleanly to $VLLM_TAG"
+
+  # ---- 2. fast-path wheel: pure-Python patch -> upstream precompiled .so, no CUDA build ----
+  wheel-fastpath:
+    needs: drift-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Apply patches onto upstream tag
+        run: bash scripts/apply_patches.sh "$VLLM_TAG"
+      - name: Build fast-path wheel (VLLM_USE_PRECOMPILED)
+        run: bash scripts/build_wheel_fastpath.sh
+      - name: Publish wheel to GitHub Release
+        uses: softprops/action-gh-release@v2.6.2
+        with:
+          tag_name: ${{ env.VLLM_TAG }}-ampere
+          target_commitish: ${{ github.sha }}
+          name: vLLM ${{ env.VLLM_TAG }} for Ampere (sm_80 + sm_86)
+          generate_release_notes: true
+          files: |
+            dist/*.whl
+
+  # ---- 3. from-source image: full sm_80+sm_86 build via upstream Dockerfile -> ghcr ----
+  image:
+    needs: drift-check
+    # Set repo variable BUILD_RUNNER to a self-hosted label (e.g. the 2x3090 box) for a fast
+    # native build; defaults to ubuntu-latest (slow, needs the free-disk step below).
+    runs-on: ${{ vars.BUILD_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Free disk (GitHub-hosted runners only)
+        if: ${{ !vars.BUILD_RUNNER }}
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with: { tool-cache: false, large-packages: true, docker-images: true, swap-storage: true }
+      - uses: actions/checkout@v4
+      - name: Apply patches onto upstream tag
+        run: bash scripts/apply_patches.sh "$VLLM_TAG"
+      - name: Derive cuXXX tag from CUDA_VERSION
+        id: cu
+        run: echo "short=cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build + push Ampere image
+        env:
+          OWNER: ${{ github.repository_owner }}
+          CU: ${{ steps.cu.outputs.short }}
+        run: bash scripts/build_image_ampere.sh
+      - name: Smoke test the published image
+        env:
+          OWNER: ${{ github.repository_owner }}
+          CU: ${{ steps.cu.outputs.short }}
+        run: bash scripts/smoke_test.sh "ghcr.io/${OWNER,,}/vllm-ampere-optimized:${VLLM_TAG}-ampere-${CU}"
+
+  # ---- 4. bump marker only when BOTH wheel and image succeeded (so a partial fail retries) ----
+  bump-marker:
+    needs: [wheel-fastpath, image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit UPSTREAM_VLLM_VERSION = ${{ env.VLLM_TAG }}
+        run: |
+          echo "$VLLM_TAG" > UPSTREAM_VLLM_VERSION
+          git config user.name  "vllm-ampere-ci"
+          git config user.email "ci@users.noreply.github.com"
+          if git diff --quiet UPSTREAM_VLLM_VERSION; then
+            echo "marker already up to date"; exit 0
+          fi
+          git add UPSTREAM_VLLM_VERSION
+          git commit -m "ci: built vLLM ${VLLM_TAG} for Ampere"
+          git push
