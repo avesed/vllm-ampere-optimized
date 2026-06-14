@@ -26,19 +26,20 @@ gh workflow run build.yml -f vllm_tag=v0.23.0 -f cuda_version=12.9.1   # cu129 b
 
 ## First-time setup
 
-1. Push this repo to GitHub (the `UPSTREAM_VLLM_VERSION` marker ships as `none`, so the first
-   `watch-upstream` run builds the current latest).
-2. **Runner for the image build** — pick one:
-   - *Self-hosted (recommended, fastest):* register a runner on the 2×3090 box and set repo
-     variable `BUILD_RUNNER` to its label (e.g. `self-hosted`). Native build, persistent sccache,
-     and the smoke test actually runs (needs a GPU). Use only on a **private** repo (self-hosted
-     runners + public PRs = arbitrary code execution).
-   - *GitHub-hosted:* leave `BUILD_RUNNER` unset → `ubuntu-latest` with a `free-disk-space` step.
-     A full CUDA build there is slow and disk-tight even single-arch; consider an 8-core larger
-     runner. The smoke test auto-skips (no GPU).
-3. No secrets needed: ghcr push uses the built-in `GITHUB_TOKEN` (`packages: write`), Release
-   upload uses it too (`contents: write`). Make the ghcr package public in repo/org settings if you
-   want anonymous `docker pull`.
+1. Push this repo to GitHub. The `UPSTREAM_VLLM_VERSION` marker ships as `none`, so the first
+   `watch-upstream` run builds the current latest. Actions is enabled by default on a non-fork repo.
+2. **Grant the token write access** (the one required setting): Settings → Actions → General →
+   **Workflow permissions → "Read and write permissions"**. New repos default to read-only, which
+   would make the marker commit (`contents: write`), the Release upload, and the ghcr push
+   (`packages: write`) all **403**. Keep "Allow all actions" enabled (the default).
+3. **Runners** — nothing to set for the defaults: the wheel and the **overlay image** both run on
+   GitHub-hosted `ubuntu-latest` for free in minutes (no GPU, no compile; the smoke test auto-skips
+   without a GPU). *Optionally*, to also build the from-source single-arch image, set repo variable
+   **`BUILD_RUNNER`** to a self-hosted GPU runner label (e.g. the 2×3090 box) — then the smoke test
+   actually runs. Use self-hosted only on a **private** repo (self-hosted + public PRs = arbitrary
+   code execution).
+4. No secrets needed — ghcr push and Release upload both use the built-in `GITHUB_TOKEN`. After the
+   first image push, make the ghcr package public (Packages → settings) for anonymous `docker pull`.
 
 ## Driver / CUDA note
 

@@ -51,17 +51,24 @@ P2P won't come up, prefer **pipeline-parallel** (`-pp 2 -tp 1`) over TP=2 — fa
 
 ## How it works
 
+Everything builds on **official upstream artifacts** — we never self-compile by default (for a
+pure-Python patch a self-compile gives no inference speedup; upstream's image already carries sm_86
+SASS, so single-arch buys only size/build-time).
+
 ```
 watch-upstream.yml (cron 6h)  →  new release tag ≠ marker?  →  build.yml
-   build.yml:  drift-check  →  { wheel-fastpath → GH Release ,  image → ghcr + smoke test }  →  bump marker
+   build.yml:  drift-check  →  { wheel (VLLM_USE_PRECOMPILED) → GH Release ,  overlay image → ghcr + smoke }  →  bump marker
 ```
 
-- **Fast-path wheel** — our patches are pure-Python, so `VLLM_USE_PRECOMPILED=1` reuses upstream's
-  prebuilt kernels: a patched, installable wheel in minutes with **no CUDA compile** (runs on
-  `ubuntu-latest`). A native-code guard forces a from-source build if a patch ever touches `.cu`.
-- **From-source image** — upstream `docker/Dockerfile --target vllm-openai`, driven entirely by
-  `--build-arg torch_cuda_arch_list="8.0 8.6"`. Best on a self-hosted 2×3090 runner (set repo var
-  `BUILD_RUNNER`); falls back to a GitHub-hosted runner with a disk-cleanup step.
+- **Fast-path wheel** — `VLLM_USE_PRECOMPILED=1` reuses upstream's prebuilt kernels: a patched,
+  installable wheel in minutes with **no CUDA compile** (runs on `ubuntu-latest`).
+- **Overlay image (default)** — `FROM vllm/vllm-openai:<tag>` + our pure-Python patch + the device
+  configs, **zero CUDA compile** → ~1–2 min on any runner; tagged `:<tag>` and `:latest`. Identical
+  runtime to a self-compile for a pure-Python patch.
+- **From-source single-arch image (opt-in)** — set repo var `BUILD_RUNNER` to a GPU runner (e.g. the
+  2×3090 box) to *also* build an `8.0/8.6`-only fatbin via upstream `docker/Dockerfile`, tagged
+  `:<tag>-ampere-cuXXX`. Only worth it for a smaller artifact, or once a patch touches native code
+  (the `apply_patches.sh` guard forces this path then).
 - **Drift canary** — `patch-drift-check.yml` runs `git apply --check` daily and opens an issue when
   a new upstream release shifts the code our patches anchor to.
 
@@ -129,8 +136,8 @@ patches/    0001-marlin-w4a8-int8-ampere.patch   # the load-bearing diff (CI sou
             regenerate.py                        # re-emit the diff against a new upstream tag
 .github/workflows/
             watch-upstream.yml  build.yml  patch-drift-check.yml
-scripts/    apply_patches.sh  build_wheel_fastpath.sh  build_image_ampere.sh  smoke_test.sh
-docker/     Dockerfile.wrapper  docker-bake.hcl
+scripts/    apply_patches.sh  build_wheel_fastpath.sh  build_image_overlay.sh  build_image_ampere.sh  smoke_test.sh
+docker/     Dockerfile.overlay  Dockerfile.wrapper  docker-bake.hcl
 configs/    fused_moe/*.json                     # device-tuned MoE kernel configs (RTX 3090), copied in by apply_patches
 quantize/   quantize_w4a8.py                     # llm-compressor recipe -> int-quantized W4A8
 benchmarks/ vllm_verify.py  vllm_batch_sweep.py  results.md

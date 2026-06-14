@@ -1,0 +1,26 @@
+# Zero-compile Ampere image: the OFFICIAL upstream image + our pure-Python W4A8 patch + the
+# RTX-3090 fused-MoE config. No CUDA build (upstream already ships an sm_86-containing fatbin),
+# so this builds in ~1-2 min on ANY runner. Valid because the patch touches no native code.
+# The slimmer single-arch from-source image (docker/Dockerfile via build_image_ampere.sh) is
+# the opt-in alternative when you want a 8.0/8.6-only fatbin.
+ARG BASE=vllm/vllm-openai:latest
+FROM ${BASE}
+
+# repo build context provides patches/ and configs/
+COPY patches/w4a8_int_marlin_ampere.py /tmp/ampere/patch.py
+COPY configs/fused_moe/ /tmp/ampere/fused_moe/
+
+# 1) apply the W4A8-Marlin Ampere fix in-place on the installed vllm (auto-detects site-packages)
+# 2) drop the device-tuned MoE configs into the package's configs dir
+RUN python /tmp/ampere/patch.py \
+ && python - <<'PY'
+import glob, os, shutil, vllm
+dst = os.path.join(os.path.dirname(vllm.__file__),
+                   "model_executor/layers/fused_moe/configs")
+for f in sorted(glob.glob("/tmp/ampere/fused_moe/*.json")):
+    shutil.copy(f, dst)
+    print("installed MoE config:", os.path.basename(f))
+PY
+RUN rm -rf /tmp/ampere
+
+# upstream ENTRYPOINT ["vllm","serve"] is inherited; pass model + flags at run time.

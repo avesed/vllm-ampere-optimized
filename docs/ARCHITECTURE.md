@@ -27,12 +27,17 @@ changes. The W4A8 Marlin patch is the opposite of that.
 
 | path | runner | speed | when |
 |---|---|---|---|
-| **fast-path wheel** (`VLLM_USE_PRECOMPILED=1`) | `ubuntu-latest` | minutes, no CUDA compile | primary; valid because patches are pure-Python |
-| **from-source image** (upstream `docker/Dockerfile --target vllm-openai`) | self-hosted 2×3090 (or larger GH runner) | full compile | the shipped runtime image |
+| **fast-path wheel** (`VLLM_USE_PRECOMPILED=1`) | `ubuntu-latest` | minutes, no compile | always — the pip artifact |
+| **overlay image** (`FROM vllm/vllm-openai` + patch) | `ubuntu-latest` | ~1–2 min, no compile | always — the shipped `:latest` image |
+| **from-source single-arch image** (upstream `docker/Dockerfile`) | self-hosted GPU / larger runner | full compile | opt-in (`BUILD_RUNNER`); smaller artifact, or once a patch needs native code |
 
-The fast-path reuses upstream's prebuilt `.so`; a **native-code guard** in
-`scripts/apply_patches.sh` forces the from-source path if any patch ever edits native code
-(otherwise the prebuilt kernels would be stale — a silent correctness bug).
+Both default paths reuse **official upstream builds** — the wheel pulls upstream's prebuilt `.so`,
+the overlay starts from upstream's published image. We self-compile only on demand. **Why no
+self-compile by default:** for a pure-Python patch it gives zero inference speedup — a fatbin loads
+only the cubin matching the running SM, and upstream already ships sm_86 SASS; single-arch only
+shrinks the artifact and build time. A **native-code guard** in `scripts/apply_patches.sh` flips the
+from-source path on automatically if a patch ever edits `.cu`/`.cpp`/CMake (else the prebuilt
+kernels would be stale — a silent correctness bug).
 
 ## Arch: `TORCH_CUDA_ARCH_LIST="8.0 8.6"` (all Ampere)
 

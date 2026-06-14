@@ -1,8 +1,9 @@
 name: build
 
-# Rebuild upstream vLLM for Ampere (sm_80 + sm_86) with our patch series, then
-# publish a pip-installable wheel (GitHub Release) and a Docker image (ghcr.io).
-# Dispatched by watch-upstream.yml on a new release, or manually for any tag.
+# Ship upstream vLLM for Ampere with our patch series, using OFFICIAL upstream builds (no
+# self-compile): a pip wheel via VLLM_USE_PRECOMPILED (GitHub Release) + an overlay Docker image
+# FROM vllm/vllm-openai + our patch (ghcr.io). A from-source single-arch image is opt-in
+# (set repo var BUILD_RUNNER). Dispatched by watch-upstream.yml on a new release, or manually.
 
 on:
   workflow_dispatch:
@@ -70,17 +71,37 @@ jobs:
           files: |
             dist/*.whl
 
-  # ---- 3. from-source image: full sm_80+sm_86 build via upstream Dockerfile -> ghcr ----
-  image:
+  # ---- 3a. DEFAULT image: OFFICIAL upstream image + our pure-Python patch, ZERO compile -> ghcr ----
+  # Runs on plain ubuntu-latest in ~1-2 min (no CUDA build). Tags :<tag> and :latest.
+  image-overlay:
     needs: drift-check
-    # Set repo variable BUILD_RUNNER to a self-hosted label (e.g. the 2x3090 box) for a fast
-    # native build; defaults to ubuntu-latest (slow, needs the free-disk step below).
-    runs-on: ${{ vars.BUILD_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     steps:
-      - name: Free disk (GitHub-hosted runners only)
-        if: ${{ !vars.BUILD_RUNNER }}
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with: { tool-cache: false, large-packages: true, docker-images: true, swap-storage: true }
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build + push overlay image (no compile)
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: bash scripts/build_image_overlay.sh
+      - name: Smoke test the published image
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: bash scripts/smoke_test.sh "ghcr.io/${OWNER,,}/vllm-ampere-optimized:${VLLM_TAG}"
+
+  # ---- 3b. OPT-IN from-source single-arch (8.0/8.6) image: only when repo var BUILD_RUNNER is set ----
+  # Use this on a self-hosted GPU runner (e.g. the 2x3090 box) if you specifically want a slimmed
+  # 8.0/8.6-only fatbin. Tags :<tag>-ampere-cuXXX (the overlay owns :latest). Note: from-source
+  # compile gives NO inference speedup over the overlay for a pure-Python patch — size/build-time only.
+  image-source:
+    needs: drift-check
+    if: ${{ vars.BUILD_RUNNER != '' }}
+    runs-on: ${{ vars.BUILD_RUNNER }}
+    steps:
       - uses: actions/checkout@v4
       - name: Apply patches onto upstream tag
         run: bash scripts/apply_patches.sh "$VLLM_TAG"
@@ -93,7 +114,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build + push Ampere image
+      - name: Build + push single-arch Ampere image
         env:
           OWNER: ${{ github.repository_owner }}
           CU: ${{ steps.cu.outputs.short }}
@@ -104,9 +125,9 @@ jobs:
           CU: ${{ steps.cu.outputs.short }}
         run: bash scripts/smoke_test.sh "ghcr.io/${OWNER,,}/vllm-ampere-optimized:${VLLM_TAG}-ampere-${CU}"
 
-  # ---- 4. bump marker only when BOTH wheel and image succeeded (so a partial fail retries) ----
+  # ---- 4. bump marker only when wheel + overlay image succeeded (so a partial fail retries) ----
   bump-marker:
-    needs: [wheel-fastpath, image]
+    needs: [wheel-fastpath, image-overlay]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

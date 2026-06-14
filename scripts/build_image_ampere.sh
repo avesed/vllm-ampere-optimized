@@ -25,7 +25,6 @@ docker buildx build vllm \
   --cache-from type=gha \
   --cache-to type=gha,mode=max \
   --tag "${IMAGE}:${VLLM_TAG}-ampere-${CU}" \
-  --tag "${IMAGE}:latest" \
   --push
 
-echo "pushed ${IMAGE}:${VLLM_TAG}-ampere-${CU} (+ :latest)"
+echo "pushed ${IMAGE}:${VLLM_TAG}-ampere-${CU}  [from-source single-arch; overlay owns :latest]"
