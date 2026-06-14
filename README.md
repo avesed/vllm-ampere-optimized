@@ -20,8 +20,10 @@ pip install https://github.com/avesed/vllm-ampere-optimized/releases/...
 # image (default cu130 → needs NVIDIA driver ≥ 580.65.06):
 docker run --gpus all -p 8000:8000 \
   ghcr.io/avesed/vllm-ampere-optimized:latest \
-  --model <hf-id> --max-model-len 8192
+  --model Avesed/Qwen3.6-27B-W4A8 --tensor-parallel-size 2 --max-model-len 8192
 ```
+
+`Avesed/Qwen3.6-27B-W4A8` is a ready-made W4A8 of the official **[Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)** — serves ~47 tok/s single-user (sub-second TTFT), ~416 tok/s saturated on 2× RTX 3090. See [W4A8 below](#w4a8-on-ampere--the-flagship-patch).
 
 ## W4A8 on Ampere — the flagship patch
 
@@ -38,7 +40,7 @@ but a config bug (`act_type=bf16` instead of `int8`) made it fall back to weight
 | W8A8  | 38.8 tok/s | 343 tok/s | **1250 tok/s** |
 | **W4A8** | **50.4 tok/s** | **393 tok/s** | **1229 tok/s** |
 
-- **Ready-made W4A8 model:** [Avesed/Qwopus3.6-27B-v2-abliterated-int4-w4a8](https://huggingface.co/Avesed/Qwopus3.6-27B-v2-abliterated-int4-w4a8)
+- **Ready-made W4A8 models:** [Avesed/Qwen3.6-27B-W4A8](https://huggingface.co/Avesed/Qwen3.6-27B-W4A8) (W4A8 of official [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B))
 - **Quantize your own:** `python quantize/quantize_w4a8.py <hf-model> <out-dir>`
 - **Patch a running vLLM in place** (no rebuild): `python patches/w4a8_int_marlin_ampere.py`
 
