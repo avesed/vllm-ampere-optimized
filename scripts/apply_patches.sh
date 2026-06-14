@@ -20,6 +20,16 @@ fi
 echo "== applying patch series (3-way) =="
 git apply --3way --whitespace=fix "$REPO_ROOT"/patches/*.patch
 
+echo "== overlay device-tuned configs (new data files, not diffs) =="
+# Drop our device-tuned fused-MoE Triton configs into the package. New files (never
+# conflict with upstream), pure data, so they don't trip the native-code guard below
+# and the precompiled fast-path stays valid.
+shopt -s nullglob
+moe_cfgs=("$REPO_ROOT"/configs/fused_moe/*.json)
+if [ ${#moe_cfgs[@]} -gt 0 ]; then
+  cp -v "${moe_cfgs[@]}" vllm/model_executor/layers/fused_moe/configs/
+fi
+
 echo "== native-code guard =="
 # The fast-path (VLLM_USE_PRECOMPILED) ships upstream's prebuilt .so. That is correct
 # ONLY while our patches touch zero native code. If a patch ever edits .cu/.cpp/CMake,

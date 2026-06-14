@@ -92,6 +92,15 @@ W4A8Int/Marlin path — a manual `config_groups` saves `pack-quantized` → weig
 python quantize/quantize_w4a8.py <hf_model> <out_dir>
 ```
 
+## Other patch: RTX 3090 fused-MoE configs (`configs/fused_moe/`)
+
+vLLM ships fused-MoE Triton tile configs only for a handful of datacenter GPUs; on a 3090 it falls
+back to a generic heuristic (`Using default MoE config. Performance might be sub-optimal!`).
+`configs/fused_moe/*.json` carries RTX-3090-tuned configs, copied into the build by
+`apply_patches.sh` — faster MoE forward, **zero accuracy change**, no kernel/native change (fast-path
+stays valid). Currently: a 256-expert / N=512 `int4_w4a16` MoE. See
+[`configs/README.md`](configs/README.md).
+
 ## Repo layout
 
 ```
@@ -102,6 +111,7 @@ patches/    0001-marlin-w4a8-int8-ampere.patch   # the load-bearing diff (CI sou
             watch-upstream.yml  build.yml  patch-drift-check.yml
 scripts/    apply_patches.sh  build_wheel_fastpath.sh  build_image_ampere.sh  smoke_test.sh
 docker/     Dockerfile.wrapper  docker-bake.hcl
+configs/    fused_moe/*.json                     # device-tuned MoE kernel configs (RTX 3090), copied in by apply_patches
 quantize/   quantize_w4a8.py                     # llm-compressor recipe -> int-quantized W4A8
 benchmarks/ vllm_verify.py  vllm_batch_sweep.py  results.md
 docs/       ARCHITECTURE.md  PATCHING.md  RELEASE.md
