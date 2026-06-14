@@ -72,6 +72,7 @@ python quantize/quantize_w4a8.py <hf_model> <out_dir> [num_calib=256] [max_len=2
 - **W8A8 actorder clash**: GPTQ defaults `actorder: static`, which vLLM rejects with a `channel` weight strategy (`Must use group or tensor_group ... to apply activation ordering`). Patch the saved `config.json` `weights.actorder` to `null` (harmless — no `g_idx` is saved for static).
 - **DEBUG logging tanks throughput**: `VLLM_LOGGING_LEVEL=DEBUG` logs tensor `repr`s per op → forces GPU→CPU sync every rms_norm → ~200× decode slowdown. Use INFO; the kernel-selection line is already INFO.
 - llm-compressor GPTQ: **don't** pass `device_map="auto"` (pre-fills the GPU → the sequential pipeline OOMs). Load on CPU; the pipeline onloads one layer at a time to GPU (~3 GB).
+- **W4A8 is int8-sized on disk, not int4-sized.** The `int-quantized` format the W4A8Int kernel needs does **not** bit-pack — each 4-bit weight occupies a full `int8` byte, so the model file is ~the same size as W8A8 (and a touch bigger, from group-128 vs per-channel scales). VRAM *is* int4 — the patch repacks `int8 → packed int4` on load (proof: W4A8 decodes like W4A16, not W8A8). If you want a small **download**, ship W4A16 (`pack-quantized`, truly bit-packed). See [`benchmarks/results.md`](benchmarks/results.md).
 
 ---
 
