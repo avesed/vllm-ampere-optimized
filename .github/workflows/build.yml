@@ -38,7 +38,7 @@ jobs:
   drift-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: git apply --check the patch series
         run: |
           git clone --depth 1 --branch "$VLLM_TAG" https://github.com/vllm-project/vllm.git vllm
@@ -54,22 +54,23 @@ jobs:
     needs: drift-check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with: { python-version: '3.12' }
       - name: Apply patches onto upstream tag
         run: bash scripts/apply_patches.sh "$VLLM_TAG"
       - name: Build fast-path wheel (VLLM_USE_PRECOMPILED)
         run: bash scripts/build_wheel_fastpath.sh
       - name: Publish wheel to GitHub Release
-        uses: softprops/action-gh-release@v2.6.2
-        with:
-          tag_name: ${{ env.VLLM_TAG }}-ampere
-          target_commitish: ${{ github.sha }}
-          name: vLLM ${{ env.VLLM_TAG }} for Ampere (sm_80 + sm_86)
-          generate_release_notes: true
-          files: |
-            dist/*.whl
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # gh CLI is preinstalled on the runner -> no Node action, no Node20/24 deprecation.
+        run: |
+          gh release create "${VLLM_TAG}-ampere" dist/*.whl \
+            --target "${{ github.sha }}" \
+            --title "vLLM ${VLLM_TAG} for Ampere (sm_80 + sm_86)" \
+            --generate-notes \
+          || gh release upload "${VLLM_TAG}-ampere" dist/*.whl --clobber
 
   # ---- 3a. DEFAULT image: OFFICIAL upstream image + our pure-Python patch, ZERO compile -> ghcr ----
   # Runs on plain ubuntu-latest in ~1-2 min (no CUDA build). Tags :<tag> and :latest.
@@ -77,7 +78,7 @@ jobs:
     needs: drift-check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -102,7 +103,7 @@ jobs:
     if: ${{ vars.BUILD_RUNNER != '' }}
     runs-on: ${{ vars.BUILD_RUNNER }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Apply patches onto upstream tag
         run: bash scripts/apply_patches.sh "$VLLM_TAG"
       - name: Derive cuXXX tag from CUDA_VERSION
@@ -130,7 +131,7 @@ jobs:
     needs: [wheel-fastpath, image-overlay]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Commit UPSTREAM_VLLM_VERSION = ${{ env.VLLM_TAG }}
         run: |
           echo "$VLLM_TAG" > UPSTREAM_VLLM_VERSION
