@@ -1,8 +1,10 @@
-# vllm-3090-optimized
+# vllm-ampere-optimized
 
-Patches and notes for running **vLLM optimally on NVIDIA Ampere consumer GPUs (RTX 3090, sm_86)** — squeezing the quantization paths that vLLM ships gated-to-Hopper or mis-configured for Ampere.
+vLLM rebuilt and tuned for the **whole NVIDIA Ampere line** — A100 (`sm_80`) and RTX 3090 / A40 / A6000 / A10 (`sm_86`) — plus the patches that unlock quantization paths vLLM ships gated-to-Hopper or mis-configured for Ampere.
 
-> Status: working set of hot-patches (pure-Python, no recompile) + reproducible benchmarks. Validated on 2× RTX 3090 (no NVLink), vLLM v0.21-dev, a 27B Qwen3.5 hybrid model.
+Goal: a GitHub-Actions pipeline that, on every upstream vLLM release, applies our patch series and builds an Ampere-only (`TORCH_CUDA_ARCH_LIST=8.0;8.6`) **wheel** + **Docker image**. Single line, two-arch fatbin → faster builds and smaller artifacts than the stock all-arch wheels, with nothing stripped that an Ampere card can use.
+
+> Status: the W4A8-on-Ampere patch + reproducible benchmarks below are done and validated (2× RTX 3090, no NVLink, vLLM v0.21-dev, a 27B Qwen3.5 hybrid model). The automated fork-rebuild CI is being added next.
 
 ---
 
