@@ -29,6 +29,26 @@ docker run --gpus all -p 8000:8000 \
   --model <hf-id> --max-model-len 8192
 ```
 
+## Tip: 2+ consumer Ampere GPUs without NVLink → enable PCIe P2P
+
+RTX 3090 (and other GeForce 30-series) have **no NVLink**, and the stock NVIDIA driver disables
+GPU-to-GPU peer DMA over PCIe for product segmentation — the silicon supports it. On
+tensor-parallel serving (`-tp 2`) that missing P2P is a real throughput tax.
+
+The community [tinygrad/open-gpu-kernel-modules](https://github.com/tinygrad/open-gpu-kernel-modules)
+driver fork force-enables P2P over PCIe BAR1. With it, vLLM's two-shot **custom all-reduce turns on
+for TP=2 automatically — no vLLM change** — recovering much of NVLink's ~50% TP gain (measured
+**~10–30%** end-to-end on dual-3090 35B-A3B). **Strongly recommended for any no-NVLink 30-series
+multi-GPU box.**
+
+```bash
+nvidia-smi topo -p2p r     # after patching: want "OK" between the GPUs, not "NS"
+```
+
+Caveats: only some 3090 SKUs expose a large/resizable **BAR1** (required) — verify first; needs
+`iommu=pt` on the kernel cmdline; **bare-metal Linux only**; pins you to a forked driver branch. If
+P2P won't come up, prefer **pipeline-parallel** (`-pp 2 -tp 1`) over TP=2 — far less PCIe-sensitive.
+
 ## How it works
 
 ```
