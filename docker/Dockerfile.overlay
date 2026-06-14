@@ -10,10 +10,11 @@ FROM ${BASE}
 COPY patches/w4a8_int_marlin_ampere.py /tmp/ampere/patch.py
 COPY configs/fused_moe/ /tmp/ampere/fused_moe/
 
+# The official image ships `python3` (vllm installed --system into it), not `python`.
 # 1) apply the W4A8-Marlin Ampere fix in-place on the installed vllm (auto-detects site-packages)
 # 2) drop the device-tuned MoE configs into the package's configs dir
-RUN python /tmp/ampere/patch.py \
- && python - <<'PY'
+RUN python3 /tmp/ampere/patch.py \
+ && python3 - <<'PY'
 import glob, os, shutil, vllm
 dst = os.path.join(os.path.dirname(vllm.__file__),
                    "model_executor/layers/fused_moe/configs")
