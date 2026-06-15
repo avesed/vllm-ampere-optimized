@@ -57,8 +57,12 @@ If P2P won't come up, prefer `-pp 2 -tp 1`.
 `watch-upstream` (cron) sees a new release → `build` patches and ships, all from **official upstream
 artifacts**:
 
-- **wheel** via `VLLM_USE_PRECOMPILED` → GitHub Release
-- **overlay image** `FROM vllm/vllm-openai:<tag>` + patch → ghcr `:latest`
+- **wheel** = official upstream wheel + our pure-Python patch overlaid, repacked → GitHub Release.
+  Reuses the official wheel's compiled `.so` (incl. `vllm/_moe_C.abi3.so`), so **MoE models work**.
+  (The old `VLLM_USE_PRECOMPILED` fast-path fetched a stable-ABI `.so` subset that dropped `_moe_C`
+  and silently broke every MoE model — fixed in `scripts/build_wheel_overlay.sh`.)
+- **overlay image** `FROM vllm/vllm-openai:<tag>` + patch → ghcr `:latest` (also MoE-capable: it
+  inherits the official image's full kernel set).
 - from-source single-arch (`8.0/8.6`) image is opt-in (set repo var `BUILD_RUNNER`)
 
 Setup + release flow: [docs/RELEASE.md](docs/RELEASE.md) · design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · patch maintenance: [docs/PATCHING.md](docs/PATCHING.md).

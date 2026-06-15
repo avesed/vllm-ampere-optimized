@@ -49,18 +49,19 @@ jobs:
           fi
           echo "patches apply cleanly to $VLLM_TAG"
 
-  # ---- 2. fast-path wheel: pure-Python patch -> upstream precompiled .so, no CUDA build ----
-  wheel-fastpath:
+  # ---- 2. overlay wheel: pure-Python patch over the OFFICIAL upstream wheel, no CUDA build ----
+  # The official wheel ships every kernel incl. vllm/_moe_C.abi3.so, so MoE models work. (The old
+  # VLLM_USE_PRECOMPILED fast-path fetched a stable-ABI .so subset that DROPPED _moe_C and silently
+  # broke every MoE model -> see scripts/build_wheel_overlay.sh.) Zero compile, runs on any runner.
+  wheel-overlay:
     needs: drift-check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with: { python-version: '3.12' }
-      - name: Apply patches onto upstream tag
-        run: bash scripts/apply_patches.sh "$VLLM_TAG"
-      - name: Build fast-path wheel (VLLM_USE_PRECOMPILED)
-        run: bash scripts/build_wheel_fastpath.sh
+      - name: Build MoE-capable overlay wheel (official wheel + pure-Python patch; ships _moe_C)
+        run: bash scripts/build_wheel_overlay.sh "$VLLM_TAG"
       - name: Publish wheel to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -128,7 +129,7 @@ jobs:
 
   # ---- 4. bump marker only when wheel + overlay image succeeded (so a partial fail retries) ----
   bump-marker:
-    needs: [wheel-fastpath, image-overlay]
+    needs: [wheel-overlay, image-overlay]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
