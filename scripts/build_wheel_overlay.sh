@@ -49,5 +49,5 @@ python -m wheel pack "$UNP" -d "$REPO_ROOT/dist"
 
 echo "== built MoE-capable overlay wheel =="
 ls -la "$REPO_ROOT/dist"
-echo "NOTE: the fastapi<0.137 cap (patch 0002, a requirements pin) is NOT in the wheel's deps —"
-echo "      pin it at install time or via the image; the overlay image (Dockerfile.overlay) still carries it."
+echo "NOTE: the official wheel already pins fastapi<0.137 (that cap landed upstream in v0.23.0,"
+echo "      so the former patch 0002 is no longer carried) — no extra fastapi handling needed."

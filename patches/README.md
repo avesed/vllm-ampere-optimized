@@ -7,7 +7,6 @@ per logical change so a drift failure points at exactly what broke.
 | patch | what it does |
 |---|---|
 | `0001-marlin-w4a8-int8-ampere.patch` | Wires int4-weight + int8-activation (W4A8) through the **Marlin** kernel on Ampere — vLLM gates its dedicated W4A8 kernels (Cutlass/Machete) to Hopper. Edits `compressed_tensors_w4a8_int.py` (`act_type=torch.int8`), `mixed_precision/marlin.py` (allow int4 in the 8-bit-act assert, pack signed int4→uint4b8, pass effective `wtype`), `marlin_utils.py` (add `int4` to supported types). Pure-Python (no `.cu`/CMake). Upstream [vllm#38064](https://github.com/vllm-project/vllm/issues/38064)/[#38066](https://github.com/vllm-project/vllm/pull/38066). |
-| `0002-cap-fastapi-prometheus-compat.patch` | Caps `fastapi[standard] < 0.137` in `requirements/common.txt`. FastAPI **0.137** introduced the `_IncludedRouter` route type (a `BaseRoute` with no `.path`); `prometheus-fastapi-instrumentator` iterates `app.routes` doing `route.path` (only special-casing `Mount`) → **`AttributeError: '_IncludedRouter' object has no attribute 'path'`** crashes `vllm serve` at startup. Upstream's loose `fastapi[standard]>=0.115.0` (no cap) lets a fresh install pull the broken fastapi — so a fresh `pip install` of the **official** vLLM wheel breaks too. This makes our published wheel install-and-`serve` cleanly. Requirements text only (no native change). Proposed upstream (see [`../docs/UPSTREAM-PR.md`](../docs/UPSTREAM-PR.md)). |
 
 ## Two rules
 
