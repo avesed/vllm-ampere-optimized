@@ -13,10 +13,11 @@ Why not a real GitHub fork carrying a patch branch:
   (`v0.23.0`). A fork's only structural perk (`on: push: tags`) never fires without bolting on
   a tag-mirror step, at which point a `gh api .../releases/latest` compare is simpler and works
   identically here.
-- Our entire change set is **3 pure-Python files**. Re-applying a tiny diff per release beats
-  rebasing a long-lived branch against the whole upstream tree every two weeks.
-- Pure-Python patches unlock a no-compile **fast-path wheel** (see below), awkward to reason
-  about inside a fork's merge history.
+- Our change set is a small patch series (patch 0001 pure-Python; patch 0002 native, opt-in only).
+  Re-applying a tiny diff per release beats rebasing a long-lived branch against the whole upstream
+  tree every two weeks.
+- Pure-Python patches unlock a no-compile **overlay wheel** (see below: official released wheel +
+  our `vllm/*` hunks), awkward to reason about inside a fork's merge history.
 - Precedent: conda-forge feedstocks, AUR PKGBUILDs, and other vLLM rebuilds all use the thin
   fetch→patch→build recipe model, not a vendored fork.
 
@@ -27,12 +28,13 @@ changes. The W4A8 Marlin patch is the opposite of that.
 
 | path | runner | speed | when |
 |---|---|---|---|
-| **fast-path wheel** (`VLLM_USE_PRECOMPILED=1`) | `ubuntu-latest` | minutes, no compile | always — the pip artifact |
-| **overlay image** (`FROM vllm/vllm-openai` + patch) | `ubuntu-latest` | ~1–2 min, no compile | always — the shipped `:latest` image |
+| **overlay wheel** (`pip download vllm==<tag>` + `vllm/*` hunks) | `ubuntu-latest` | minutes, no compile | always — the pip artifact |
+| **overlay image** (`FROM vllm/vllm-openai:<tag>` + patch) | `ubuntu-latest` | ~1–2 min, no compile | always — the shipped `:latest` image |
 | **from-source single-arch image** (upstream `docker/Dockerfile`) | self-hosted GPU / larger runner | full compile | opt-in (`BUILD_RUNNER`); smaller artifact, or once a patch needs native code |
 
-Both default paths reuse **official upstream builds** — the wheel pulls upstream's prebuilt `.so`,
-the overlay starts from upstream's published image. We self-compile only on demand. **Why no
+Both default paths reuse **official upstream RELEASE builds** (never main/nightly) — the wheel is the
+official released wheel (`pip download vllm==<tag>`) with our Python hunks overlaid, the image starts
+from upstream's published `:<tag>` image. We self-compile only on demand. **Why no
 self-compile by default:** for a pure-Python patch it gives zero inference speedup — a fatbin loads
 only the cubin matching the running SM, and upstream already ships sm_86 SASS; single-arch only
 shrinks the artifact and build time. A **native-code guard** in `scripts/apply_patches.sh` flips the

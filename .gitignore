@@ -4,3 +4,10 @@ __pycache__/
 *.log
 .venv/
 .DS_Store
+
+# build artifacts
+dist/
+
+# local sandbox / workflow scratch (not deliverables)
+.sandbox_*
+.wf_*

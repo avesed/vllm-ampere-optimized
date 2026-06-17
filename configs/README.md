@@ -3,7 +3,7 @@
 Drop-in data files that vLLM loads at runtime but does **not** ship for our cards. Unlike
 `patches/` (diffs against upstream code), these are **new files** copied verbatim into the vLLM
 tree by `scripts/apply_patches.sh` — they never conflict with upstream and, being pure data,
-don't trip the native-code guard (the precompiled fast-path stays valid).
+don't trip the native-code guard (they ride the default overlay wheel/image fine).
 
 ## fused_moe/
 

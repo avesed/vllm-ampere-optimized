@@ -11,11 +11,14 @@ per logical change so a drift failure points at exactly what broke.
 
 ## Two rules
 
-1. **Pure-Python only, or the fast-path breaks.** The wheel fast-path
-   (`VLLM_USE_PRECOMPILED=1`) reuses upstream's prebuilt `.so`. That is correct *only* while
-   no patch edits native code. `scripts/apply_patches.sh` greps the applied diff for
-   `.cu/.cpp/.cuh/CMakeLists/csrc/` and sets `NATIVE_CHANGED=1` to force a from-source build
-   if you ever cross that line. Keep native changes out of here unless you mean it.
+1. **Pure-Python only, or it won't reach the default ship.** The default OVERLAY wheel
+   (`scripts/build_wheel_overlay.sh`) applies only `vllm/*` (Python) hunks onto the official
+   **released** wheel (`pip download vllm==<tag>`), and the overlay image is
+   `FROM vllm/vllm-openai:<tag>` + the same hunks — neither can carry native
+   (`.cu/.cpp/.cuh/CMakeLists/csrc/`) changes. `scripts/apply_patches.sh` greps the applied diff for
+   those paths and sets `NATIVE_CHANGED=1`; a native patch (e.g. `0002`) then ships **only** via the
+   opt-in from-source image (`build_image_ampere.sh`, repo var `BUILD_RUNNER`). Keep native changes
+   out of here unless you mean it.
 
 2. **Anchors drift; refresh against the tag.** These diffs match upstream context lines that
    move between releases. `patch-drift-check.yml` runs `git apply --check` daily and opens an
