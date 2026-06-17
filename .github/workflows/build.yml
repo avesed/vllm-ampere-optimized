@@ -1,9 +1,10 @@
 name: build
 
-# Ship upstream vLLM for Ampere with our patch series, using OFFICIAL upstream builds (no
-# self-compile): a pip wheel via VLLM_USE_PRECOMPILED (GitHub Release) + an overlay Docker image
-# FROM vllm/vllm-openai + our patch (ghcr.io). A from-source single-arch image is opt-in
-# (set repo var BUILD_RUNNER). Dispatched by watch-upstream.yml on a new release, or manually.
+# Ship upstream vLLM for Ampere with our patch series, using OFFICIAL upstream RELEASE artifacts (no
+# self-compile, NOT main/nightly): a pip wheel = the official released wheel (`pip download vllm==<tag>`)
+# + our pure-Python patch overlaid (GitHub Release) + an overlay Docker image FROM vllm/vllm-openai:<tag>
+# + our patch (ghcr.io). A from-source single-arch image is opt-in (set repo var BUILD_RUNNER).
+# Dispatched by watch-upstream.yml on a new release (releases/latest tag), or manually.
 
 on:
   workflow_dispatch:
@@ -94,6 +95,25 @@ jobs:
         env:
           OWNER: ${{ github.repository_owner }}
         run: bash scripts/smoke_test.sh "ghcr.io/${OWNER,,}/vllm-ampere-optimized:${VLLM_TAG}"
+
+  # ---- 3a-ci. OPT-IN Ampere kernel CI: run upstream mamba/GatedDeltaNet/causal-conv1d Triton kernel
+  # tests on a self-hosted Ampere GPU runner (sm_80/86) against the SHIPPED overlay image. The hybrid
+  # kernels are vendored JIT-Triton; this is the only thing that proves they compile + are numerically
+  # correct on Ampere after an upstream/torch/triton bump. Only runs when repo var BUILD_RUNNER is set.
+  ampere-kernel-ci:
+    needs: image-overlay
+    if: ${{ vars.BUILD_RUNNER != '' }}
+    runs-on: ${{ vars.BUILD_RUNNER }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run Ampere mamba/GDN Triton kernel tests against the published image
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: bash scripts/ampere_kernel_ci.sh "ghcr.io/${OWNER,,}/vllm-ampere-optimized:${VLLM_TAG}" "$VLLM_TAG"
+      - name: Assert Ampere runtime path selection (GDN->Triton, attention->FlashAttention)
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: bash scripts/ampere_defaults_check.sh "ghcr.io/${OWNER,,}/vllm-ampere-optimized:${VLLM_TAG}"
 
   # ---- 3b. OPT-IN from-source single-arch (8.0/8.6) image: only when repo var BUILD_RUNNER is set ----
   # Use this on a self-hosted GPU runner (e.g. the 2x3090 box) if you specifically want a slimmed
