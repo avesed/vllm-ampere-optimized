@@ -31,11 +31,16 @@ non-zero exit only when a hunk genuinely can't apply — which is what the drift
 
 ## The native-code rule
 
-Keep patches **pure-Python**. The wheel fast-path (`VLLM_USE_PRECOMPILED=1`) ships upstream's
-prebuilt kernels; if a patch edits `.cu/.cpp/.cuh/CMakeLists/csrc/`, those kernels no longer
-reflect the patch — silent wrong results. `scripts/apply_patches.sh` detects this and sets
-`NATIVE_CHANGED=1`, which makes `build_wheel_fastpath.sh` refuse to run and forces the from-source
-image build. If you *intend* a native change, accept that the fast-path is gone for that release.
+Keep patches **pure-Python** where you can. The default ship is an OVERLAY: the wheel
+(`scripts/build_wheel_overlay.sh`) applies only the `vllm/*` (Python) hunks onto the official
+**released** wheel (`pip download vllm==<tag>`), and the image is `FROM vllm/vllm-openai:<tag>` +
+the same Python hunks. Neither can carry native (`.cu/.cpp/.cuh/CMakeLists/csrc/`) changes — a native
+patch's kernels are simply **absent** from the default overlay wheel/image (the overlay just logs
+`(no applicable vllm/ hunks …)` and moves on). A native patch therefore ships **only** via the opt-in
+from-source image (`scripts/build_image_ampere.sh`, set repo var `BUILD_RUNNER`), which applies the
+full patch and compiles. `scripts/apply_patches.sh` flags native hunks (`NATIVE_CHANGED=1`) so a
+release that needs them is known to require the from-source path. (Example: patch 0002, the int8
+8-row Marlin tile, is native → from-source image only; the overlay wheel/image carries patch 0001.)
 
 ## If upstream fixes it
 

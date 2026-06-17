@@ -33,9 +33,13 @@ echo "== overlay our pure-Python patches (apply only vllm/ hunks; requirements/*
 ( cd "$UNP"
   for p in "$REPO_ROOT"/patches/*.patch; do
     if git apply -p1 --include='vllm/*' --whitespace=fix "$p" 2>/dev/null; then
-      echo "  applied $(basename "$p")"
+      echo "  applied $(basename "$p") (vllm/* hunks)"
     else
       echo "  (no applicable vllm/ hunks in $(basename "$p"))"
+    fi
+    # a native (csrc/.cu/CMake) patch CANNOT go in the overlay wheel -> say so loudly, don't drop it silently
+    if grep -qE '^\+\+\+ b/(csrc/|cmake/|CMakeLists)|^\+\+\+ b/.*\.(cu|cuh|cpp|cc)$' "$p"; then
+      echo "::warning::$(basename "$p") has NATIVE (csrc) hunks NOT carried by the overlay wheel — those kernels ship only via the from-source image (build_image_ampere.sh / BUILD_RUNNER)"
     fi
   done
   if compgen -G "$REPO_ROOT/configs/fused_moe/*.json" >/dev/null; then
@@ -49,5 +53,5 @@ python -m wheel pack "$UNP" -d "$REPO_ROOT/dist"
 
 echo "== built MoE-capable overlay wheel =="
 ls -la "$REPO_ROOT/dist"
-echo "NOTE: the official wheel already pins fastapi<0.137 (that cap landed upstream in v0.23.0,"
-echo "      so the former patch 0002 is no longer carried) — no extra fastapi handling needed."
+echo "NOTE: the official wheel already pins fastapi<0.137 (that cap landed upstream in v0.23.0),"
+echo "      so no extra fastapi handling is needed here."

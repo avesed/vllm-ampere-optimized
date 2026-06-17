@@ -44,6 +44,29 @@ but a config bug (`act_type=bf16` instead of `int8`) made it fall back to weight
 - **Quantize your own:** `python quantize/quantize_w4a8.py <hf-model> <out-dir>`
 - **Patch a running vLLM in place** (no rebuild): `python patches/w4a8_int_marlin_ampere.py`
 
+## Other automatic Ampere fast paths (no flag, no patch — just know they exist)
+
+Beyond the W4A8 patch, upstream vLLM already routes several quant paths to Ampere-friendly kernels
+automatically — worth knowing so you pick the right checkpoint:
+
+- **fp8 weight-only → W8A16-fp8 Marlin** (`<sm89`, i.e. all Ampere): an fp8 dense checkpoint auto-uses
+  the Marlin fp8 fast path (~1.6× throughput, ~2× less weight VRAM vs bf16). Ampere has no fp8 tensor
+  cores, but weight-only fp8 (dequant → bf16 compute) still wins on bandwidth. No flag needed.
+- **AllSpark uint8b128 W8A16**: a uint8 W8A16 checkpoint (`group_size=-1`) gets an explicit Ampere branch
+  that beats generic Marlin at small-M (low-batch) decode.
+- **W8A8-int8 CUTLASS** (cap ≥ 7.5): int8 W8A8 checkpoints run the CUTLASS int8 path on Ampere — at the
+  int8 tensor-core ceiling (great prefill; but decode reads int8 weights, so W4A8 wins at low batch).
+
+## Hybrid / linear-attention models (GatedDeltaNet, Mamba2, …)
+
+Modern hybrids (Qwen3.5/3.6, Jamba, Nemotron-H, …) run their linear-attention / SSM / causal-conv1d
+layers on **vendored Triton kernels** shipped inside vLLM — **no separate `flash-linear-attention` /
+`causal-conv1d` / `mamba-ssm` install is needed** (pinning them is a no-op). These JIT-Triton kernels
+are not AOT-compiled, so this fork's CI runs the upstream mamba/GDN kernel test suite on a real Ampere
+GPU (`scripts/ampere_kernel_ci.sh`, gated on `BUILD_RUNNER`) to catch sm_80/sm_86 codegen or numeric
+regressions after each upstream/torch/triton bump — **622 kernel cases verified green on sm_86**. The
+GatedDeltaNet recurrent-decode state is already bf16 by default (bandwidth-optimal) — nothing to tune.
+
 ## Multi-GPU without NVLink (30-series)
 
 Consumer Ampere has no NVLink and the stock driver blocks PCIe P2P. The
@@ -69,10 +92,16 @@ Setup + release flow: [docs/RELEASE.md](docs/RELEASE.md) · design: [docs/ARCHIT
 
 ## Also included
 
-- `configs/fused_moe/` — RTX 3090-tuned fused-MoE Triton configs (vLLM ships none for the 3090) →
-  faster MoE, zero accuracy change.
-- `benchmarks/` — the decode/prefill harness behind the table above (+ interpretation in
-  [`results.md`](benchmarks/results.md)).
+- `configs/fused_moe/` — RTX 3090-tuned fused-MoE Triton configs (vLLM ships none for the 3090). Used by
+  the **Triton** fused-MoE path (bf16/fp16/int8_w8a8); the Marlin `moe_wna16` W4A8/W4A16 path picks tiles
+  in compiled CUDA and does not read these. Faster Triton MoE, zero accuracy change.
+- `scripts/ampere_kernel_ci.sh` — runs the upstream mamba/GatedDeltaNet/causal-conv1d Triton kernel tests
+  on a self-hosted Ampere GPU (`BUILD_RUNNER`) against the shipped image: anti-regression for the vendored
+  JIT kernels (622 cases green on sm_86).
+- `benchmarks/` — the decode/prefill serving harness behind the table above + an Ampere **diagnostic**
+  harness (ncu IMMA-occupancy, comm-excluded decode-share, GDN kernel sweeps) for deciding whether a kernel
+  lever is worth building. See [`benchmarks/README.md`](benchmarks/README.md) and [`results.md`](benchmarks/results.md).
+- `docs/ROADMAP.md` — the prioritized shippable-optimization backlog (what's done / build-now / NO-GO).
 
 ## Credits
 

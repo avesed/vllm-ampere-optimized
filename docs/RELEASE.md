@@ -7,9 +7,11 @@ watch-upstream.yml (cron, every 6h)
   └─ gh api .../releases/latest  ≠  UPSTREAM_VLLM_VERSION ?
         └─ createWorkflowDispatch → build.yml(vllm_tag)
              ├─ drift-check     : git apply --check patches/*  (gates the rest)
-             ├─ wheel-fastpath  : apply patches → VLLM_USE_PRECOMPILED wheel → GitHub Release
-             ├─ image           : apply patches → docker build (sm_80+sm_86) → ghcr → smoke test
-             └─ bump-marker     : on BOTH succeeding, commit UPSTREAM_VLLM_VERSION = vllm_tag
+             ├─ wheel-overlay   : pip download vllm==<tag> (official RELEASE wheel) → overlay vllm/* hunks → GitHub Release
+             ├─ image-overlay   : FROM vllm/vllm-openai:<tag> + vllm/* hunks → ghcr → smoke test
+             ├─ ampere-kernel-ci: (opt-in BUILD_RUNNER) run upstream mamba/GDN Triton kernel tests on Ampere GPU
+             ├─ image-source    : (opt-in BUILD_RUNNER) apply FULL patches → from-source docker build (sm_80+sm_86)
+             └─ bump-marker     : on wheel+overlay-image succeeding, commit UPSTREAM_VLLM_VERSION = vllm_tag
 ```
 
 The marker bumps **only when wheel + image both succeed**, so a partial failure re-fires on the
