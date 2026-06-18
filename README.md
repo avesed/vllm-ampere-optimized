@@ -4,7 +4,7 @@ A vendored, **built-from-source** Ampere fork of **vLLM v0.23.0** + **FlashInfer
 whole NVIDIA Ampere line — A100 (`sm_80`) and RTX 3090 / A40 / A6000 / A10 (`sm_86`). It un-gates
 **W4A8 (int4 weights + int8 activations)** and adds native int8 kernels that upstream restricts to Hopper.
 
-- **Image:** [`ghcr.io/avesed/vllm-ampere-optimized`](https://github.com/avesed/vllm-ampere-optimized/pkgs/container/vllm-ampere-optimized) — built from the pinned vendored source on every change to `main`.
+- **Image:** [`ghcr.io/avesed/vllm-ampere-optimized`](https://github.com/avesed/vllm-ampere-optimized/pkgs/container/vllm-ampere-optimized) — built from the pinned vendored source and pushed by the maintainer (no CI auto-build).
 
 ## What's in the fork
 
@@ -18,7 +18,10 @@ whole NVIDIA Ampere line — A100 (`sm_80`) and RTX 3090 / A40 / A6000 / A10 (`s
 
 The int8 kernels are native (`.cu`/`.cuh`), so the fork is **vendored + built from source**: `vllm/`
 (v0.23.0) and `flashinfer/` (v0.6.12) carry the edits baked in; `patches/` + `scripts/revendor.sh`
-regenerate them on an upstream bump, and `build.yml` builds the image from source on every push to `main`.
+regenerate them on an upstream bump. The image is then **built and pushed locally** with
+`scripts/build_image_source.sh` — there is no CI auto-build (a self-hosted GPU runner on a public repo
+is a security risk); a github-hosted `patch-drift-check` only canaries when the edit recipe stops
+applying to a new upstream release.
 
 ## Why this exists
 

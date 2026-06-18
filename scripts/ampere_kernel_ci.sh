@@ -6,7 +6,7 @@
 # This catches Ampere codegen/numeric regressions after each upstream/torch/triton bump. Validated on a
 # real RTX 3090 (sm_86): 228 + 286 + ... cases pass.
 #
-# Skips gracefully without a GPU (the real run needs a self-hosted Ampere runner; set repo var BUILD_RUNNER).
+# Skips gracefully without a GPU — run it locally on an Ampere GPU box after build_image_source.sh.
 # Usage: ampere_kernel_ci.sh <image> <vllm_tag>
 set -euo pipefail
 
@@ -14,8 +14,8 @@ IMG="${1:?usage: ampere_kernel_ci.sh <image> <vllm_tag>}"
 TAG="${2:?usage: ampere_kernel_ci.sh <image> <vllm_tag>}"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "::warning::no GPU on this runner — skipping Ampere kernel CI for $IMG"
-  echo "(set repo variable BUILD_RUNNER to a self-hosted Ampere GPU runner to enable it)"
+  echo "::warning::no GPU here — skipping Ampere kernel CI for $IMG"
+  echo "(run this on an Ampere GPU box after building the image locally)"
   exit 0
 fi
 

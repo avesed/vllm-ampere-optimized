@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Gate the publish: boot the image with a tiny model, assert /health, and assert the
-# patched Marlin W4A8 scheme imports. Skips gracefully on a GPU-less runner (the real
-# test runs when BUILD_RUNNER points at a GPU self-hosted runner). Usage: smoke_test.sh <image>
+# patched Marlin W4A8 scheme imports. Skips gracefully without a GPU — run it locally on the GPU
+# box after building the image (scripts/build_image_source.sh). Usage: smoke_test.sh <image>
 set -euo pipefail
 
 IMG="${1:?usage: smoke_test.sh <image>}"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "::warning::no GPU on this runner — skipping runtime smoke test for $IMG"
-  echo "(set repo variable BUILD_RUNNER to a GPU self-hosted runner to enable it)"
+  echo "::warning::no GPU here — skipping runtime smoke test for $IMG"
+  echo "(run this on the GPU box after building the image locally)"
   exit 0
 fi
 

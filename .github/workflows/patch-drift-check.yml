@@ -36,9 +36,10 @@ jobs:
       - name: Replay recipe onto latest vLLM ${{ steps.up.outputs.vllm }} (temp)
         run: |
           git clone --depth 1 --branch "${{ steps.up.outputs.vllm }}" https://github.com/vllm-project/vllm.git _vllm_check
-          # 0001 (anchor-based, exits non-zero on skew) + 0002 (native, --check only)
+          # 0001 (anchor-based, exits non-zero on skew) + 0002/0003 (native + cache-key, --check only)
           python3 patches/regenerate.py _vllm_check
           git apply --check -p1 --directory=_vllm_check patches/0002-marlin-int8-8row-decode-ampere.patch
+          git apply --check -p1 --directory=_vllm_check patches/0003-aot-compile-cache-quant-scheme-key.patch
 
       - name: Replay recipe onto latest FlashInfer ${{ steps.up.outputs.fi }} (temp)
         run: |
@@ -56,5 +57,5 @@ jobs:
           TITLE="recipe drift: edits no longer apply to vLLM $VTAG / FlashInfer $FTAG"
           if [ -z "$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number')" ]; then
             gh issue create --title "$TITLE" \
-              --body "The vendored-fork edit recipe failed to replay onto the latest upstream tags. Refresh the anchors, then re-vendor: \`scripts/revendor.sh <vllm_tag> <flashinfer_tag>\`, review the diff, and open a PR to main (which triggers the from-source build). See patches/README.md."
+              --body "The vendored-fork edit recipe failed to replay onto the latest upstream tags. Refresh the anchors, then re-vendor: \`scripts/revendor.sh <vllm_tag> <flashinfer_tag>\`, review the diff, commit, and rebuild + push the image locally (\`OWNER=<you> scripts/build_image_source.sh\` — there is no CI auto-build). See patches/README.md."
           fi

@@ -1,7 +1,7 @@
-diff --git a/vllm/vllm/compilation/caching.py b/vllm/vllm/compilation/caching.py
+diff --git a/vllm/compilation/caching.py b/vllm/compilation/caching.py
 index 62da2d9..f914729 100644
---- a/vllm/vllm/compilation/caching.py
-+++ b/vllm/vllm/compilation/caching.py
+--- a/vllm/compilation/caching.py
++++ b/vllm/compilation/caching.py
 @@ -574,6 +574,20 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
      config_hash = vllm_config.compute_hash()
      factors.append(config_hash)

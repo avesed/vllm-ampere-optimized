@@ -5,6 +5,11 @@
 #            via upstream vllm/docker/Dockerfile -> sm_80 + sm_86 fatbin.
 #   stage 2: overlay the vendored int8-QK flashinfer/ (docker/Dockerfile.flashinfer-int8).
 # Push the final image to ghcr (:<tag>-ampere-<cu> + :latest).
+#
+# THIS IS THE RELEASE TOOL: run it YOURSELF on a local CUDA box and it pushes to ghcr. There is no CI
+# auto-build — a self-hosted GPU runner on a public repo is a security risk. Needs docker buildx + a
+# ghcr login (`docker login ghcr.io`) with packages:write. Optionally smoke-test after:
+#   scripts/smoke_test.sh <pushed-image>  &&  scripts/ampere_kernel_ci.sh <pushed-image> "$(cat UPSTREAM_VLLM_VERSION)"
 # Env: OWNER (required), CUDA_VERSION, TORCH_CUDA_ARCH_LIST. VLLM_TAG defaults to UPSTREAM_VLLM_VERSION.
 set -euo pipefail
 
@@ -18,6 +23,8 @@ VLLM_TAG="${VLLM_TAG:-$(cat UPSTREAM_VLLM_VERSION)}"   # the pinned vendored vLL
 IMAGE="ghcr.io/${OWNER,,}/vllm-ampere-optimized"       # ghcr path must be lowercase
 CU="cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')"
 JOBS="$(nproc)"; [ "$JOBS" -gt 8 ] && JOBS=8           # cap parallel TUs to bound build RAM
+# GHA registry cache only works inside GitHub Actions; locally use docker's own layer cache.
+GHA_CACHE=""; [ -n "${GITHUB_ACTIONS:-}" ] && GHA_CACHE="--cache-from type=gha --cache-to type=gha,mode=max"
 
 [ -f vllm/docker/Dockerfile ] || { echo "::error::vendored vllm/ source missing (vllm/docker/Dockerfile)"; exit 1; }
 [ -f flashinfer/include/flashinfer/mma.cuh ] || { echo "::error::vendored flashinfer/ source missing"; exit 1; }
@@ -38,7 +45,7 @@ docker buildx build vllm \
   --build-arg VLLM_BUILD_COMMIT="${GITHUB_SHA:-unknown}" \
   --build-arg VLLM_IMAGE_TAG="${VLLM_TAG}-ampere-${CU}" \
   --provenance=false \
-  --cache-from type=gha --cache-to type=gha,mode=max \
+  $GHA_CACHE \
   --tag "$VLLM_IMG" --load
 
 echo "== stage 2/2: overlay vendored int8-QK flashinfer + push final =="

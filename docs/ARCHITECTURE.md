@@ -2,44 +2,29 @@
 
 The maintainer's mental model. Why this repo is shaped the way it is.
 
-## Overlay, not a fork
+## Vendored fork, built from source
 
-This repo vendors **zero** vLLM source. It is a *patch-overlay build recipe*: CI checks out
-upstream `vllm-project/vllm` at a release tag, applies `patches/*.patch`, builds, publishes.
+This repo vendors the **complete** modified source — `vllm/` (upstream v0.23.0) and `flashinfer/`
+(v0.6.12) — with every edit baked in. It is **not** a patch-overlay, because the int8 work is
+**native**: `.cu`/`.cuh` kernels (the int8 8-row Marlin decode tile in patch 0002, the int8-QK
+FlashInfer IMMA path) that a pip-overlay onto an official wheel/image physically cannot carry. Native
+code ships only from a real source build — which is exactly why the source is vendored rather than
+patched at build time.
 
-Why not a real GitHub fork carrying a patch branch:
+`patches/` is no longer applied during a build — it is the **recipe** (`regenerate.py` for 0001 +
+`git apply` for 0002/0003 + `flashinfer_int8/apply_to_source.py`) that regenerates the vendored trees
+from a fresh upstream checkout, so an upstream bump stays reproducible and drift is detectable
+(`scripts/revendor.sh`; the github-hosted `patch-drift-check` canary replays it daily). See
+`patches/README.md`.
 
-- The standard fork-sync actions sync **branches, not tags** — and vLLM releases are tags
-  (`v0.23.0`). A fork's only structural perk (`on: push: tags`) never fires without bolting on
-  a tag-mirror step, at which point a `gh api .../releases/latest` compare is simpler and works
-  identically here.
-- Our change set is a small patch series (patch 0001 pure-Python; patch 0002 native, opt-in only).
-  Re-applying a tiny diff per release beats rebasing a long-lived branch against the whole upstream
-  tree every two weeks.
-- Pure-Python patches unlock a no-compile **overlay wheel** (see below: official released wheel +
-  our `vllm/*` hunks), awkward to reason about inside a fork's merge history.
-- Precedent: conda-forge feedstocks, AUR PKGBUILDs, and other vLLM rebuilds all use the thin
-  fetch→patch→build recipe model, not a vendored fork.
+## One build path: local, from source
 
-A true fork would only pay off if we ever carried many deep, intertwined **native** (`.cu`/CMake)
-changes. The W4A8 Marlin patch is the opposite of that.
-
-## Two build paths
-
-| path | runner | speed | when |
-|---|---|---|---|
-| **overlay wheel** (`pip download vllm==<tag>` + `vllm/*` hunks) | `ubuntu-latest` | minutes, no compile | always — the pip artifact |
-| **overlay image** (`FROM vllm/vllm-openai:<tag>` + patch) | `ubuntu-latest` | ~1–2 min, no compile | always — the shipped `:latest` image |
-| **from-source single-arch image** (upstream `docker/Dockerfile`) | self-hosted GPU / larger runner | full compile | opt-in (`BUILD_RUNNER`); smaller artifact, or once a patch needs native code |
-
-Both default paths reuse **official upstream RELEASE builds** (never main/nightly) — the wheel is the
-official released wheel (`pip download vllm==<tag>`) with our Python hunks overlaid, the image starts
-from upstream's published `:<tag>` image. We self-compile only on demand. **Why no
-self-compile by default:** for a pure-Python patch it gives zero inference speedup — a fatbin loads
-only the cubin matching the running SM, and upstream already ships sm_86 SASS; single-arch only
-shrinks the artifact and build time. A **native-code guard** in `scripts/apply_patches.sh` flips the
-from-source path on automatically if a patch ever edits `.cu`/`.cpp`/CMake (else the prebuilt
-kernels would be stale — a silent correctness bug).
+The image is built **from the vendored source on a local GPU box** (`scripts/build_image_source.sh`:
+vLLM → sm_80+sm_86 fatbin, then the int8-QK FlashInfer overlaid) and pushed to ghcr **by the
+maintainer**. There is **no CI build**: a from-source vLLM CUDA build needs a GPU, and a self-hosted
+GPU runner on a **public** repo is a security risk — a malicious PR could run arbitrary code on the
+runner. The only CI is two github-hosted canaries (`watch-upstream`, `patch-drift-check`) that just
+open issues; they never build or push. See `docs/RELEASE.md`.
 
 ## Arch: `TORCH_CUDA_ARCH_LIST="8.0 8.6"` (all Ampere)
 
@@ -73,7 +58,7 @@ driver floor + ecosystem:
 - **cu130** (CUDA 13.0): upstream Dockerfile + `requirements/cuda.txt` (`nvidia-cutlass-dsl[cu13]`)
   default → from-source builds with **zero override**. Driver ≥ 580.65.06. Default here.
 - **cu129** (CUDA 12.9): vLLM's pip-install default; driver ≥ 575. Best for shipping to arbitrary
-  Ampere hosts. Produce it by dispatching `build.yml` with `cuda_version=12.9.1`.
+  Ampere hosts. Produce it locally with `CUDA_VERSION=12.9.1 scripts/build_image_source.sh`.
 - Downgrading to cu129 for the *source* build can trip the `nvidia-cutlass-dsl[cu13]` pin at some
   tags — verify it resolves, or stay on cu130.
 

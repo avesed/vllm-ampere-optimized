@@ -5,10 +5,12 @@ and `flashinfer/` (upstream v0.6.12), committed with all our edits baked in. `pa
 applied at build time — it is the **recipe** that regenerates those vendored trees from a fresh
 upstream checkout (so an upstream bump is reproducible and drift is detectable).
 
-The complete fork is built **from source** on every push to `main`
-(`.github/workflows/build.yml` → `scripts/build_image_source.sh`): vLLM from `vllm/` (sm_80+sm_86
-fatbin) + the int8-QK FlashInfer overlaid from `flashinfer/`. Native changes (`.cu/.cuh`) ship only
-from source — which is exactly why this is vendored rather than a pure-Python overlay.
+The complete fork is built **from source** by the maintainer running `scripts/build_image_source.sh`
+**locally** (vLLM from `vllm/` → sm_80+sm_86 fatbin + the int8-QK FlashInfer overlaid from
+`flashinfer/`) and pushing to ghcr. There is **no CI auto-build**: the from-source CUDA build needs a
+GPU, and a self-hosted GPU runner on a public repo is a security risk (a malicious PR could run code
+on it). The only CI is the github-hosted `patch-drift-check` canary below. Native changes (`.cu/.cuh`)
+ship only from source — which is exactly why this is vendored rather than a pure-Python overlay.
 
 ## The edits (the recipe)
 
@@ -34,10 +36,11 @@ head_dim 128/256, GQA, causal/non-causal, paged+ragged, qo<kv append); head_dim 
 
 ```bash
 scripts/revendor.sh <vllm_tag> <flashinfer_tag>   # e.g. v0.23.0 v0.6.12
-# clones the fresh tags into vllm/ + flashinfer/, replays the recipe (regenerate.py + 0002 +
+# clones the fresh tags into vllm/ + flashinfer/, replays the recipe (regenerate.py + 0002 + 0003 +
 # apply_to_source.py); any drifted anchor FAILS LOUDLY. Then:
 git diff                                           # review
-# open a PR to main — merging triggers the from-source build.
+git commit -am "revendor vllm@<tag> + flashinfer@<tag>"
+OWNER=<you> scripts/build_image_source.sh          # build from source + push to ghcr (local; no CI auto-build)
 ```
 
 `patch-drift-check.yml` replays the recipe onto the LATEST upstream tags daily (in temp checkouts,

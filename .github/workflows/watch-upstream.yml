@@ -2,9 +2,10 @@ name: watch-upstream
 
 # Polls vllm-project/vllm for a new stable release every 6h. In the vendored-fork model a new
 # upstream release is NOT a rebuild — it needs RE-VENDORING (clone the new tag + replay the edit
-# recipe via scripts/revendor.sh, as a PR to main). So when the latest tag differs from the
-# committed UPSTREAM_VLLM_VERSION marker, open a re-vendor issue for a human (the recipe can drift
-# and needs review). build.yml then runs automatically when that PR merges to main.
+# recipe via scripts/revendor.sh). So when the latest tag differs from the committed
+# UPSTREAM_VLLM_VERSION marker, open a re-vendor issue for a human (the recipe can drift and needs
+# review). There is no CI auto-build: after re-vendoring you build + push the image yourself locally
+# (scripts/build_image_source.sh) — a self-hosted GPU runner on a public repo is a security risk.
 
 on:
   schedule:
@@ -55,5 +56,5 @@ jobs:
           TITLE="re-vendor: upstream vLLM $TAG available (vendored is $(cat UPSTREAM_VLLM_VERSION))"
           if [ -z "$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number')" ]; then
             gh issue create --title "$TITLE" \
-              --body "Upstream vLLM \`$TAG\` is newer than the vendored \`$(cat UPSTREAM_VLLM_VERSION)\`. Re-vendor the fork: \`scripts/revendor.sh $TAG <flashinfer_tag>\` (replays the edit recipe; fails loudly if anchors drifted), review \`git diff\`, and open a PR to main — merging triggers the from-source build. See patches/README.md."
+              --body "Upstream vLLM \`$TAG\` is newer than the vendored \`$(cat UPSTREAM_VLLM_VERSION)\`. Re-vendor the fork: \`scripts/revendor.sh $TAG <flashinfer_tag>\` (replays the edit recipe; fails loudly if anchors drifted), review \`git diff\`, commit, then rebuild + push the image locally (\`OWNER=<you> scripts/build_image_source.sh\` — no CI auto-build). See patches/README.md."
           fi
