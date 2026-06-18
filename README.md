@@ -1,22 +1,32 @@
 # vllm-ampere-optimized
 
-vLLM with **W4A8 (int4 weights + int8 activations) un-gated for the whole NVIDIA Ampere line** —
-A100 (`sm_80`) and RTX 3090 / A40 / A6000 / A10 (`sm_86`). Shipped as a patch over the **official**
-upstream build — pip wheel + Docker image, auto-rebuilt on every vLLM release. No fork to maintain,
-no self-compile.
+A vendored, **built-from-source** Ampere fork of **vLLM v0.23.0** + **FlashInfer v0.6.12** for the
+whole NVIDIA Ampere line — A100 (`sm_80`) and RTX 3090 / A40 / A6000 / A10 (`sm_86`). It un-gates
+**W4A8 (int4 weights + int8 activations)** and adds native int8 kernels that upstream restricts to Hopper.
 
-- **Wheels:** [Releases](https://github.com/avesed/vllm-ampere-optimized/releases) · **Images:** [`ghcr.io/avesed/vllm-ampere-optimized`](https://github.com/avesed/vllm-ampere-optimized/pkgs/container/vllm-ampere-optimized)
+- **Image:** [`ghcr.io/avesed/vllm-ampere-optimized`](https://github.com/avesed/vllm-ampere-optimized/pkgs/container/vllm-ampere-optimized) — built from the pinned vendored source on every change to `main`.
+
+## What's in the fork
+
+- **W4A8 on Ampere** (`patches/0001`, upstream [#38066](https://github.com/vllm-project/vllm/pull/38066)) —
+  routes int4-weight + int8-activation through Marlin. The big serving win (table below). Pure-Python.
+- **int8 8-row Marlin decode tile** (`patches/0002`, native `.cu`) — completes the W4A8 small-batch decode path.
+- **int8-QK prefill attention** (`flashinfer/`, int8 IMMA in `compute_qk`) — int8 QK^T + fp16 PV for the
+  full-attn layers of head_dim-256 hybrids (Qwen3.5/3.6), validated cos 0.9999 vs fp16; a long-context prefill lever.
+- **AOT-compile cache-key fix** (`patches/0003`) — keys the torch.compile cache on the quant scheme
+  (without it a W4A8 model loads a W4A16's cached graph and crashes — `KeyError: weight_zero_point`).
+
+The int8 kernels are native (`.cu`/`.cuh`), so the fork is **vendored + built from source**: `vllm/`
+(v0.23.0) and `flashinfer/` (v0.6.12) carry the edits baked in; `patches/` + `scripts/revendor.sh`
+regenerate them on an upstream bump, and `build.yml` builds the image from source on every push to `main`.
 
 ## Why this exists
 
 W4A8 is the best serving quant for Ampere — int4 weights cut decode bandwidth, int8 activations speed
 up prefill — and **Marlin can run it on Ampere**. But vLLM gates its W4A8 path to Hopper: on an Ampere
 GPU, loading a W4A8 checkpoint **crashes at load** (a weight-shape mismatch in
-`process_weights_after_loading`), so Ampere users are stuck on W4A16.
-
-This repo's patch (`patches/0001`, upstream [#38066](https://github.com/vllm-project/vllm/pull/38066))
-routes W4A8 through Marlin so the whole Ampere line can run it — shipped automatically on top of each
-official upstream release.
+`process_weights_after_loading`), so Ampere users are stuck on W4A16. This fork routes W4A8 through
+Marlin — plus the native int8 paths above — for the whole Ampere line.
 
 ## Validated throughput & quality
 
@@ -35,9 +45,6 @@ cudagraph. All numbers **tok/s**:
 - **Quality preserved:** GSM8K with thinking — W4A16 **81.6%** vs W4A8 **85.6%** (N=250). int8
   dynamic-per-token activations carry ~zero quality cost under the AWQ+mse weight quant.
 - The fork's **W4A16 is byte-identical to stock** — the patch only *adds* W4A8, zero regression elsewhere.
-- W4A8 + cudagraph also needed fixing a vLLM AOT-compile cache-key collision (`patches/0003`): the
-  compile cache key omitted the quant scheme, so a W4A8 model could load a W4A16's cached graph and
-  crash (`KeyError: weight_zero_point`). The fork keys the cache on the quant scheme.
 
 Flagship 27B on 2× RTX 3090 (tp2): W4A8 ≈ 50 tok/s single-stream decode, 393 batched, 1229 prefill.
 
