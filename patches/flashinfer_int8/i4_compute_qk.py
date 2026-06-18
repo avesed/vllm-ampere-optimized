@@ -141,14 +141,19 @@ INT8_BRANCH = r'''  uint32_t a_frag[KTraits::NUM_MMA_Q][4], b_frag[4];
     const uint32_t warp_kv_base = get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_KV * 16;
     const int8_t* q_base = reinterpret_cast<const int8_t*>(q_smem->base);
     const int8_t* k_base = reinterpret_cast<const int8_t*>(k_smem->base);
+    // Read the b128-swizzled int8 smem via the SAME get_permuted_offset the smem_t uses, so the
+    // SWIZZLE MODE is honored automatically: Q is always k128B; KV is k64B when int8 + HEAD_DIM_VO
+    // ==64 (UPCAST_STRIDE_K==4) else k128B. (D64 int8 stores K with k64B: off = i*4 + (j ^ ((i/2)
+    // %4)); the old hardcoded (j ^ (i%8)) only matched k128B -> D64 garbage. get_permuted_offset
+    // returns the offset in b128 units; byte off = that*16 + e.)
     auto ldq = [&](uint32_t row, uint32_t dcol) -> uint32_t {
       uint32_t jb = dcol >> 4, e = dcol & 15;
-      uint32_t off = (row * US_Q + (jb ^ (row & 7u))) * 16u + e;
+      uint32_t off = q_smem->template get_permuted_offset<US_Q>(row, jb) * 16u + e;
       return *reinterpret_cast<const uint32_t*>(q_base + off);
     };
     auto ldk = [&](uint32_t row, uint32_t dcol) -> uint32_t {
       uint32_t jb = dcol >> 4, e = dcol & 15;
-      uint32_t off = (row * US_K + (jb ^ (row & 7u))) * 16u + e;
+      uint32_t off = k_smem->template get_permuted_offset<US_K>(row, jb) * 16u + e;
       return *reinterpret_cast<const uint32_t*>(k_base + off);
     };
     // Per-fragment absolute q-token indices (two q rows: g, g+8) via group_size.divmod,
@@ -389,7 +394,17 @@ __device__ __forceinline__ const float* get_k_dequant_scale(const Params& params
     if (params.maybe_k_scale == nullptr) return nullptr;
     uint32_t off = 0;
     if constexpr (i4_has_kv_scale_indptr<Params>::value) {
-      off = params.maybe_kv_scale_indptr[request_idx];
+      // I-5: per-request k-scale offset. maybe_kv_scale_indptr is the kv-TOKEN prefix sum
+      // (cumulative logical kv length over requests); maybe_k_scale is laid out flat
+      // [sum kv_len] in request-major logical order, so request `request_idx`'s per-token
+      // k-scale segment begins at maybe_k_scale + maybe_kv_scale_indptr[request_idx], and
+      // the kernel's logical-within-request kv_idx then indexes into that segment. The field
+      // exists for ALL int8 BATCH modules (codegen), but is nullptr for single-request /
+      // callers that don't pass it -> offset 0 (request-local tensor / one request). Mirror
+      // of the q-scale offset (params.q_indptr[request_idx]) but kv-token based.
+      if (params.maybe_kv_scale_indptr != nullptr) {
+        off = params.maybe_kv_scale_indptr[request_idx];
+      }
     }
     return params.maybe_k_scale + off;
   } else {

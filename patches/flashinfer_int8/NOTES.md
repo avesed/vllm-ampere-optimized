@@ -223,6 +223,7 @@ kernel indexes `maybe_k_scale[kv_idx]` with kv_idx logical-within-request and of
 `maybe_kv_scale_indptr` field exists; SFINAE → 0). For multi-request batch the caller must pass a
 request-local k-scale view OR add a `maybe_kv_scale_indptr` Params field + offset (q-scale already shows
 the pattern). The matmul/dequant math is correct; only the global→request k-scale tensor offset remains.
+**[CLOSED by I-5 below — `maybe_kv_scale_indptr` plumbed; multi-request paged + ragged validated.]**
 
 ## smooth_k composition
 smooth_k = subtract per-(head,channel) mean of K BEFORE int8 quant (caller side, as in the tests). The
@@ -312,3 +313,91 @@ activation memory. The int8-QK matmul lever itself is real + net-positive; the c
 carries the gather/quant cost. **The landing deliverable: chunked+cached-prefix int8 makes 128k
 single-card prefill FIT and stay coherent (needle correct, int8 on ALL chunks) — the prior path OOMed
 >64k single-card.** For max int8 benefit use the LARGEST chunk that fits.
+
+---
+
+# I-5 NOTES — per-request k-scale offset for MULTI-request batched int8-QK (the gap CLOSED)
+
+**STATUS: DONE + validated on real RTX 3090 (sm_86), image v0.23.0, FlashInfer 0.6.12.** The I-4b
+flagged gap ("k-scale per-request offset is NOT plumbed; single-request correct, multi-request needs a
+request-local k-scale view") is CLOSED. A batched prefill of N requests with DISTINCT per-request
+per-token k-scales is now numerically correct for EVERY request in both the paged and ragged fa2 paths.
+
+## The bug (confirmed before fixing — req0 OK, req1..N-1 corrupted)
+The kernel reads `maybe_k_scale + maybe_kv_scale_indptr[request_idx]`, but `maybe_kv_scale_indptr` was
+never declared (SFINAE → offset 0), so EVERY request used request-0's per-token k-scale segment.
+q-scale was already offset by `params.q_indptr[request_idx]` (correct), so req0 stayed correct and the
+error grew with request index. The trap: with statistically-similar per-request scales the error only
+nicks cos ~1e-4 (FALSE PASS on a weak test). Built `i5_paged_test.py`/`i5_ragged_test.py` with DISTINCT
+per-request K magnitudes (KMAG=[0.1,1.0,8.0]) so a wrong k-scale offset is unmistakable:
+- BEFORE (current recipe, N=3 L=128/333/777, GQA g4, D128, causal):
+  - paged: req0 cos 0.99995 PASS / req1 cos **0.98234** FAIL / req2 cos **0.30845** FAIL
+  - ragged: identical (req2 cos 0.308, mag 0.715)
+
+## The fix — `maybe_kv_scale_indptr` (kv-TOKEN prefix sum), mirror of the q-scale offset
+- **i4_apply.py P1 (modules.py BATCH branch)**: append `maybe_kv_scale_indptr` / `int32_t` to the int8
+  batch additional tensors (after maybe_k_scale). `generate_additional_params` auto-emits the
+  `int32_t* maybe_kv_scale_indptr;` Params field + `Optional<ffi::Tensor>` func param + nullptr-tolerant
+  setter — exactly like the other `maybe_*` tensors. (single_prefill is one request → no batch field.)
+- **i4_apply.py P6**: add trailing `scale_kv_indptr=None` param to `paged_run`/`ragged_run` (the
+  registered ops in `get_batch_prefill_module`; `register_custom_op` is a no-op passthrough in this build
+  so KEYWORD args work). The int8 C++ forwarding (P2) passes `scale_kv_indptr` right after `scale_k` so
+  it maps to `maybe_kv_scale_indptr`.
+- **i4_apply.py P8 (paged wrapper run)**: derive the kv-TOKEN prefix sum from the planned
+  `_paged_kv_indptr_buf` (pages) + `_paged_kv_last_page_len_buf` + `page_size`
+  (`kvlen = (pages-1)*page_size + last_page_len`, cumsum), pass `scale_kv_indptr=` by keyword.
+- **i4_apply.py P9 (ragged wrapper run)**: `self._kv_indptr_buf` IS the kv-token prefix sum → pass it
+  directly. Both P8/P9 guard the keyword on `self._jit_module is None` (the user-jit passthrough uses
+  `*args`, no such param).
+- **i4_compute_qk.py (get_k_dequant_scale)**: the SFINAE offset already existed; added a **runtime
+  nullptr guard** on `maybe_kv_scale_indptr` because the field now ALWAYS exists for int8 batch modules
+  but is nullptr for single-request / callers that don't pass it (→ offset 0, bit-identical to before).
+Caller CONTRACT unchanged from single-request: pass flat `scale_q` [Σqo] + flat `scale_k` [Σkv] in
+request-major logical order; the wrapper auto-derives both per-request offsets (q via its own
+qo_indptr, k via the new kv_scale_indptr). Layout = exactly the SFINAE accessor expects.
+
+## Final cos + magnitude (DISTINCT per-request K mags; PASS = EVERY req cos>0.99 AND mag∈[0.95,1.05])
+- **AFTER fix, N=3 L=128/333/777 GQA g4 D128 causal** (the prior FAIL case):
+  - paged:  req0 cos 0.99995 / req1 cos **0.99993** / req2 cos **0.99982** — ALL PASS (was 0.982/0.308)
+  - ragged: req0 0.99995 / req1 0.99993 / req2 0.99982 — ALL PASS
+- **i5_sweep.py** (paged + ragged each): N∈{3,5,8}, GQA groups {g1,g2,g4,g8,MHA}, D∈{128,256},
+  causal+non-causal, page {16,32}, plus a qo<kv APPEND case (qo_len<kv_len end-aligned, D128+D256) —
+  **ALL_PASS, worst-request cos 0.99969** across every config. Single-request regression (i4 single /
+  i3 paged / i3 ragged sweeps) re-run: ALL_PASS, cos 0.9999, mag ~1.0 — no regression.
+- **Perf** (single_prefill, real-scale, cuda-event median, causal H8): D128 L16384 **1.166×**,
+  D256 L16384 **1.037×** — within the documented bands (no regression; the offset is one
+  nullptr-guarded pointer-add per CTA, not per element).
+
+## Other int8-dtype gap found + closed during the audit: head_dim 64
+While sweeping head_dim {64,128,256}, **head_dim=64 int8 was found PRE-EXISTING broken** (never
+validated — prior sweeps were D128/D256 only): single-request D64 cos 0.91–0.98 (NOT a multi-request
+issue). Root cause: for int8 KV with `HEAD_DIM_VO==64` the KV smem uses the **k64B swizzle** (`off =
+i*4 + (j ^ ((i/2)%4))` + a different token→row layout), whereas the int8 IMMA read assumed k128B
+(`j ^ (i%8)`). Refactored the int8 `ldq`/`ldk` to use the canonical `smem_t::get_permuted_offset<US>`
+(swizzle-mode-correct by construction; behaviorally identical for the deployed k128B D128/D256 →
+0 perf/accuracy change). The k64B path ALSO needs a different token-row mapping (k64B `produce_kv`
+uses `kv_idx = base + warp*8 + lane/4`, 2-row interleave), which the int8 read does not implement, so
+D64 is **GUARDED unsupported**: `gen_*_prefill_module` asserts `head_dim_vo != 64` for int8 q (loud
+error, never silent garbage). head_dim 64 is in NO deployed int8-QK path (the vLLM backend targets
+hd256; models are hd128/hd256), so guarding is the complete+stable resolution; a real k64B
+implementation is left as future work if an hd64 int8 model ever appears. Validated: i5_sweep's
+"head_dim 64 guard" case confirms the assert fires.
+
+## Files (I-5, in this dir)
+- `i5_paged_test.py` / `i5_ragged_test.py` — the N≥3 multi-request gate (distinct per-request K mags;
+  per-request cos+mag vs each request's fp16 single reference). env: H/HKV/D/PAGE/CAUSAL/LENS/KMAG.
+- `i5_sweep.py` — full multi-request matrix (paged+ragged, N/GQA/D/causal/page/qo<kv) + the D64 guard.
+- Recipe edits: `i4_apply.py` (P1 modules.py kv_scale_indptr + D64 guard; P2 C++ scale_kv_indptr
+  forward; P6 run() signatures; P8 paged wrapper kv-token prefix-sum; P9 ragged wrapper kv_indptr) and
+  `i4_compute_qk.py` (get_permuted_offset swizzle-correct ldq/ldk + kv_scale_indptr nullptr guard).
+- Vendored `flashinfer/` regenerated; `apply_to_source.py` on a FRESH `git clone --depth 1 --branch
+  v0.6.12` reproduces all 5 recipe-touched files **byte-identical** to the committed tree (all anchors
+  match) — verified.
+
+## Dev loop (I-5, per `--rm` container) — same as I-4
+```
+docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0 -e HOME=/out \
+  -v /mnt/coder/workspaces/trevor/d2m:/out --shm-size=2g --entrypoint bash IMG -lc "
+    python3 /out/i1_apply.py && python3 /out/i4_apply.py && python3 /out/i4_compute_qk.py &&
+    rm -rf /out/.cache/flashinfer && python3 /out/i5_sweep.py 2>&1 | tail -30"
+```

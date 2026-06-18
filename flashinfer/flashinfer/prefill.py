@@ -514,6 +514,7 @@ def get_batch_prefill_module(backend, *args):
         scale_q: Optional[torch.Tensor] = None,
         scale_k: Optional[torch.Tensor] = None,
         scale_v: Optional[torch.Tensor] = None,
+        scale_kv_indptr: Optional[torch.Tensor] = None,  # I-5: per-request k-scale offset
     ) -> None:
         # Check if FP8 by presence of scale tensors
         is_fp8 = scale_q is not None
@@ -545,6 +546,7 @@ def get_batch_prefill_module(backend, *args):
                     maybe_v_cache_sf,
                     scale_q,
                     scale_k,
+                    scale_kv_indptr,
                     logits_soft_cap,
                     sm_scale,
                     1.0 / rope_scale,  # rope_rcp_scale
@@ -732,6 +734,7 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        scale_kv_indptr: Optional[torch.Tensor] = None,  # I-5: per-request k-scale offset
     ) -> None:
         if backend == "trtllm-gen":
             assert num_qo_heads is not None
@@ -801,6 +804,7 @@ def get_batch_prefill_module(backend, *args):
                     value_block_scales,
                     scale_q,
                     scale_k,
+                    scale_kv_indptr,
                     logits_soft_cap,
                     sm_scale,
                     1.0 / rope_scale,  # rope_rcp_scale
@@ -946,6 +950,7 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        scale_kv_indptr: Optional[torch.Tensor] = None,  # I-5: per-request k-scale offset
     ) -> None:
         pass
 
@@ -2584,7 +2589,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 ]
 
             assert self._cached_module is not None, "cached module is not initialized"
-            self._cached_module.paged_run(*run_args)
+            # I-5: per-request k-scale offset (kv-TOKEN prefix sum) for multi-request int8 batch.
+            # Only the standard get_batch_prefill_module path declares scale_kv_indptr; the
+            # user-supplied _jit_module passthrough does not, so guard the keyword on it.
+            if self._jit_module is None:
+                paged_scale_kv_indptr = None
+                if q.dtype == torch.int8 and self._batch_size is not None and self._batch_size > 1:
+                    _pi = self._paged_kv_indptr_buf[: self._batch_size + 1].to(torch.int64)
+                    _lpl = self._paged_kv_last_page_len_buf[: self._batch_size].to(torch.int64)
+                    _pages = _pi[1:] - _pi[:-1]
+                    _kvlen = (_pages - 1) * page_size + _lpl
+                    paged_scale_kv_indptr = torch.zeros(
+                        self._batch_size + 1, dtype=torch.int32, device=q.device
+                    )
+                    paged_scale_kv_indptr[1:] = torch.cumsum(_kvlen, 0).to(torch.int32)
+                self._cached_module.paged_run(*run_args, scale_kv_indptr=paged_scale_kv_indptr)
+            else:
+                self._cached_module.paged_run(*run_args)
 
             is_float_one = isinstance(v_scale, float) and v_scale == 1.0
             if v_scale is not None and not is_float_one:
@@ -3613,7 +3634,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 run_args.extend(list(args))
 
         assert self._cached_module is not None, "cached module is not initialized"
-        self._cached_module.ragged_run(*run_args)
+        # I-5: per-request k-scale offset. For ragged, kv_indptr IS the kv-token prefix sum.
+        # Guard the keyword on the standard module path (user _jit_module lacks the param).
+        if self._jit_module is None:
+            ragged_scale_kv_indptr = (
+                self._kv_indptr_buf if q.dtype == torch.int8 else None
+            )
+            self._cached_module.ragged_run(*run_args, scale_kv_indptr=ragged_scale_kv_indptr)
+        else:
+            self._cached_module.ragged_run(*run_args)
 
         # Apply V scaling for NVFP4 ragged KV if v_scale is provided and not equal to 1.0
         is_float_one = isinstance(v_scale, float) and v_scale == 1.0

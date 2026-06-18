@@ -21,9 +21,11 @@ from source — which is exactly why this is vendored rather than a pure-Python 
 
 **FlashInfer** (`flashinfer/`) — `flashinfer_int8/apply_to_source.py` (runs i1_apply + i4_apply + i4_compute_qk):
 native int8-QK IMMA (`m16n8k32 s8s8s32`) wired into `compute_qk` (mma.cuh wrapper, s32 accum, per-token
-q/k dequant + smooth_k, PV fp16) + the int8 dtype path through the JIT codegen + per-token scale plumbing.
-Validated real RTX 3090: cos 0.9999 vs fp16 incl head_dim=256; e2e Qwen3.5-9B-W4A8 64k +1.9% / 128k chunked +2.0% TTFT.
-See `flashinfer_int8/NOTES.md`.
+q/k dequant + smooth_k, PV fp16) + the int8 dtype path through the JIT codegen + per-token scale plumbing,
+incl. per-request q AND k scale offsets (`q_indptr` / `maybe_kv_scale_indptr`) for MULTI-request batched
+prefill (paged + ragged). Validated real RTX 3090: cos 0.9999 vs fp16 single- AND multi-request (N≥3,
+head_dim 128/256, GQA, causal/non-causal, paged+ragged, qo<kv append); head_dim 64 guarded unsupported
+(k64B swizzle); e2e Qwen3.5-9B-W4A8 64k +1.9% / 128k chunked +2.0% TTFT. See `flashinfer_int8/NOTES.md`.
 
 ## Re-vendor on an upstream bump
 

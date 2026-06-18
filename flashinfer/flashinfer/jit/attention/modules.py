@@ -527,6 +527,14 @@ def gen_single_prefill_module(
         ]
         additional_tensor_dtypes = ["uint8_t", "float", "uint8_t", "uint8_t"]
         if dtype_q == torch.int8:  # I-4a: per-token int8-QK dequant scales
+            # I-5 audit: the int8 IMMA QK read assumes the k128B smem swizzle. For
+            # head_dim_vo==64 the KV smem uses the k64B swizzle + a different token-row
+            # layout, which the int8 path does not implement -> would be silently wrong.
+            # Guard it loudly (head_dim 64 is not in any deployed int8-QK path: hd128/hd256).
+            assert head_dim_vo != 64, (
+                "int8-QK prefill does not support head_dim_vo==64 (k64B smem swizzle "
+                "unimplemented); use head_dim 128/256 or the f16 path."
+            )
             additional_tensor_names += ["maybe_q_scale", "maybe_k_scale"]
             additional_tensor_dtypes += ["float", "float"]
         additional_scalar_names = [
@@ -1024,8 +1032,17 @@ def gen_batch_prefill_module(
             "uint8_t",
         ]  # NOTE(Zihao): int32_t should follow dtype_idx
         if dtype_q == torch.int8:  # I-4a: per-token int8-QK dequant scales
+            # I-5 audit: head_dim_vo==64 uses the k64B KV smem swizzle (unimplemented in the
+            # int8 IMMA read) -> guard loudly. Deployed int8-QK paths are hd128/hd256 only.
+            assert head_dim_vo != 64, (
+                "int8-QK prefill does not support head_dim_vo==64 (k64B smem swizzle "
+                "unimplemented); use head_dim 128/256 or the f16 path."
+            )
             additional_tensor_names += ["maybe_q_scale", "maybe_k_scale"]
             additional_tensor_dtypes += ["float", "float"]
+            # I-5: per-request k-scale offset (kv-TOKEN prefix sum) for MULTI-request batch.
+            additional_tensor_names += ["maybe_kv_scale_indptr"]
+            additional_tensor_dtypes += ["int32_t"]
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
