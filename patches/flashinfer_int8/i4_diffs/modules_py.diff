@@ -1,0 +1,22 @@
+--- /usr/local/lib/python3.12/dist-packages/flashinfer/jit/attention/modules.py.i4orig	2026-06-18 06:21:33.155297266 +0000
++++ /usr/local/lib/python3.12/dist-packages/flashinfer/jit/attention/modules.py	2026-06-18 06:21:33.156675388 +0000
+@@ -526,6 +526,9 @@
+             "maybe_v_cache_sf",
+         ]
+         additional_tensor_dtypes = ["uint8_t", "float", "uint8_t", "uint8_t"]
++        if dtype_q == torch.int8:  # I-4a: per-token int8-QK dequant scales
++            additional_tensor_names += ["maybe_q_scale", "maybe_k_scale"]
++            additional_tensor_dtypes += ["float", "float"]
+         additional_scalar_names = [
+             "logits_soft_cap",
+             "sm_scale",
+@@ -1020,6 +1023,9 @@
+             "uint8_t",
+             "uint8_t",
+         ]  # NOTE(Zihao): int32_t should follow dtype_idx
++        if dtype_q == torch.int8:  # I-4a: per-token int8-QK dequant scales
++            additional_tensor_names += ["maybe_q_scale", "maybe_k_scale"]
++            additional_tensor_dtypes += ["float", "float"]
+         additional_scalar_names = [
+             "logits_soft_cap",
+             "sm_scale",
