@@ -574,11 +574,60 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
     config_hash = vllm_config.compute_hash()
     factors.append(config_hash)
 
+    # 1b. factors come from the quantization scheme.
+    # vllm_config.compute_hash() (via ModelConfig.compute_hash) does NOT
+    # capture the resolved quantization scheme details: the discriminating
+    # info (compressed-tensors `format`, per-group weight/activation
+    # num_bits/strategy/symmetric, e.g. pack-quantized W4A16 vs int-quantized
+    # W4A8) lives in hf_config.quantization_config, which is not part of the
+    # hashed factors for the compiled language-model backbone. Without this,
+    # two checkpoints of the SAME architecture but DIFFERENT quant schemes
+    # collide on the AOT-compile cache key and one loads the other's compiled
+    # graph -> `KeyError: 'weight_zero_point'` (W4A16 registers
+    # weight_zero_point; symmetric W4A8 does not). See fork
+    # eval/INT8_CUDAGRAPH_ROOTCAUSE.md.
+    factors.append(_quantization_hash_factor(vllm_config))
+
     # 2. inductor factors if applicable
     if envs.VLLM_USE_MEGA_AOT_ARTIFACT:
         factors.extend(get_inductor_factors())
 
     return factors
+
+
+def _quantization_hash_factor(vllm_config: VllmConfig) -> str:
+    """Stable hash of the resolved quantization scheme.
+
+    Captures the method name plus the raw `quantization_config` dict from the
+    HF config (compressed-tensors `format`, per-group weight/activation specs,
+    etc.) so distinct quant schemes never share an AOT-compile cache key.
+    """
+    parts: list[str] = []
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is not None:
+        parts.append(str(getattr(model_config, "quantization", None)))
+        hf_config = getattr(model_config, "hf_config", None)
+        quant_cfg = getattr(hf_config, "quantization_config", None)
+        if quant_cfg is not None:
+            try:
+                # repr() over a sorted, normalized view is stable enough; the
+                # quant config is a plain (possibly nested) dict for
+                # compressed-tensors / GPTQ / AWQ checkpoints.
+                parts.append(repr(_stable_repr(quant_cfg)))
+            except Exception:
+                parts.append(repr(quant_cfg))
+    return safe_hash(" ".join(parts).encode(), usedforsecurity=False).hexdigest()
+
+
+def _stable_repr(obj: Any) -> Any:
+    """Recursively canonicalize dict/list/set into a sorted, hashable form."""
+    if isinstance(obj, dict):
+        return tuple(sorted((str(k), _stable_repr(v)) for k, v in obj.items()))
+    if isinstance(obj, (list, tuple)):
+        return tuple(_stable_repr(v) for v in obj)
+    if isinstance(obj, set):
+        return tuple(sorted(_stable_repr(v) for v in obj))
+    return obj
 
 
 def _compute_code_hash_with_content(file_contents: dict[str, str]) -> str:

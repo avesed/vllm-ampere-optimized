@@ -1,0 +1,50 @@
+# Qwen3.5-9B (dense hybrid VL) — the USER'S proven W4 quant recipe applied to the dense 9B.
+# Method: AWQModifier (scale-search activation smoothing, duo_scaling=both, n_grid=20)
+#         + QuantizationModifier (int4 group_size=32 symmetric weights, observer=mse).
+# This is the EXACT recipe llmcompressor 0.12.0 serialized for the W4A16 ckpt
+# (Qwen3.5-9B-w4a16-g32-awqmse), reproducing Avesed/Qwopus3.6-35B-A3B-v1-int4-mixed's
+# method on the dense model. For W4A8, set config_groups.group_0.input_activations to:
+#   {num_bits: 8, type: int, symmetric: true, strategy: token, dynamic: true, observer: null}
+#
+# Driver: quantize/requant_v2_awq_mse_g32.py (builds this recipe in-process and runs
+# oneshot(recipe=<yaml>)). The Python `from llmcompressor.modifiers.awq import AWQModifier`
+# symbol in 0.12.0 is a deprecated FACTORY returning a list, so the recipe is passed as YAML,
+# where `AWQModifier` resolves to the real transform.awq.AWQModifier smoother.
+default_stage:
+  default_modifiers:
+    AWQModifier:
+      mappings:
+      - smooth_layer: re:.*post_attention_layernorm$
+        balance_layers: ['re:.*mlp[.]gate_proj$', 're:.*mlp[.]up_proj$']
+        activation_hook_target: null
+      - smooth_layer: re:.*mlp[.]up_proj$
+        balance_layers: ['re:.*mlp[.]down_proj$']
+        activation_hook_target: null
+      - smooth_layer: re:.*layers\.(3|7|11|15|19|23|27|31)\.input_layernorm$
+        balance_layers: ['re:.*self_attn[.]q_proj$', 're:.*self_attn[.]k_proj$', 're:.*self_attn[.]v_proj$']
+        activation_hook_target: null
+      duo_scaling: both
+      n_grid: 20
+    QuantizationModifier:
+      config_groups:
+        group_0:
+          targets: [Linear]
+          weights:
+            num_bits: 4
+            type: int
+            symmetric: true
+            group_size: 32
+            strategy: group
+            block_structure: null
+            dynamic: false
+            actorder: null
+            scale_dtype: null
+            zp_dtype: null
+            observer: mse
+            observer_kwargs: {}
+          input_activations: null     # W4A16; for W4A8 -> int8 token-dynamic (see header)
+          output_activations: null
+          format: null
+      targets: [Linear]
+      ignore: [lm_head, 're:.*embed_tokens', 're:.*linear_attn.*', 're:.*visual.*', 're:.*mtp.*']
+      bypass_divisibility_checks: false

@@ -11,3 +11,6 @@ dist/
 # local sandbox / workflow scratch (not deliverables)
 .sandbox_*
 .wf_*
+
+# large raw eval generations (summarized in eval/*.md; on sandbox)
+eval/results_awqmse/*_n250.json
