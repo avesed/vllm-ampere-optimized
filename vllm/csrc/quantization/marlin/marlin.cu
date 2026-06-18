@@ -424,7 +424,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     int thread_n = thread_n_init;
 
     int thread_m_blocks = min(div_ceil(prob_m_split, 16), max_thread_m_blocks);
-    int m_block_size_8 = prob_m_split <= 8 && a_type.size_bits() == 16;
+    int m_block_size_8 =
+      prob_m_split <= 8 && (a_type.size_bits() == 16 || a_type == vllm::kS8);
 
     // Set thread config
     exec_config_t exec_cfg;

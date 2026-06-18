@@ -1,0 +1,33 @@
+# Overlay the vendored int8-QK FlashInfer fork onto the from-source vLLM Ampere image.
+# FlashInfer is JIT: the int8-QK kernels live in headers (mma.cuh / attention/prefill.cuh) +
+# the jit codegen (jit/utils.py, jit/attention/modules.py) + prefill.py, and compile at runtime
+# on first use. The vLLM image already pip-installed stock flashinfer 0.6.12; we overlay our
+# int8-edited files onto that installed package (same v0.6.12, so the file overlay is consistent).
+# This is the in-image equivalent of patches/flashinfer_int8/apply_to_source.py.
+ARG BASE
+FROM ${BASE}
+
+# repo build context (.) provides the vendored flashinfer/ source tree
+COPY flashinfer/include/flashinfer/ /tmp/fi/include/flashinfer/
+COPY flashinfer/flashinfer/ /tmp/fi/py/
+
+RUN python3 - <<'PY'
+import os, shutil, flashinfer
+pkg = os.path.dirname(flashinfer.__file__)
+assert flashinfer.__version__.startswith("0.6.12"), \
+    f"stock flashinfer {flashinfer.__version__} != vendored 0.6.12 — overlay would mix versions"
+# native headers -> the package's JIT include tree (data/include/flashinfer)
+shutil.copytree("/tmp/fi/include/flashinfer",
+                os.path.join(pkg, "data/include/flashinfer"), dirs_exist_ok=True)
+# python edits: dtype map, jit module codegen, prefill wrapper
+for rel in ("jit/utils.py", "jit/attention/modules.py", "prefill.py"):
+    shutil.copy(os.path.join("/tmp/fi/py", rel), os.path.join(pkg, rel))
+# sanity: the int8 markers must be present post-overlay
+mma = open(os.path.join(pkg, "data/include/flashinfer/mma.cuh")).read()
+assert "mma_sync_m16n16k32_row_col_s8s8s32" in mma, "int8 IMMA wrapper missing after overlay"
+assert 'torch.int8: "int8_t"' in open(os.path.join(pkg, "jit/utils.py")).read(), "int8 dtype_map_kv missing"
+print("int8-QK FlashInfer overlay applied to", pkg)
+PY
+RUN rm -rf /tmp/fi
+# upstream ENTRYPOINT ["vllm","serve"] inherited. int8-QK is opt-in at runtime via the
+# int8qk_backend (vendored into vllm/), not default — enable per deployment.

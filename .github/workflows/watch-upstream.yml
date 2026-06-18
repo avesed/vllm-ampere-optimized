@@ -1,9 +1,10 @@
 name: watch-upstream
 
-# Polls vllm-project/vllm for a new stable release every 6h. When the latest tag
-# differs from the committed UPSTREAM_VLLM_VERSION marker, dispatches build.yml.
-# createWorkflowDispatch with the built-in GITHUB_TOKEN is the documented exception
-# to the "no recursive trigger" rule, so no PAT is needed (requires actions: write).
+# Polls vllm-project/vllm for a new stable release every 6h. In the vendored-fork model a new
+# upstream release is NOT a rebuild — it needs RE-VENDORING (clone the new tag + replay the edit
+# recipe via scripts/revendor.sh, as a PR to main). So when the latest tag differs from the
+# committed UPSTREAM_VLLM_VERSION marker, open a re-vendor issue for a human (the recipe can drift
+# and needs review). build.yml then runs automatically when that PR merges to main.
 
 on:
   schedule:
@@ -12,7 +13,7 @@ on:
 
 permissions:
   contents: read
-  actions: write          # required for createWorkflowDispatch
+  issues: write
 
 concurrency:
   group: watch-upstream
@@ -34,27 +35,25 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Latest upstream stable vLLM: $TAG"
 
-      - name: Compare with marker
+      - name: Compare with vendored marker
         id: cmp
         run: |
           LAST=$(cat UPSTREAM_VLLM_VERSION 2>/dev/null | tr -d '[:space:]' || echo none)
-          echo "last-built: '$LAST'  latest: '${{ steps.up.outputs.tag }}'"
+          echo "vendored: '$LAST'  latest: '${{ steps.up.outputs.tag }}'"
           if [ "${{ steps.up.outputs.tag }}" != "$LAST" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Dispatch build for the new tag
+      - name: Open re-vendor issue for the new tag
         if: steps.cmp.outputs.changed == 'true'
-        uses: actions/github-script@v8
-        with:
-          script: |
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'build.yml',
-              ref: context.ref,
-              inputs: { vllm_tag: '${{ steps.up.outputs.tag }}' }
-            })
-            core.notice(`Dispatched build.yml for ${{ steps.up.outputs.tag }}`)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          TITLE="re-vendor: upstream vLLM $TAG available (vendored is $(cat UPSTREAM_VLLM_VERSION))"
+          if [ -z "$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number')" ]; then
+            gh issue create --title "$TITLE" \
+              --body "Upstream vLLM \`$TAG\` is newer than the vendored \`$(cat UPSTREAM_VLLM_VERSION)\`. Re-vendor the fork: \`scripts/revendor.sh $TAG <flashinfer_tag>\` (replays the edit recipe; fails loudly if anchors drifted), review \`git diff\`, and open a PR to main — merging triggers the from-source build. See patches/README.md."
+          fi

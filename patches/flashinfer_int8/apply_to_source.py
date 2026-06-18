@@ -16,7 +16,9 @@ import sys, os, types, glob
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
-SRC = os.path.join(REPO, "flashinfer")          # the vendored clone root
+# default: the vendored repo clone; override with argv[1] to replay onto a fresh upstream
+# checkout (e.g. patch-drift-check / revendor against a new tag in a temp dir).
+SRC = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(REPO, "flashinfer")
 PKG = os.path.join(SRC, "flashinfer")           # python package root (== FI for the scripts)
 assert os.path.isdir(PKG), f"no flashinfer source package at {PKG}"
 assert os.path.isfile(os.path.join(SRC, "include/flashinfer/mma.cuh")), "source headers missing"
