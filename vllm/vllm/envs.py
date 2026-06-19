@@ -596,6 +596,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # [Ampere fork] Opt in to the int8-QK prefill attention backend (patch 0004): when "1",
+    # the `vllm.general_plugins` entry-point `register_int8qk` overrides the FLASH_ATTN backend
+    # with the int8-QK + fp16-PV prefill path for hd256 full-attn layers (everything else
+    # FA-falls-back). Default off so a plain image swap doesn't change attention for every model.
+    "VLLM_INT8QK": lambda: bool(int(os.getenv("VLLM_INT8QK", "0"))),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel Xe2/Xe3; the non-TD branch is dead-code-eliminated at Triton

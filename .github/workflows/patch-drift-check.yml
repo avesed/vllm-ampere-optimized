@@ -40,6 +40,7 @@ jobs:
           python3 patches/regenerate.py _vllm_check
           git apply --check -p1 --directory=_vllm_check patches/0002-marlin-int8-8row-decode-ampere.patch
           git apply --check -p1 --directory=_vllm_check patches/0003-aot-compile-cache-quant-scheme-key.patch
+          git apply --check -p1 --directory=_vllm_check patches/0004-int8qk-general-plugin-entrypoint.patch
 
       - name: Replay recipe onto latest FlashInfer ${{ steps.up.outputs.fi }} (temp)
         run: |

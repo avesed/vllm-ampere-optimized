@@ -61,7 +61,7 @@ docker run --gpus all -p 8000:8000 \
 *(default cu130 image needs NVIDIA driver ≥ 580.65)*
 
 - **Ready-made W4A8:** [Avesed/Qwen3.6-27B-W4A8](https://huggingface.co/Avesed/Qwen3.6-27B-W4A8) (of official [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B))
-- **Quantize your own:** `python quantize/quantize_w4a8.py <hf-model> <out-dir>`
+- **Quantize your own:** generic = `python quantize/quantize_w4a8.py <hf-model> <out-dir>`; best quality = the validated **AWQ + mse + g32** recipe → [`quantize/README.md`](quantize/README.md)
 
 ## Credits
 

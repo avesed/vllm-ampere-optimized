@@ -18,7 +18,8 @@ maintainer, locally:
           (regenerate.py 0001 + git apply 0002 + 0003 + apply_to_source.py); drift FAILS LOUDLY
   2. git diff && git commit                             # review + commit the vendored trees
   3. OWNER=<you> scripts/build_image_source.sh          # from-source sm_80+sm_86 build → push ghcr :<tag>-ampere-<cu> + :latest
-  4. (optional) scripts/smoke_test.sh <img> && scripts/ampere_kernel_ci.sh <img> "$(cat UPSTREAM_VLLM_VERSION)"
+  4. (optional) scripts/smoke_test.sh <img> ; scripts/ampere_kernel_ci.sh <img> "$(cat UPSTREAM_VLLM_VERSION)"
+       W4A16_CKPT=<w4a16> W4A8_CKPT=<w4a8> scripts/int8_cudagraph_regression.sh <img>   # asserts patch 0003
   5. echo <tag> > UPSTREAM_VLLM_VERSION && git commit   # bump the marker (revendor.sh already does this)
 
 patch-drift-check.yml (cron daily + on patches/** PRs)  # github-hosted; replays the recipe onto the

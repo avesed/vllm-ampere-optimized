@@ -1,0 +1,30 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index c782cc3..e831b53 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -46,6 +46,9 @@ vllm = "vllm.entrypoints.cli.main:main"
+ [project.entry-points."vllm.general_plugins"]
+ lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
+ lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
++# Ampere fork (patch 0004): int8-QK prefill attention backend override, loaded in EVERY process
++# (engine core + each TP/PP worker) so it fires under multi-GPU. Opt-in via VLLM_INT8QK=1.
++int8qk = "vllm.v1.attention.backends.int8qk_backend:register_int8qk"
+ 
+ [tool.setuptools_scm]
+ # no extra settings needed, presence enables setuptools-scm
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 8f4e18d..bea9280 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -596,6 +596,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # Enable batch-invariant mode: deterministic results regardless of
+     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
+     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
++    # [Ampere fork] Opt in to the int8-QK prefill attention backend (patch 0004): when "1",
++    # the `vllm.general_plugins` entry-point `register_int8qk` overrides the FLASH_ATTN backend
++    # with the int8-QK + fp16-PV prefill path for hd256 full-attn layers (everything else
++    # FA-falls-back). Default off so a plain image swap doesn't change attention for every model.
++    "VLLM_INT8QK": lambda: bool(int(os.getenv("VLLM_INT8QK", "0"))),
+     # Use tensor descriptors for Q/K/V loads and output stores in the
+     # Triton unified-attention kernel.  Enables HW 2D block reads on
+     # Intel Xe2/Xe3; the non-TD branch is dead-code-eliminated at Triton

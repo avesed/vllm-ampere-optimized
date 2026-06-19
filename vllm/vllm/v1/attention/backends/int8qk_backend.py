@@ -24,8 +24,21 @@ CHUNKED PREFILL (cached-prefix steps) — the I-4b-paged extension:
   Pure-fresh chunks skip the gather (use the in-hand K/V — cheaper, bit-identical path).
 
 Decode rows / non-hd256 layers / quantized-KV / cascade / DCP / everything unsupported -> FA
-fallback (bit-faithful to the stock baseline). Default-OFF; enabled by the harness via the
-registry override + VLLM_ENABLE_V1_MULTIPROCESSING=0 (single-card in-process), exactly like Step A.
+fallback (bit-faithful to the stock baseline). Default-OFF; opt in with `VLLM_INT8QK=1`.
+
+REGISTRATION (canonical, multi-process safe). The override is installed by `register_int8qk()`,
+exposed as a `vllm.general_plugins` entry-point (see pyproject.toml). vLLM's
+`load_general_plugins()` runs registered plugins in EVERY process — the engine-core process AND
+each TP/PP worker subprocess (`vllm/v1/worker/worker_base.py:init_worker` calls it before the
+worker class is even resolved, i.e. before attention-backend selection). So the override reaches
+all workers and int8-QK fires under `-tp N` / `-pp N`, NOT only in a single in-process engine.
+This replaces the old in-process monkeypatch that required `VLLM_ENABLE_V1_MULTIPROCESSING=0`.
+
+Gating: opt-in via `VLLM_INT8QK=1`. The entry-point is baked into the from-source image, so a
+plain `docker run` would otherwise override the GLOBAL FLASH_ATTN backend for every model. Even
+though this backend FA-falls-back on non-hd256 / decode / unsupported cases, silently swapping
+the global attention backend for all users is too invasive to be default-on; opt-in keeps stock
+behavior the default. With `VLLM_INT8QK=1` it is the same code path single-process AND multi-worker.
 """
 from __future__ import annotations
 
@@ -53,6 +66,11 @@ _INT8QK_HEAD_SIZES = (256,)
 # split lets the harness PROVE int8 fired on cached-prefix chunks, not just chunk-0.
 INT8QK_FIRE = {"calls": 0, "seqs": 0, "fresh": 0, "cached": 0}
 
+# Per-PROCESS "int8-QK actually fired here" latch. Under TP/PP the workers are separate processes
+# so the launcher can't read INT8QK_FIRE from them; this emits a one-time per-rank log line the
+# instant the int8 path runs in THIS process, giving per-worker fire evidence in the worker logs.
+_FIRED_LOGGED = False
+
 try:
     import flashinfer  # noqa: F401
 
@@ -62,8 +80,17 @@ except Exception as e:  # pragma: no cover - import guard
     _HAS_FI = False
     logger.warning("flashinfer not importable (%s); INT8QK backend will delegate to FA.", e)
 
-reshape_and_cache_flash = _fa.reshape_and_cache_flash
+# NOTE: `flash_attn.reshape_and_cache_flash` is only bound when FA's varlen kernel is available
+# (`is_flash_attn_varlen_func_available()` is True — i.e. on a real CUDA build). Binding it at
+# MODULE-import time would crash this module on import in any context where that block hasn't run
+# (e.g. CPU, or the entry-point plugin loading before FA's conditional import). Since this module
+# is now imported eagerly via the `vllm.general_plugins` entry-point (register_int8qk), bind it
+# LAZILY at call time so the import is always safe; on GPU it resolves to the exact same function.
 is_quantized_kv_cache = _fa.is_quantized_kv_cache
+
+
+def _reshape_and_cache_flash(*args, **kwargs):
+    return _fa.reshape_and_cache_flash(*args, **kwargs)
 
 
 def _quant_qk_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -209,7 +236,7 @@ class Int8QKAttentionImpl(FlashAttentionImpl):
 
         # Write the NEW chunk's K/V into the paged cache so the gather (and later decode) see them.
         key_cache, value_cache = kv_cache.unbind(1)
-        reshape_and_cache_flash(
+        _reshape_and_cache_flash(
             key, value, key_cache, value_cache,
             attn_metadata.slot_mapping, self.kv_cache_dtype,
             layer._k_scale, layer._v_scale,
@@ -259,6 +286,25 @@ class Int8QKAttentionImpl(FlashAttentionImpl):
             output[s:e] = o.reshape(output[s:e].shape).to(output.dtype)
             INT8QK_FIRE["calls"] += 1
             INT8QK_FIRE["seqs"] += 1
+            global _FIRED_LOGGED
+            if not _FIRED_LOGGED:
+                _FIRED_LOGGED = True
+                try:
+                    from vllm.distributed.parallel_state import (
+                        get_pp_group,
+                        get_tp_group,
+                    )
+
+                    tp = get_tp_group().rank_in_group
+                    pp = get_pp_group().rank_in_group
+                    rank = f"tp{tp}/pp{pp}"
+                except Exception:
+                    rank = "single"
+                # INFO so it shows in every worker's stderr -> per-rank fire evidence.
+                logger.info(
+                    "INT8QK FIRED rank=%s pid=%d (q_len=%d ctx=%d head_size=%d)",
+                    rank, __import__("os").getpid(), Lq, ctx, D,
+                )
         return output
 
 
@@ -269,7 +315,13 @@ class Int8QKAttentionBackend(FlashAttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "INT8QK"
+        # MUST return "FLASH_ATTN" (the enum slot we override), NOT a custom name. vLLM converts
+        # the backend name back to an enum member at
+        # vllm/model_executor/layers/attention/attention.py: `AttentionBackendEnum[get_name()]`;
+        # a custom name ("INT8QK") raises "Unknown attention backend". We ARE the FLASH_ATTN
+        # override, so we masquerade as FLASH_ATTN — this is what makes the plugin path self
+        # contained (no get_name monkeypatch needed in the launcher, unlike the old in-process PoC).
+        return "FLASH_ATTN"
 
     @staticmethod
     def get_impl_cls() -> type[Int8QKAttentionImpl]:
@@ -282,3 +334,37 @@ class Int8QKAttentionBackend(FlashAttentionBackend):
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
         return FlashAttentionBackend.supports_attn_type(attn_type)
+
+
+def register_int8qk() -> None:
+    """`vllm.general_plugins` entry-point: install the int8-QK override in EVERY process.
+
+    Registered in pyproject.toml under `[project.entry-points."vllm.general_plugins"]`. vLLM's
+    `load_general_plugins()` calls this once per process — the engine-core process AND each TP/PP
+    worker subprocess (`vllm/v1/worker/worker_base.py:init_worker`, before the worker class is
+    resolved, i.e. before attention-backend selection). So the override reaches all workers and
+    int8-QK fires under `-tp N` / `-pp N`, not only in a single in-process engine.
+
+    OPT-IN: no-op unless `VLLM_INT8QK=1`. The entry-point is baked into the from-source image, so
+    default-on would swap the GLOBAL FLASH_ATTN backend for every model on a plain `docker run`.
+    Idempotent: `load_general_plugins()` guards against double-load per process, and re-registering
+    the same override is harmless.
+    """
+    import os
+
+    if os.environ.get("VLLM_INT8QK", "0") not in ("1", "true", "True"):
+        return
+
+    from vllm.v1.attention.backends.registry import (
+        AttentionBackendEnum,
+        register_backend,
+    )
+
+    register_backend(
+        AttentionBackendEnum.FLASH_ATTN,
+        "vllm.v1.attention.backends.int8qk_backend.Int8QKAttentionBackend",
+    )
+    logger.info(
+        "INT8QK plugin: registered Int8QKAttentionBackend as the FLASH_ATTN override "
+        "(VLLM_INT8QK=1). hd256 full-attn prefill -> int8-QK; everything else -> FA."
+    )

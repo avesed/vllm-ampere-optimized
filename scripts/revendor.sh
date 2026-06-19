@@ -3,6 +3,7 @@
 # Clones fresh upstream into the vendored vllm/ + flashinfer/ trees and replays the edit recipe:
 #   vLLM:       patches/regenerate.py (0001 W4A8, anchor-based) + patches/0002 (native marlin, git apply)
 #               + patches/0003 (AOT compile cache-key, git apply) + drop in patches/flashinfer_int8/int8qk_backend.py
+#               + patches/0004 (int8qk vllm.general_plugins entry-point, git apply)
 #   FlashInfer: patches/flashinfer_int8/apply_to_source.py (int8-QK, strict anchors)
 # Any anchor/patch that no longer applies FAILS LOUDLY = the version-skew signal (refresh the recipe).
 # There is NO CI auto-build (a self-hosted GPU runner on a public repo is a security risk). After it
@@ -26,6 +27,7 @@ git apply -p1 --directory=vllm patches/0002-marlin-int8-8row-decode-ampere.patch
 git apply -p1 --directory=vllm patches/0003-aot-compile-cache-quant-scheme-key.patch # 0003 AOT cache-key
 cp patches/flashinfer_int8/int8qk_backend.py \
    vllm/vllm/v1/attention/backends/int8qk_backend.py
+git apply -p1 --directory=vllm patches/0004-int8qk-general-plugin-entrypoint.patch # 0004 int8qk plugin entry-point
 
 echo "== re-vendor FlashInfer $FI_TAG =="
 rm -rf flashinfer
