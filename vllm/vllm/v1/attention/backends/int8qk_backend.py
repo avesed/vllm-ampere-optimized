@@ -214,6 +214,25 @@ class Int8QKAttentionImpl(FlashAttentionImpl):
                 output_scale, output_block_scale,
             )
 
+        # int8-QK does CPU<->GPU .tolist() syncs (for the chunked-prefill gather) that are ILLEGAL
+        # during cudagraph capture ("Cannot copy between CPU and CUDA tensors during CUDA graph
+        # capture"). Route to FA whenever the stream is capturing -> robust to EVERY cudagraph mode
+        # (FULL / PIECEWISE / FULL_AND_PIECEWISE) AND to spec-decode (captured steps can have
+        # max_query_len>1, so a max_query_len check alone is NOT enough). int8-QK is prefill-only and
+        # prefill runs eager (never captured), so routing every captured call to FA loses nothing.
+        if torch.cuda.is_current_stream_capturing():
+            return super().forward(
+                layer, query, key, value, kv_cache, attn_metadata, output,
+                output_scale, output_block_scale,
+            )
+        # Runtime fast-path: pure-decode batches (max_query_len<=1) -> FA, skip the int8 path.
+        mql = getattr(attn_metadata, "max_query_len", None)
+        if mql is None or mql <= 1:
+            return super().forward(
+                layer, query, key, value, kv_cache, attn_metadata, output,
+                output_scale, output_block_scale,
+            )
+
         cu = attn_metadata.query_start_loc
         cu_list = cu.tolist()                                  # [batch+1] (CPU sync, small)
         n_req = len(cu_list) - 1
