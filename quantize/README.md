@@ -16,8 +16,13 @@ python quantize/quantize_w4a8.py <hf_model> <out_dir> [num_calib=256] [max_len=2
 ```
 GPTQ with the `scheme="W4A8"` shortcut (int4 g128 + int8 dynamic act, `format: int-quantized`). Works
 on any architecture with no per-model tuning. This is the proven baseline (the original 27B W4A8 was
-made this way). For a hybrid/VL model, extend the `ignore` list (`re:.*linear_attn.*`, `re:.*visual.*`,
-`re:.*mtp.*`) — see the comments in the script.
+made this way). The `ignore` list excludes ALL quant-sensitive branches by default — `lm_head`,
+`embed_tokens`, `re:.*mtp.*` (MTP head), `re:.*linear_attn.*` (GatedDeltaNet), `re:.*visual.*` (vision);
+each regex is a no-op on models that lack the module, so it is safe everywhere (MoE also add
+`re:.*mlp[.]gate$`). **Keeping `re:.*mtp.*` ignored is mandatory for spec-decode**: it stops the MTP
+head being dropped, and — because llm-compressor writes the recipe `ignore` into the output
+`config.json` `quantization_config.ignore` — it makes vLLM load the head as bf16 (else the
+`qwen3_5_mtp` loader runs it through the quantized path → 0% acceptance, silently).
 
 ### 2. Recommended for quality — AWQ + mse + g32  (`requant_v2_awq_mse_g32.py`)
 ```bash
