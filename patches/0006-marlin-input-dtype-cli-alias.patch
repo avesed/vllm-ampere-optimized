@@ -1,0 +1,47 @@
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index 0490cbc..d8035e6 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -614,6 +614,9 @@ class EngineArgs:
+     spec_method: str | None = None
+     spec_model: str | None = None
+     spec_tokens: int | None = None
++    # Ampere fork: friendly CLI alias for the VLLM_MARLIN_INPUT_DTYPE env var
++    # (Marlin W4A8 activation dtype, read at the low-level kernel selector).
++    marlin_input_dtype: str | None = None
+ 
+     show_hidden_metrics_for_version: str | None = (
+         ObservabilityConfig.show_hidden_metrics_for_version
+@@ -1536,6 +1539,15 @@ class EngineArgs:
+             default=None,
+             help="Select GDN prefill backend.",
+         )
++        parser.add_argument(
++            "--marlin-input-dtype",
++            dest="marlin_input_dtype",
++            choices=["int8", "fp8"],
++            default=None,
++            help="Activation dtype for Marlin W4A8 on Ampere (int8 = int8-act "
++            "MoE/dense W4A8; fp8 = SM89+). Opt-in; default is fp16 activations "
++            "(W4A16). Friendly alias for the VLLM_MARLIN_INPUT_DTYPE env var.",
++        )
+         return parser
+ 
+     @classmethod
+@@ -1711,6 +1723,16 @@ class EngineArgs:
+         """
+         current_platform.pre_register_and_update()
+ 
++        # Ampere fork: --marlin-input-dtype is a friendly alias for the
++        # VLLM_MARLIN_INPUT_DTYPE env var (read at the low-level Marlin kernel
++        # selector). Set it here in the main process, before workers spawn, so
++        # they inherit it via the environment (the validated propagation path)
++        # and before validate_environ() below checks the choices.
++        if self.marlin_input_dtype is not None:
++            import os
++
++            os.environ["VLLM_MARLIN_INPUT_DTYPE"] = self.marlin_input_dtype
++
+         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
+ 
+         envs.validate_environ(self.fail_on_environ_validation)
