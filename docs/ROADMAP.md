@@ -13,7 +13,10 @@ Status legend: ✅ shipped · 🔨 build-now · ⏳ gated on measurement · 🧪
 
 ## Already shipped ✅
 - **W4A8-int8 Marlin un-gate** (patch 0001) + int8 8-row decode tile (patch 0002). The flagship.
-  Measured: decode = W4A16 parity (weight-bandwidth-bound), prefill +15-18% (int8 TC).
+  Measured: decode = W4A16 parity (weight-bandwidth-bound); prefill **+19-49% on consumer sm_86**
+  (9B dense 8k +49%, 35B-A3B pp2 +19%; 3090 fp16-FP32acc is half-rate → int8 ~4× TC lever), but
+  **~0 on A100 sm_80** (dense; +8% MoE — full-rate fp16). The W4A8 *enabler* + int4 decode/VRAM win
+  hold on all Ampere; the int8 *prefill* TC win is a consumer-sm_86 effect (measured 2026-06-20).
 - **RTX-3090 fused_moe Triton config** (configs/fused_moe). NOTE: used by the **Triton** fused-MoE
   path (bf16/fp16/int8_w8a8), confirmed triggered. NOT read by the Marlin `moe_wna16` path. Keep;
   document which path it serves. (Earlier "delete it as dead" was wrong — it's live for Triton MoE.)

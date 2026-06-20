@@ -26,7 +26,8 @@ applying to a new upstream release.
 ## Why this exists
 
 W4A8 is the best serving quant for Ampere — int4 weights cut decode bandwidth, int8 activations speed
-up prefill — and **Marlin can run it on Ampere**. But vLLM gates its W4A8 path to Hopper: on an Ampere
+up prefill (the prefill speedup is largest on consumer `sm_86`; see the hardware-scope note below) — and
+**Marlin can run it on Ampere**. But vLLM gates its W4A8 path to Hopper: on an Ampere
 GPU, loading a W4A8 checkpoint **crashes at load** (a weight-shape mismatch in
 `process_weights_after_loading`), so Ampere users are stuck on W4A16. This fork routes W4A8 through
 Marlin — plus the native int8 paths above — for the whole Ampere line.
@@ -48,17 +49,38 @@ cudagraph. All numbers **tok/s**:
 - **Quality preserved:** GSM8K with thinking — W4A16 **81.6%** vs W4A8 **85.6%** (N=250). int8
   dynamic-per-token activations carry ~zero quality cost under the AWQ+mse weight quant.
 - The fork's **W4A16 is byte-identical to stock** — the patch only *adds* W4A8, zero regression elsewhere.
+- **Hardware scope of the prefill/batch win:** these int8 speedups are **consumer Ampere (`sm_86`:
+  3090 / A40 / A6000 / A10)** — their fp16 tensor (FP32 accumulate) runs at *half* rate, so int8 is a
+  ~4× compute lever. On **A100 (`sm_80`)** fp16 is full-rate: the **W4A8 enabler still applies** (stock
+  crashes on Ampere, the fork runs it) but the int8 *prefill* speedup is small — measured ~0 (dense) /
+  +8% (MoE). int4-weight decode-bandwidth + VRAM savings hold on every Ampere card.
 
-Flagship 27B on 2× RTX 3090 (tp2): W4A8 ≈ 50 tok/s single-stream decode, 393 batched, 1229 prefill.
+### Multi-GPU without NVLink → pipeline-parallel, not tensor-parallel
+
+On 2× RTX 3090 **without NVLink**, TP's per-layer all-reduce eats ~half of prefill — use **`-pp 2 -tp 1`**.
+35B-A3B (MoE), 2× 3090, pp2, cudagraph:
+
+| 35B-A3B · pp2 | decode (single) | prefill (8k) | batch-32 |
+|---|---:|---:|---:|
+| this fork · W4A16 | 122 | 9.1k | 614 |
+| **this fork · W4A8** | 120 | **10.8k** | **669** |
+
+The same model on `-tp 2` runs ~half the prefill (the all-reduce tax), and int8's prefill gain collapses
+from **+19%** (pp2) to ~+5% (tp2). With NVLink, TP is fine.
 
 ## Use
 
 ```bash
 docker run --gpus all -p 8000:8000 \
   ghcr.io/avesed/vllm-ampere-optimized:latest \
-  --model Avesed/Qwen3.6-27B-W4A8 --tensor-parallel-size 2 --max-model-len 8192
+  --model Avesed/Qwen3.6-27B-W4A8 --pipeline-parallel-size 2 --max-model-len 8192
 ```
-*(default cu130 image needs NVIDIA driver ≥ 580.65)*
+*(default cu130 image needs NVIDIA driver ≥ 580.65. Multi-GPU: `--pipeline-parallel-size 2` without
+NVLink, `--tensor-parallel-size 2` with it; single GPU → drop both.)*
+
+**No Docker** (e.g. an A100 cloud box without docker-in-docker)? A from-source wheel (`sm_80`+`sm_86`)
+is on [Releases](https://github.com/avesed/vllm-ampere-optimized/releases) — `pip install` it (needs
+torch 2.11 + CUDA 13). Enable W4A8 with `--marlin-input-dtype int8` (or env `VLLM_MARLIN_INPUT_DTYPE=int8`).
 
 - **Ready-made W4A8:** [Avesed/Qwen3.6-27B-W4A8](https://huggingface.co/Avesed/Qwen3.6-27B-W4A8) (of official [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B))
 - **Quantize your own:** generic = `python quantize/quantize_w4a8.py <hf-model> <out-dir>`; best quality = the validated **AWQ + mse + g32** recipe → [`quantize/README.md`](quantize/README.md)
