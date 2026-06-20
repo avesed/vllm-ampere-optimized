@@ -330,6 +330,39 @@ def marlin_act_int8_process_scales(s: torch.Tensor):
     return s, a_scales_scale_factor
 
 
+def marlin_act_int8_process_scales_per_expert(s: torch.Tensor):
+    """Per-expert int16 weight-scale quantization for int8-act MoE.
+
+    The dense / homogeneous variant ``marlin_act_int8_process_scales`` divides
+    a 3D ``[E, K, N]`` MoE scale tensor by a SINGLE global ``s.max()`` taken over
+    all experts. With heterogeneous experts (e.g. E=256) the smallest-scale
+    experts collapse to int16 codes of 0 (full dynamic-range loss) -> garbage.
+
+    This variant instead normalizes EACH expert by its own max, giving every
+    expert the full 4096-code int16 range, and returns the per-expert
+    reconstruction factor as an ``[E]`` float tensor (shape matches the kernel's
+    ``global_scale_ptr[expert_id]`` per-expert channel).
+
+    Args:
+        s: ``[E, K, N]`` permuted weight scales (real float scales).
+
+    Returns:
+        A tuple of:
+            - int16-coded scales (same dtype-view as input), full 4096 range
+              per expert.
+            - ``[E]`` float reconstruction factors ``(1/4096) * per_expert_max``.
+    """
+    assert s.dim() == 3, "per-expert int8 scale prep expects a 3D [E,K,N] tensor"
+    # Per-expert denominator: max over (K, N) for each expert, shape [E, 1, 1].
+    per_expert_max = s.amax(dim=(1, 2), keepdim=True)
+    a_scales_scale_factor = (1 / 4096 * per_expert_max.flatten()).float()
+    # Avoid div-by-zero for an all-zero expert (degenerate); leaves codes at 0.
+    denom = per_expert_max.clamp_min(torch.finfo(s.dtype).tiny)
+    s = s / denom * 4096
+    s = s.round().to(torch.int16).view(s.dtype)
+    return s, a_scales_scale_factor
+
+
 def marlin_moe_permute_scales(
     s: torch.Tensor, size_k: int, size_n: int, group_size: int, is_a_8bit: bool = False
 ):

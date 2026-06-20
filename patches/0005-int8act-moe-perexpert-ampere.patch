@@ -1,0 +1,383 @@
+diff --git a/csrc/moe/marlin_moe_wna16/marlin_template.h b/csrc/moe/marlin_moe_wna16/marlin_template.h
+index 9858df9..3247c94 100644
+--- a/csrc/moe/marlin_moe_wna16/marlin_template.h
++++ b/csrc/moe/marlin_moe_wna16/marlin_template.h
+@@ -521,6 +521,11 @@ __global__ void Marlin(
+         if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
+           topk_weight_tmp *= global_scale_f32;
+         }
++        // int8-act: GEMM2 (mul_topk_weights==True) applies the per-expert
++        // factor here, folded into the topk weight (single application).
++        if constexpr (a_type == vllm::kS8) {
++          topk_weight_tmp *= global_scale_f32;
++        }
+         c_scalar_t2 topk_weight_val =
+             Cdtype::num2num2(Cdtype::float2num(topk_weight_tmp));
+         sh_block_topk_weights[threadIdx.x] = topk_weight_val;
+@@ -545,6 +550,15 @@ __global__ void Marlin(
+     if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
+       global_scale_f32 = global_scale_ptr[expert_id];
+     }
++    // int8-act MoE: per-expert reconstruction factor (1/4096 * per_expert_max).
++    // Scoped to kS8 only (NOT generic 8-bit) so fp8-act is untouched. Runtime
++    // null-guard: int8 callers without per-expert prep (e.g. num_groups==1,
++    // legacy scalar prep) pass nullptr and keep the default factor of 1.0.
++    if constexpr (a_type == vllm::kS8) {
++      if (global_scale_ptr != nullptr) {
++        global_scale_f32 = global_scale_ptr[expert_id];
++      }
++    }
+ 
+     B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
+     scales_ptr += (expert_id - old_expert_id) * scales_expert_stride;
+@@ -1799,6 +1813,15 @@ __global__ void Marlin(
+           c1 *= global_scale_f32;
+         }
+       }
++      // int8-act: GEMM1 (mul_topk_weights==False) applies the per-expert
++      // factor here. Mirrors nvfp4 exclusivity so the factor is applied
++      // EXACTLY ONCE per GEMM (GEMM2 folds it into topk weights instead).
++      if constexpr (a_type == vllm::kS8) {
++        if (!mul_topk_weights) {
++          c0 *= global_scale_f32;
++          c1 *= global_scale_f32;
++        }
++      }
+ 
+       c_scalar_t2 res =
+           Cdtype::nums2num2(Cdtype::float2num(c0), Cdtype::float2num(c1));
+diff --git a/csrc/moe/marlin_moe_wna16/ops.cu b/csrc/moe/marlin_moe_wna16/ops.cu
+index 82cba29..ce6922b 100644
+--- a/csrc/moe/marlin_moe_wna16/ops.cu
++++ b/csrc/moe/marlin_moe_wna16/ops.cu
+@@ -759,13 +759,22 @@ torch::Tensor moe_wna16_marlin_gemm(
+   torch::Tensor global_scale;
+   if (global_scale_or_none.has_value()) {
+     global_scale = global_scale_or_none.value();
+-    TORCH_CHECK(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn,
+-                "global_scale can only be used for nvfp4 format.");
++    // global_scale carries the per-expert reconstruction factor for nvfp4
++    // (per-expert alpha) AND for int8-act MoE (per-expert (1/4096)*max). Both
++    // index global_scale_ptr[expert_id] in the kernel.
++    TORCH_CHECK((b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) ||
++                    a_type == vllm::kS8,
++                "global_scale can only be used for nvfp4 or int8-act format.");
+   } else {
+     global_scale = torch::empty({0}, options_fp32);
+     TORCH_CHECK(!(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn),
+                 "the global_scale parameter must be passed for nvfp4 format.");
+   }
++  // For int8-act without a per-expert factor (empty tensor), pass nullptr so
++  // the kernel keeps global_scale_f32 = 1.0 (its runtime null-guard handles it).
++  // marlin_mm takes a void* (g_s) which the kernel reinterprets as const float*.
++  void* global_scale_kernel_ptr =
++      global_scale.numel() > 0 ? global_scale.data_ptr() : nullptr;
+ 
+   bool has_bias = b_bias_or_none.has_value();
+   torch::Tensor b_bias;
+@@ -856,7 +865,7 @@ torch::Tensor moe_wna16_marlin_gemm(
+   MARLIN_NAMESPACE_NAME::marlin_mm(
+       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),
+       b_bias.data_ptr(), a_scales.data_ptr(), b_scales.data_ptr(),
+-      global_scale.data_ptr(), b_zeros.data_ptr(), g_idx.data_ptr(),
++      global_scale_kernel_ptr, b_zeros.data_ptr(), g_idx.data_ptr(),
+       perm.data_ptr(), a_tmp.data_ptr(), sorted_token_ids.data_ptr(),
+       expert_ids.data_ptr(), num_tokens_past_padded.data_ptr(),
+       topk_weights.data_ptr(), moe_block_size, num_experts, top_k,
+diff --git a/tests/kernels/moe/test_moe.py b/tests/kernels/moe/test_moe.py
+index 781b5e3..298ee0b 100644
+--- a/tests/kernels/moe/test_moe.py
++++ b/tests/kernels/moe/test_moe.py
+@@ -37,6 +37,7 @@ from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
+     fused_marlin_moe,
+ )
+ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
++    marlin_act_int8_process_scales_per_expert,
+     marlin_permute_bias,
+ )
+ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+@@ -1009,6 +1010,113 @@ def test_fused_marlin_moe(
+     torch.testing.assert_close(marlin_output, torch_output, atol=4e-2, rtol=0)
+ 
+ 
++@pytest.mark.flaky(reruns=2)
++@pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
++@pytest.mark.usefixtures("default_vllm_config")
++@pytest.mark.parametrize("m", [1, 17, 256])
++def test_fused_marlin_moe_int8_heterogeneous_experts(m):
++    """int8-act MoE with DELIBERATELY divergent per-expert scale magnitudes.
++
++    The stock test (test_fused_marlin_moe) cannot expose the real model-loading
++    bug because it normalizes the int16 weight scales by a SINGLE global
++    ``scales.max()`` over the whole stacked [E,K,N] tensor. With low-spread
++    random experts that is benign. But at high E with heterogeneous experts the
++    smallest-scale experts collapse to int16 code 0 -> garbage.
++
++    Here we multiply expert i's weights by ``10**i`` so the per-expert max spans
++    many orders of magnitude. We then quantize int16 scales PER-EXPERT
++    (full 4096-code range each) and carry the per-expert reconstruction factor
++    through the kernel's per-expert ``global_scale_ptr[expert_id]`` channel
++    (``global_scale1/2``), which is the structural fix. Asserting close proves
++    the per-expert int8 channel is wired end-to-end.
++    """
++    set_random_seed(7)
++
++    e, topk = 8, 2
++    n, k = 256, 512
++    group_size = 128
++    b_type = scalar_types.uint4  # AWQ-style (has_zp), matches the real ckpt
++    dtype = torch.bfloat16
++    a_dtype = torch.int8
++
++    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
++    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
++    w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
++
++    # Force heterogeneous per-expert magnitudes (orders-of-magnitude spread).
++    spread = torch.tensor(
++        [10.0 ** (i - e // 2) for i in range(e)], device="cuda", dtype=dtype
++    )
++    w1 = w1 * spread.view(e, 1, 1)
++    w2 = w2 * spread.view(e, 1, 1)
++
++    def build(w):
++        w_ref_l, qweight_l, scales_l, zeros_l = [], [], [], []
++        for i in range(w.shape[0]):
++            w_ref, qweight, scales, zeros = awq_marlin_quantize(
++                w[i].transpose(1, 0), b_type, group_size, input_dtype=torch.int8
++            )
++            w_ref_l.append(w_ref.T)
++            qweight_l.append(qweight)
++            scales_l.append(scales)
++            zeros_l.append(zeros)
++        w_ref = stack_and_dev(w_ref_l)
++        qweight = stack_and_dev(qweight_l).contiguous()
++        scales = stack_and_dev(scales_l)
++        zeros = stack_and_dev(zeros_l)
++        # Per-expert int16 normalization + [E] reconstruction factor (the fix).
++        scales_i16, gscale = marlin_act_int8_process_scales_per_expert(scales)
++        # Sanity: every expert must keep a non-zero max int16 code (no collapse).
++        codes = scales_i16.view(torch.int16).abs().amax(dim=(1, 2))
++        assert (codes > 0).all(), f"some expert collapsed to int16 code 0: {codes}"
++        return w_ref, qweight, scales_i16, zeros, gscale
++
++    w1_ref, w1_q, w1_s, w1_zp, w1_gscale = build(w1)
++    w2_ref, w2_q, w2_s, w2_zp, w2_gscale = build(w2)
++
++    score = torch.randn((m, e), device="cuda", dtype=dtype)
++    topk_weights, topk_ids, _ = fused_topk(a, score, topk, False)
++
++    with set_current_vllm_config(vllm_config):
++        score_sm = torch.softmax(score, dim=-1, dtype=torch.float32)
++        topk_weight, topk_ids_ref = torch.topk(score_sm, topk)
++        torch_output = torch_experts(
++            a,
++            w1_ref,
++            w2_ref,
++            topk_weight=topk_weight,
++            topk_ids=topk_ids_ref,
++            global_num_experts=e,
++            expert_map=None,
++            quant_dtype=a_dtype,
++            per_act_token_quant=True,
++        )
++
++    marlin_output = fused_marlin_moe(
++        a,
++        w1_q,
++        w2_q,
++        None,
++        None,
++        w1_s,
++        w2_s,
++        topk_weights,
++        topk_ids,
++        global_num_experts=e,
++        expert_map=None,
++        # Per-expert reconstruction factor on the per-expert kernel channel.
++        global_scale1=w1_gscale,
++        global_scale2=w2_gscale,
++        w1_zeros=w1_zp,
++        w2_zeros=w2_zp,
++        input_dtype=a_dtype,
++        quant_type_id=b_type.id,
++        is_k_full=True,
++    )
++
++    torch.testing.assert_close(marlin_output, torch_output, atol=4e-2, rtol=0)
++
++
+ @pytest.mark.flaky(reruns=2)
+ @pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
+ @pytest.mark.usefixtures("default_vllm_config")
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index 64c6801..9010c31 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -128,8 +128,16 @@ def _fused_marlin_moe(
+     gate_up_input = hidden_states
+     if input_dtype == torch.int8:
+         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
++        # int8 act-MoE reconstruction factor is PER-EXPERT, so it cannot be
++        # folded into the pre-routing per-token a_scales (that forces a scalar).
++        # A scalar input_global_scale1 (legacy homogeneous prep) is still folded;
++        # a per-expert [E] tensor is routed to the kernel's per-expert
++        # global_scale_ptr channel (global_scale1) instead.
+         if input_global_scale1 is not None:
+-            a_scales1 = a_scales1 * input_global_scale1
++            if input_global_scale1.numel() == 1:
++                a_scales1 = a_scales1 * input_global_scale1
++            else:
++                global_scale1 = input_global_scale1
+     elif input_dtype == torch.float8_e4m3fn:
+         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
+ 
+@@ -185,8 +193,12 @@ def _fused_marlin_moe(
+         intermediate_cache2, a_scales2 = marlin_quant_input(
+             intermediate_cache2, input_dtype
+         )
++        # Per-expert int8 factor -> kernel global_scale2 channel (see GEMM1).
+         if input_global_scale2 is not None:
+-            a_scales2 = a_scales2 * input_global_scale2
++            if input_global_scale2.numel() == 1:
++                a_scales2 = a_scales2 * input_global_scale2
++            else:
++                global_scale2 = input_global_scale2
+     elif input_dtype == torch.float8_e4m3fn:
+         intermediate_cache2, a_scales2 = marlin_quant_input(
+             intermediate_cache2, input_dtype
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+index 6ad60d6..8b2c755 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+@@ -28,7 +28,7 @@ from vllm.model_executor.layers.fused_moe.experts.trtllm_mxint4_moe import (
+ )
+ from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+-    marlin_act_int8_process_scales,
++    marlin_act_int8_process_scales_per_expert,
+     marlin_moe_permute_scales,
+     marlin_permute_bias,
+     moe_awq_to_marlin_zero_points,
+@@ -488,14 +488,22 @@ def _process_weights_marlin(
+     )
+ 
+     if input_dtype == torch.int8:
++        # Per-expert int16 normalization: a single global s.max() over the
++        # stacked [E,K,N] tensor under-resolves small-scale experts at high E
++        # (codes collapse to 0 -> garbage). Each expert gets its own 4096-code
++        # range; the per-expert reconstruction factor [E] flows through the
++        # kernel's global_scale_ptr[expert_id] channel (not the scalar a_scale
++        # fold). See marlin_act_int8_process_scales_per_expert.
+         if layer.num_groups_w13 > 1:
+-            marlin_w13_scales, w13_input_global_scale = marlin_act_int8_process_scales(
+-                marlin_w13_scales
+-            )
++            (
++                marlin_w13_scales,
++                w13_input_global_scale,
++            ) = marlin_act_int8_process_scales_per_expert(marlin_w13_scales)
+         if layer.num_groups_w2 > 1:
+-            marlin_w2_scales, w2_input_global_scale = marlin_act_int8_process_scales(
+-                marlin_w2_scales
+-            )
++            (
++                marlin_w2_scales,
++                w2_input_global_scale,
++            ) = marlin_act_int8_process_scales_per_expert(marlin_w2_scales)
+ 
+     # --- Permute zero points ---
+     if w13_qzeros is not None and w2_qzeros is not None:
+@@ -629,9 +637,11 @@ def _process_awq_weights_marlin(
+         is_a_8bit=is_a_8bit,
+     )
+     if input_dtype == torch.int8 and layer.num_groups_w13 > 1:
+-        marlin_w13_scales, w13_input_global_scale = marlin_act_int8_process_scales(
+-            marlin_w13_scales
+-        )
++        # Per-expert int16 normalization (see _process_gptq_weights_marlin).
++        (
++            marlin_w13_scales,
++            w13_input_global_scale,
++        ) = marlin_act_int8_process_scales_per_expert(marlin_w13_scales)
+ 
+     marlin_w2_scales = marlin_moe_permute_scales(
+         s=w2_scales,
+@@ -641,9 +651,11 @@ def _process_awq_weights_marlin(
+         is_a_8bit=is_a_8bit,
+     )
+     if input_dtype == torch.int8 and layer.num_groups_w2 > 1:
+-        marlin_w2_scales, w2_input_global_scale = marlin_act_int8_process_scales(
+-            marlin_w2_scales
+-        )
++        # Per-expert int16 normalization (see _process_gptq_weights_marlin).
++        (
++            marlin_w2_scales,
++            w2_input_global_scale,
++        ) = marlin_act_int8_process_scales_per_expert(marlin_w2_scales)
+ 
+     marlin_w13_qzeros = moe_awq_to_marlin_zero_points(
+         w13_qzeros,
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_marlin.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_marlin.py
+index 2a98d44..c2b5790 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_marlin.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16_marlin.py
+@@ -478,6 +478,14 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
+             num_bits=self.num_bits,
+             w1_zp=getattr(layer, "w13_weight_zero_point", None),
+             w2_zp=getattr(layer, "w2_weight_zero_point", None),
++            # int8-act MoE: the per-expert reconstruction factor produced by the
++            # weight-scale prep (convert_to_wna16_moe_kernel_format) is stored on
++            # the layer as w13/w2_input_global_scale. It MUST be plumbed into the
++            # quant config (as a1/a2_gscale) so the marlin kernel applies the
++            # per-expert global_scale; otherwise it is silently dropped and the
++            # int8 output is garbage. Non-int8 paths leave these None (no-op).
++            a1_gscale=getattr(layer, "w13_input_global_scale", None),
++            a2_gscale=getattr(layer, "w2_input_global_scale", None),
+         )
+ 
+     def apply_monolithic(
+diff --git a/vllm/model_executor/layers/quantization/utils/marlin_utils.py b/vllm/model_executor/layers/quantization/utils/marlin_utils.py
+index 37f9033..5699ee0 100644
+--- a/vllm/model_executor/layers/quantization/utils/marlin_utils.py
++++ b/vllm/model_executor/layers/quantization/utils/marlin_utils.py
+@@ -330,6 +330,39 @@ def marlin_act_int8_process_scales(s: torch.Tensor):
+     return s, a_scales_scale_factor
+ 
+ 
++def marlin_act_int8_process_scales_per_expert(s: torch.Tensor):
++    """Per-expert int16 weight-scale quantization for int8-act MoE.
++
++    The dense / homogeneous variant ``marlin_act_int8_process_scales`` divides
++    a 3D ``[E, K, N]`` MoE scale tensor by a SINGLE global ``s.max()`` taken over
++    all experts. With heterogeneous experts (e.g. E=256) the smallest-scale
++    experts collapse to int16 codes of 0 (full dynamic-range loss) -> garbage.
++
++    This variant instead normalizes EACH expert by its own max, giving every
++    expert the full 4096-code int16 range, and returns the per-expert
++    reconstruction factor as an ``[E]`` float tensor (shape matches the kernel's
++    ``global_scale_ptr[expert_id]`` per-expert channel).
++
++    Args:
++        s: ``[E, K, N]`` permuted weight scales (real float scales).
++
++    Returns:
++        A tuple of:
++            - int16-coded scales (same dtype-view as input), full 4096 range
++              per expert.
++            - ``[E]`` float reconstruction factors ``(1/4096) * per_expert_max``.
++    """
++    assert s.dim() == 3, "per-expert int8 scale prep expects a 3D [E,K,N] tensor"
++    # Per-expert denominator: max over (K, N) for each expert, shape [E, 1, 1].
++    per_expert_max = s.amax(dim=(1, 2), keepdim=True)
++    a_scales_scale_factor = (1 / 4096 * per_expert_max.flatten()).float()
++    # Avoid div-by-zero for an all-zero expert (degenerate); leaves codes at 0.
++    denom = per_expert_max.clamp_min(torch.finfo(s.dtype).tiny)
++    s = s / denom * 4096
++    s = s.round().to(torch.int16).view(s.dtype)
++    return s, a_scales_scale_factor
++
++
+ def marlin_moe_permute_scales(
+     s: torch.Tensor, size_k: int, size_n: int, group_size: int, is_a_8bit: bool = False
+ ):

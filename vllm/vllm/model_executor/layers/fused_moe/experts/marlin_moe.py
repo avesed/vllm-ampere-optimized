@@ -128,8 +128,16 @@ def _fused_marlin_moe(
     gate_up_input = hidden_states
     if input_dtype == torch.int8:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
+        # int8 act-MoE reconstruction factor is PER-EXPERT, so it cannot be
+        # folded into the pre-routing per-token a_scales (that forces a scalar).
+        # A scalar input_global_scale1 (legacy homogeneous prep) is still folded;
+        # a per-expert [E] tensor is routed to the kernel's per-expert
+        # global_scale_ptr channel (global_scale1) instead.
         if input_global_scale1 is not None:
-            a_scales1 = a_scales1 * input_global_scale1
+            if input_global_scale1.numel() == 1:
+                a_scales1 = a_scales1 * input_global_scale1
+            else:
+                global_scale1 = input_global_scale1
     elif input_dtype == torch.float8_e4m3fn:
         gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
 
@@ -185,8 +193,12 @@ def _fused_marlin_moe(
         intermediate_cache2, a_scales2 = marlin_quant_input(
             intermediate_cache2, input_dtype
         )
+        # Per-expert int8 factor -> kernel global_scale2 channel (see GEMM1).
         if input_global_scale2 is not None:
-            a_scales2 = a_scales2 * input_global_scale2
+            if input_global_scale2.numel() == 1:
+                a_scales2 = a_scales2 * input_global_scale2
+            else:
+                global_scale2 = input_global_scale2
     elif input_dtype == torch.float8_e4m3fn:
         intermediate_cache2, a_scales2 = marlin_quant_input(
             intermediate_cache2, input_dtype

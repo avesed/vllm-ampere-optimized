@@ -521,6 +521,11 @@ __global__ void Marlin(
         if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
           topk_weight_tmp *= global_scale_f32;
         }
+        // int8-act: GEMM2 (mul_topk_weights==True) applies the per-expert
+        // factor here, folded into the topk weight (single application).
+        if constexpr (a_type == vllm::kS8) {
+          topk_weight_tmp *= global_scale_f32;
+        }
         c_scalar_t2 topk_weight_val =
             Cdtype::num2num2(Cdtype::float2num(topk_weight_tmp));
         sh_block_topk_weights[threadIdx.x] = topk_weight_val;
@@ -544,6 +549,15 @@ __global__ void Marlin(
 
     if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
       global_scale_f32 = global_scale_ptr[expert_id];
+    }
+    // int8-act MoE: per-expert reconstruction factor (1/4096 * per_expert_max).
+    // Scoped to kS8 only (NOT generic 8-bit) so fp8-act is untouched. Runtime
+    // null-guard: int8 callers without per-expert prep (e.g. num_groups==1,
+    // legacy scalar prep) pass nullptr and keep the default factor of 1.0.
+    if constexpr (a_type == vllm::kS8) {
+      if (global_scale_ptr != nullptr) {
+        global_scale_f32 = global_scale_ptr[expert_id];
+      }
     }
 
     B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
@@ -1794,6 +1808,15 @@ __global__ void Marlin(
     // global write patterns
     auto write = [&](int idx, float c0, float c1, FragS& s, FragS& b_bias) {
       if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
+        if (!mul_topk_weights) {
+          c0 *= global_scale_f32;
+          c1 *= global_scale_f32;
+        }
+      }
+      // int8-act: GEMM1 (mul_topk_weights==False) applies the per-expert
+      // factor here. Mirrors nvfp4 exclusivity so the factor is applied
+      // EXACTLY ONCE per GEMM (GEMM2 folds it into topk weights instead).
+      if constexpr (a_type == vllm::kS8) {
         if (!mul_topk_weights) {
           c0 *= global_scale_f32;
           c1 *= global_scale_f32;

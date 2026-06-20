@@ -478,6 +478,14 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             num_bits=self.num_bits,
             w1_zp=getattr(layer, "w13_weight_zero_point", None),
             w2_zp=getattr(layer, "w2_weight_zero_point", None),
+            # int8-act MoE: the per-expert reconstruction factor produced by the
+            # weight-scale prep (convert_to_wna16_moe_kernel_format) is stored on
+            # the layer as w13/w2_input_global_scale. It MUST be plumbed into the
+            # quant config (as a1/a2_gscale) so the marlin kernel applies the
+            # per-expert global_scale; otherwise it is silently dropped and the
+            # int8 output is garbage. Non-int8 paths leave these None (no-op).
+            a1_gscale=getattr(layer, "w13_input_global_scale", None),
+            a2_gscale=getattr(layer, "w2_input_global_scale", None),
         )
 
     def apply_monolithic(

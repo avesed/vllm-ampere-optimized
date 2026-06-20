@@ -28,7 +28,7 @@ from vllm.model_executor.layers.fused_moe.experts.trtllm_mxint4_moe import (
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    marlin_act_int8_process_scales,
+    marlin_act_int8_process_scales_per_expert,
     marlin_moe_permute_scales,
     marlin_permute_bias,
     moe_awq_to_marlin_zero_points,
@@ -488,14 +488,22 @@ def _process_weights_marlin(
     )
 
     if input_dtype == torch.int8:
+        # Per-expert int16 normalization: a single global s.max() over the
+        # stacked [E,K,N] tensor under-resolves small-scale experts at high E
+        # (codes collapse to 0 -> garbage). Each expert gets its own 4096-code
+        # range; the per-expert reconstruction factor [E] flows through the
+        # kernel's global_scale_ptr[expert_id] channel (not the scalar a_scale
+        # fold). See marlin_act_int8_process_scales_per_expert.
         if layer.num_groups_w13 > 1:
-            marlin_w13_scales, w13_input_global_scale = marlin_act_int8_process_scales(
-                marlin_w13_scales
-            )
+            (
+                marlin_w13_scales,
+                w13_input_global_scale,
+            ) = marlin_act_int8_process_scales_per_expert(marlin_w13_scales)
         if layer.num_groups_w2 > 1:
-            marlin_w2_scales, w2_input_global_scale = marlin_act_int8_process_scales(
-                marlin_w2_scales
-            )
+            (
+                marlin_w2_scales,
+                w2_input_global_scale,
+            ) = marlin_act_int8_process_scales_per_expert(marlin_w2_scales)
 
     # --- Permute zero points ---
     if w13_qzeros is not None and w2_qzeros is not None:
@@ -629,9 +637,11 @@ def _process_awq_weights_marlin(
         is_a_8bit=is_a_8bit,
     )
     if input_dtype == torch.int8 and layer.num_groups_w13 > 1:
-        marlin_w13_scales, w13_input_global_scale = marlin_act_int8_process_scales(
-            marlin_w13_scales
-        )
+        # Per-expert int16 normalization (see _process_gptq_weights_marlin).
+        (
+            marlin_w13_scales,
+            w13_input_global_scale,
+        ) = marlin_act_int8_process_scales_per_expert(marlin_w13_scales)
 
     marlin_w2_scales = marlin_moe_permute_scales(
         s=w2_scales,
@@ -641,9 +651,11 @@ def _process_awq_weights_marlin(
         is_a_8bit=is_a_8bit,
     )
     if input_dtype == torch.int8 and layer.num_groups_w2 > 1:
-        marlin_w2_scales, w2_input_global_scale = marlin_act_int8_process_scales(
-            marlin_w2_scales
-        )
+        # Per-expert int16 normalization (see _process_gptq_weights_marlin).
+        (
+            marlin_w2_scales,
+            w2_input_global_scale,
+        ) = marlin_act_int8_process_scales_per_expert(marlin_w2_scales)
 
     marlin_w13_qzeros = moe_awq_to_marlin_zero_points(
         w13_qzeros,

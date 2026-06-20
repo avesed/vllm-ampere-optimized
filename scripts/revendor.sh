@@ -28,6 +28,7 @@ git apply -p1 --directory=vllm patches/0003-aot-compile-cache-quant-scheme-key.p
 cp patches/flashinfer_int8/int8qk_backend.py \
    vllm/vllm/v1/attention/backends/int8qk_backend.py
 git apply -p1 --directory=vllm patches/0004-int8qk-general-plugin-entrypoint.patch # 0004 int8qk plugin entry-point
+git apply -p1 --directory=vllm patches/0005-int8act-moe-perexpert-ampere.patch # 0005 int8-act MoE per-expert scale (kernel un-gate + python)
 
 echo "== re-vendor FlashInfer $FI_TAG =="
 rm -rf flashinfer

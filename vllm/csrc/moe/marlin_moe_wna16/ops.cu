@@ -759,13 +759,22 @@ torch::Tensor moe_wna16_marlin_gemm(
   torch::Tensor global_scale;
   if (global_scale_or_none.has_value()) {
     global_scale = global_scale_or_none.value();
-    TORCH_CHECK(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn,
-                "global_scale can only be used for nvfp4 format.");
+    // global_scale carries the per-expert reconstruction factor for nvfp4
+    // (per-expert alpha) AND for int8-act MoE (per-expert (1/4096)*max). Both
+    // index global_scale_ptr[expert_id] in the kernel.
+    TORCH_CHECK((b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) ||
+                    a_type == vllm::kS8,
+                "global_scale can only be used for nvfp4 or int8-act format.");
   } else {
     global_scale = torch::empty({0}, options_fp32);
     TORCH_CHECK(!(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn),
                 "the global_scale parameter must be passed for nvfp4 format.");
   }
+  // For int8-act without a per-expert factor (empty tensor), pass nullptr so
+  // the kernel keeps global_scale_f32 = 1.0 (its runtime null-guard handles it).
+  // marlin_mm takes a void* (g_s) which the kernel reinterprets as const float*.
+  void* global_scale_kernel_ptr =
+      global_scale.numel() > 0 ? global_scale.data_ptr() : nullptr;
 
   bool has_bias = b_bias_or_none.has_value();
   torch::Tensor b_bias;
@@ -856,7 +865,7 @@ torch::Tensor moe_wna16_marlin_gemm(
   MARLIN_NAMESPACE_NAME::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),
       b_bias.data_ptr(), a_scales.data_ptr(), b_scales.data_ptr(),
-      global_scale.data_ptr(), b_zeros.data_ptr(), g_idx.data_ptr(),
+      global_scale_kernel_ptr, b_zeros.data_ptr(), g_idx.data_ptr(),
       perm.data_ptr(), a_tmp.data_ptr(), sorted_token_ids.data_ptr(),
       expert_ids.data_ptr(), num_tokens_past_padded.data_ptr(),
       topk_weights.data_ptr(), moe_block_size, num_experts, top_k,

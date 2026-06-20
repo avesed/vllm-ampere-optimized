@@ -37,6 +37,7 @@ from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
     fused_marlin_moe,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    marlin_act_int8_process_scales_per_expert,
     marlin_permute_bias,
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
@@ -1004,6 +1005,113 @@ def test_fused_marlin_moe(
         input_dtype=a_dtype,
         quant_type_id=b_type.id,
         is_k_full=is_k_full,
+    )
+
+    torch.testing.assert_close(marlin_output, torch_output, atol=4e-2, rtol=0)
+
+
+@pytest.mark.flaky(reruns=2)
+@pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
+@pytest.mark.usefixtures("default_vllm_config")
+@pytest.mark.parametrize("m", [1, 17, 256])
+def test_fused_marlin_moe_int8_heterogeneous_experts(m):
+    """int8-act MoE with DELIBERATELY divergent per-expert scale magnitudes.
+
+    The stock test (test_fused_marlin_moe) cannot expose the real model-loading
+    bug because it normalizes the int16 weight scales by a SINGLE global
+    ``scales.max()`` over the whole stacked [E,K,N] tensor. With low-spread
+    random experts that is benign. But at high E with heterogeneous experts the
+    smallest-scale experts collapse to int16 code 0 -> garbage.
+
+    Here we multiply expert i's weights by ``10**i`` so the per-expert max spans
+    many orders of magnitude. We then quantize int16 scales PER-EXPERT
+    (full 4096-code range each) and carry the per-expert reconstruction factor
+    through the kernel's per-expert ``global_scale_ptr[expert_id]`` channel
+    (``global_scale1/2``), which is the structural fix. Asserting close proves
+    the per-expert int8 channel is wired end-to-end.
+    """
+    set_random_seed(7)
+
+    e, topk = 8, 2
+    n, k = 256, 512
+    group_size = 128
+    b_type = scalar_types.uint4  # AWQ-style (has_zp), matches the real ckpt
+    dtype = torch.bfloat16
+    a_dtype = torch.int8
+
+    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
+    w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
+
+    # Force heterogeneous per-expert magnitudes (orders-of-magnitude spread).
+    spread = torch.tensor(
+        [10.0 ** (i - e // 2) for i in range(e)], device="cuda", dtype=dtype
+    )
+    w1 = w1 * spread.view(e, 1, 1)
+    w2 = w2 * spread.view(e, 1, 1)
+
+    def build(w):
+        w_ref_l, qweight_l, scales_l, zeros_l = [], [], [], []
+        for i in range(w.shape[0]):
+            w_ref, qweight, scales, zeros = awq_marlin_quantize(
+                w[i].transpose(1, 0), b_type, group_size, input_dtype=torch.int8
+            )
+            w_ref_l.append(w_ref.T)
+            qweight_l.append(qweight)
+            scales_l.append(scales)
+            zeros_l.append(zeros)
+        w_ref = stack_and_dev(w_ref_l)
+        qweight = stack_and_dev(qweight_l).contiguous()
+        scales = stack_and_dev(scales_l)
+        zeros = stack_and_dev(zeros_l)
+        # Per-expert int16 normalization + [E] reconstruction factor (the fix).
+        scales_i16, gscale = marlin_act_int8_process_scales_per_expert(scales)
+        # Sanity: every expert must keep a non-zero max int16 code (no collapse).
+        codes = scales_i16.view(torch.int16).abs().amax(dim=(1, 2))
+        assert (codes > 0).all(), f"some expert collapsed to int16 code 0: {codes}"
+        return w_ref, qweight, scales_i16, zeros, gscale
+
+    w1_ref, w1_q, w1_s, w1_zp, w1_gscale = build(w1)
+    w2_ref, w2_q, w2_s, w2_zp, w2_gscale = build(w2)
+
+    score = torch.randn((m, e), device="cuda", dtype=dtype)
+    topk_weights, topk_ids, _ = fused_topk(a, score, topk, False)
+
+    with set_current_vllm_config(vllm_config):
+        score_sm = torch.softmax(score, dim=-1, dtype=torch.float32)
+        topk_weight, topk_ids_ref = torch.topk(score_sm, topk)
+        torch_output = torch_experts(
+            a,
+            w1_ref,
+            w2_ref,
+            topk_weight=topk_weight,
+            topk_ids=topk_ids_ref,
+            global_num_experts=e,
+            expert_map=None,
+            quant_dtype=a_dtype,
+            per_act_token_quant=True,
+        )
+
+    marlin_output = fused_marlin_moe(
+        a,
+        w1_q,
+        w2_q,
+        None,
+        None,
+        w1_s,
+        w2_s,
+        topk_weights,
+        topk_ids,
+        global_num_experts=e,
+        expert_map=None,
+        # Per-expert reconstruction factor on the per-expert kernel channel.
+        global_scale1=w1_gscale,
+        global_scale2=w2_gscale,
+        w1_zeros=w1_zp,
+        w2_zeros=w2_zp,
+        input_dtype=a_dtype,
+        quant_type_id=b_type.id,
+        is_k_full=True,
     )
 
     torch.testing.assert_close(marlin_output, torch_output, atol=4e-2, rtol=0)
