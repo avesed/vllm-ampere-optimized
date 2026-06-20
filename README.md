@@ -22,26 +22,25 @@ Marlin can run it on Ampere, but vLLM gates its W4A8 path to Hopper: on an Amper
 `vllm/` and `flashinfer/` carry the edits baked in; `patches/` + `scripts/revendor.sh` replay them on an
 upstream bump, and `scripts/build_image_source.sh` builds + pushes the image.
 
-## Throughput & quality
+## Results
 
-One RTX 3090, Qwen3.5-9B (int4 g32, AWQ + mse), single-GPU, cudagraph — tok/s:
+Stock vLLM **won't load W4A8 on any Ampere GPU** — the fork is the only way to run it. Numbers below are
+**W4A16 → W4A8** on the same fork engine, tok/s (int4 g32 AWQ+mse, cudagraph):
 
-| quant | decode | prefill (8k) | batch-32 |
-|---|---:|---:|---:|
-| stock vLLM · W4A8 | ❌ won't load on Ampere | — | — |
-| this fork · W4A16 | 87 | 4.7k | 438 |
-| **this fork · W4A8** | 85 | **7.0k** | **595** |
+| GPU · arch | model | prefill (8k) | int8 Δ | decode | batch-32 |
+|---|---|---|---:|---:|---:|
+| RTX 3090 ×1 · `sm_86` | 9B dense | 4.7k → **7.0k** | **+49%** | 87 → 85 | 438 → **595** |
+| RTX 3090 ×2 (pp2) · `sm_86` | 35B-A3B MoE | 9.1k → **10.8k** | **+19%** | 122 → 120 | 614 → **669** |
+| A100 ×1 · `sm_80` | 9B dense | 11.1k → 11.1k | +0% | — | — |
+| A100 ×1 · `sm_80` | 35B-A3B MoE | 22.8k → 24.7k | +8% | — | — |
 
-W4A8 vs W4A16: decode parity, **+49% prefill, +36% batch**. GSM8K (thinking): W4A16 81.6% vs W4A8 85.6%
-(N=250) — int8 activations cost ~zero quality under AWQ+mse. The fork's W4A16 is byte-identical to stock.
-
-**Hardware scope:** the int8 prefill/batch win is a **consumer-Ampere (`sm_86`)** effect — those cards'
-fp16 tensor (FP32 accumulate) is half-rate, so int8 is a ~4× lever. On **A100 (`sm_80`)** fp16 is
-full-rate, so the W4A8 *enabler* still applies but the int8 prefill speedup is small (~0 dense, +8% MoE).
-int4-weight decode + VRAM savings hold on every Ampere card.
-
-**Multi-GPU without NVLink → use `-pp 2 -tp 1`** (TP's per-layer all-reduce eats ~half of prefill). On
-2×3090, pp2, 35B-A3B (MoE): W4A16 prefill-8k 9.1k → W4A8 **10.8k (+19%)**, decode 120, batch-32 669.
+- **The int8 prefill win is a consumer-`sm_86` effect** — those cards' fp16 tensor (FP32 accumulate) is
+  half-rate, so int8 is a ~4× compute lever. A100 (`sm_80`) fp16 is full-rate → int8 prefill ~0 (dense)
+  / +8% (MoE). The W4A8 enabler + int4-weight decode/VRAM savings hold on every Ampere card.
+- **No-NVLink multi-GPU → `-pp 2 -tp 1`** — TP's all-reduce eats ~half of prefill (it shrinks the 35B
+  int8 gain to +5%).
+- **Quality:** decode is W4A16-parity; int8 activations cost ~zero accuracy — GSM8K (thinking) 9B W4A16
+  81.6% / W4A8 85.6% (N=250); 35B-A3B W4A8 GSM8K 95.8%, MMLU-Pro 80.5%. The fork's W4A16 is byte-identical to stock.
 
 ## Use
 
