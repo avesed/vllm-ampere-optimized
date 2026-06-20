@@ -1,36 +1,48 @@
-# patches/
+# patches/ — the fork edit recipe
 
-Ordered, upstream-relative unified diffs applied on top of a clean vLLM release checkout
-in CI (`git apply --3way --whitespace=fix patches/*.patch`, lexical order). One `.patch`
-per logical change so a drift failure points at exactly what broke.
+This repo is a **vendored fork**: the complete modified source lives in `vllm/` (upstream v0.23.0)
+and `flashinfer/` (upstream v0.6.12), committed with all our edits baked in. `patches/` is no longer
+applied at build time — it is the **recipe** that regenerates those vendored trees from a fresh
+upstream checkout (so an upstream bump is reproducible and drift is detectable).
 
-| patch | what it does |
+The complete fork is built **from source** by the maintainer running `scripts/build_image_source.sh`
+**locally** (vLLM from `vllm/` → sm_80+sm_86 fatbin + the int8-QK FlashInfer overlaid from
+`flashinfer/`) and pushing to ghcr. There is **no CI auto-build**: the from-source CUDA build needs a
+GPU, and a self-hosted GPU runner on a public repo is a security risk (a malicious PR could run code
+on it). The only CI is the github-hosted `patch-drift-check` canary below. Native changes (`.cu/.cuh`)
+ship only from source — which is exactly why this is vendored rather than a pure-Python overlay.
+
+## The edits (the recipe)
+
+**vLLM** (`vllm/`):
+| edit | what it does |
 |---|---|
-| `0001-marlin-w4a8-int8-ampere.patch` | Wires int4-weight + int8-activation (W4A8) through the **Marlin** kernel on Ampere — vLLM gates its dedicated W4A8 kernels (Cutlass/Machete) to Hopper. Edits `compressed_tensors_w4a8_int.py` (`act_type=torch.int8`), `mixed_precision/marlin.py` (allow int4 in the 8-bit-act assert, pack signed int4→uint4b8, pass effective `wtype`), `marlin_utils.py` (add `int4` to supported types). Pure-Python (no `.cu`/CMake). Upstream [vllm#38064](https://github.com/vllm-project/vllm/issues/38064)/[#38066](https://github.com/vllm-project/vllm/pull/38066). |
-| `0002-marlin-int8-8row-decode-ampere.patch` | **Native.** Implements + fixes the int8 (`kS8`) `m_block_size_8` **8-row decode tile** in Marlin — upstream gates it to 16-bit activations only (`marlin.cu`: `m_block_size_8 = prob_m<=8 && size_bits==16`). Enables the 8-row tile for W4A8 small-batch (`prob_m<=8`) decode via four transposed-`m16n8k32`-layout fixes, all `is_a_8bit`/`m_block_size_8`-gated (16-bit path untouched): **(1) gather k-order** — `b0=K[tg*4..+3]`, `b1=K[tg*4+16..+19]` (two K-half int4 chunks, not 8 contiguous K); **(2) grouped-fold weight-scale** — warp-shuffle col `gid`'s int16 scale from lane `gid>>1`; **(3) per-row activation scale** — `sh_a_s[tid*2+g%2]`, `[0]`-slot only; **(4) writeback** — `32` cols/warp for int8 (was 16-bit's `64`). Plus `marlin.cu` gate (kS8->8-row) and `generate_kernels.py` (emit `0.5` m-block kernels). **Touches `csrc/` -> trips the native-code guard (rule 1); W4A8 builds from source.** Validated: standalone Marlin GEMM M=4/8 uniform+real `max_diff ~0.003`; 27B W4A8 decode coherent. Zero decode throughput change (weight-bandwidth-bound) — correctness/completeness fix. |
+| `0001-marlin-w4a8-int8-ampere.patch` (+ `regenerate.py`) | Wires int4-weight + int8-activation (W4A8) through **Marlin** on Ampere — vLLM gates Cutlass/Machete W4A8 to Hopper. Edits `compressed_tensors_w4a8_int.py` (`act_type=torch.int8`), `mixed_precision/marlin.py` (int4 in the 8-bit-act assert, pack signed int4→uint4b8, effective `wtype`), `marlin_utils.py` (int4 supported). Pure-Python. Upstream [vllm#38064](https://github.com/vllm-project/vllm/issues/38064)/[#38066](https://github.com/vllm-project/vllm/pull/38066). Applied by `regenerate.py` (anchor-based, fails loudly on skew). |
+| `0002-marlin-int8-8row-decode-ampere.patch` | **Native.** int8 (`kS8`) `m_block_size_8` 8-row decode tile in Marlin (upstream gates it to 16-bit acts) via four transposed-`m16n8k32`-layout fixes, all `is_a_8bit`/`m_block_size_8`-gated. Touches `csrc/`. Applied by `git apply -p1 --directory=vllm`. |
+| `0003-aot-compile-cache-quant-scheme-key.patch` | **Pure-Python.** Folds the resolved quantization scheme into the **torch.compile AOT-compile cache key** (`compilation/caching.py` `aot_compile_hash_factors`). Without it, two checkpoints of the SAME architecture but DIFFERENT quant schemes (e.g. pack-quantized **W4A16** vs int-quantized **W4A8**) collide on the on-disk AOT-graph hash; a W4A8 model served against a persistent cache holding the W4A16 graph loads it and crashes `KeyError: 'weight_zero_point'` (W4A16 registers `weight_zero_point`; symmetric W4A8 does not). Root cause + reproduction + validation in [`eval/INT8_CUDAGRAPH_ROOTCAUSE.md`](../eval/INT8_CUDAGRAPH_ROOTCAUSE.md). Applied by `git apply -p1` (additive; anchor = `aot_compile_hash_factors`). |
+| `flashinfer_int8/int8qk_backend.py` | vLLM V1 CUSTOM attention backend: intercepts hd256 full-attn prefill (fresh + cached-prefix chunks), per-token int8-quant Q/K → int8 FlashInfer prefill, fp16 PV. Dropped into `vllm/vllm/v1/attention/backends/`. Now ships `register_int8qk()`, the `vllm.general_plugins` entry-point (registered by 0004). Everything non-hd256 / decode / unsupported FA-falls-back. **Runtime-couples to the int8-QK FlashInfer overlay below** — stock flashinfer 0.6.12 lacks `torch.int8` in `dtype_map_kv`, so the kernel `KeyError`s the instant it fires; both ship together via `build_image_source.sh`. |
+| `0004-int8qk-general-plugin-entrypoint.patch` | **Pure-Python (`pyproject.toml`).** Registers `int8qk = "...int8qk_backend:register_int8qk"` under `[project.entry-points."vllm.general_plugins"]`. vLLM's `load_general_plugins()` runs this in **every process** — engine-core AND each TP/PP worker subprocess (`v1/worker/worker_base.py:init_worker`, before backend selection) — so the int8-QK override reaches all workers and fires under `-tp N` / `-pp N` (the old in-process monkeypatch only worked with `VLLM_ENABLE_V1_MULTIPROCESSING=0`). **Opt-in via `VLLM_INT8QK=1`** (the entry-point is baked into the from-source image; default-on would swap the global FLASH_ATTN backend for every model). The backend's `get_name()` returns `"FLASH_ATTN"` so the `AttentionBackendEnum[get_name()]` lookup in `attention.py` resolves (no launcher monkeypatch needed). Applied by `git apply -p1 --directory=vllm` **after** the `int8qk_backend.py` cp. |
 
-## Two rules
+**FlashInfer** (`flashinfer/`) — `flashinfer_int8/apply_to_source.py` (runs i1_apply + i4_apply + i4_compute_qk):
+native int8-QK IMMA (`m16n8k32 s8s8s32`) wired into `compute_qk` (mma.cuh wrapper, s32 accum, per-token
+q/k dequant + smooth_k, PV fp16) + the int8 dtype path through the JIT codegen + per-token scale plumbing,
+incl. per-request q AND k scale offsets (`q_indptr` / `maybe_kv_scale_indptr`) for MULTI-request batched
+prefill (paged + ragged). Validated real RTX 3090: cos 0.9999 vs fp16 single- AND multi-request (N≥3,
+head_dim 128/256, GQA, causal/non-causal, paged+ragged, qo<kv append); head_dim 64 guarded unsupported
+(k64B swizzle); e2e Qwen3.5-9B-W4A8 64k +1.9% / 128k chunked +2.0% TTFT. See `flashinfer_int8/NOTES.md`.
 
-1. **Pure-Python only, or it won't reach the default ship.** The default OVERLAY wheel
-   (`scripts/build_wheel_overlay.sh`) applies only `vllm/*` (Python) hunks onto the official
-   **released** wheel (`pip download vllm==<tag>`), and the overlay image is
-   `FROM vllm/vllm-openai:<tag>` + the same hunks — neither can carry native
-   (`.cu/.cpp/.cuh/CMakeLists/csrc/`) changes. `scripts/apply_patches.sh` greps the applied diff for
-   those paths and sets `NATIVE_CHANGED=1`; a native patch (e.g. `0002`) then ships **only** via the
-   opt-in from-source image (`build_image_ampere.sh`, repo var `BUILD_RUNNER`). Keep native changes
-   out of here unless you mean it.
+## Re-vendor on an upstream bump
 
-2. **Anchors drift; refresh against the tag.** These diffs match upstream context lines that
-   move between releases. `patch-drift-check.yml` runs `git apply --check` daily and opens an
-   issue when the series stops applying.
-
-## Regenerate a patch against a new tag
+`watch-upstream.yml` opens an issue when upstream releases a newer tag. To re-vendor:
 
 ```bash
-git clone --depth 1 --branch <tag> https://github.com/vllm-project/vllm.git vllm
-python patches/regenerate.py vllm          # applies the edits in-place (fails loudly on skew)
-cd vllm && git diff > ../patches/0001-marlin-w4a8-int8-ampere.patch
+scripts/revendor.sh <vllm_tag> <flashinfer_tag>   # e.g. v0.23.0 v0.6.12
+# clones the fresh tags into vllm/ + flashinfer/, replays the recipe (regenerate.py + 0002 + 0003 +
+# apply_to_source.py); any drifted anchor FAILS LOUDLY. Then:
+git diff                                           # review
+git commit -am "revendor vllm@<tag> + flashinfer@<tag>"
+OWNER=<you> scripts/build_image_source.sh          # build from source + push to ghcr (local; no CI auto-build)
 ```
 
-`regenerate.py` carries the exact string anchors; if an anchor no longer matches it prints
-which one, so you update the anchor (and the diff) together. See `../docs/PATCHING.md`.
+`patch-drift-check.yml` replays the recipe onto the LATEST upstream tags daily (in temp checkouts,
+never touching the committed trees) and opens an issue if an anchor drifted, so refreshes are caught early.

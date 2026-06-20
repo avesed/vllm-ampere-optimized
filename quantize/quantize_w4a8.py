@@ -12,8 +12,11 @@ pipeline onloads ONE layer at a time to the GPU (~3 GB); pre-filling the GPU wit
 Usage:
     python quantize_w4a8.py <hf_model> <out_dir> [num_calib=256] [max_len=2048]
 
-For a plain text LLM, swap AutoModelForImageTextToText -> AutoModelForCausalLM and trim the
-`ignore` list (drop the visual / linear_attn / mtp entries).
+The `ignore` list excludes ALL quant-sensitive branches by default (lm_head, embed_tokens, mtp
+head, GatedDeltaNet linear_attn, visual tower); each regex is a harmless no-op on models that lack
+the module, so it is safe to keep the full list for plain text LLMs too. NOTE: the user's PROVEN
+quality recipe is AWQ+QuantizationModifier(observer=mse, g32) (see requant_v2_awq_mse_g32.py /
+recipe_qwen35_9b_awq_mse_g32.yaml) — GPTQ here is the generic fallback; prefer the AWQ+mse recipe.
 """
 import sys
 import torch
@@ -31,9 +34,20 @@ MAXLEN = int(sys.argv[4]) if len(sys.argv) > 4 else 2048
 recipe = GPTQModifier(
     scheme="W4A8",
     targets=["Linear"],
-    # keep the embedding / output / non-FFN branches in full precision.
-    # for hybrid/VL models add: "re:.*linear_attn.*", "re:.*visual.*", "re:.*mtp.*"
-    ignore=["lm_head", "re:.*embed_tokens"],
+    # Ignore ALL quant-sensitive / non-FFN-attn branches (keep them bf16). Each regex is a no-op on
+    # models that lack the module, so the full list is SAFE as a default (dense, hybrid, VL alike):
+    #   lm_head, embed_tokens   - input/output projections (always sensitive).
+    #   re:.*mtp.*              - MTP / next-token-prediction head. MUST stay bf16 AND land in the
+    #                            OUTPUT config's quantization_config.ignore (llm-compressor writes
+    #                            the recipe ignore there). Otherwise (a) AWQ/GPTQ may DROP the head
+    #                            entirely, and (b) vLLM's qwen3_5_mtp loader runs the bf16 fc through
+    #                            the quantized path (it only force-unquantizes for modelopt_fp4) ->
+    #                            0% spec-decode acceptance, silently. Proven 2026-06-19.
+    #   re:.*linear_attn.*     - GatedDeltaNet (hybrid) linear-attention projections (sensitive).
+    #   re:.*visual.*          - vision tower (VL models).
+    # For MoE models also add the router: "re:.*mlp[.]gate$".
+    ignore=["lm_head", "re:.*embed_tokens", "re:.*mtp.*",
+            "re:.*linear_attn.*", "re:.*visual.*"],
     dampening_frac=0.01,
 )
 

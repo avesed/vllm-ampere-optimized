@@ -1,0 +1,304 @@
+--- /usr/local/lib/python3.12/dist-packages/flashinfer/prefill.py.i4orig	2026-06-18 06:21:33.157984662 +0000
++++ /usr/local/lib/python3.12/dist-packages/flashinfer/prefill.py	2026-06-18 06:21:33.160254339 +0000
+@@ -387,25 +387,48 @@
+                     scale_v_scalar,
+                 )
+         else:
+-            run_func(
+-                q,
+-                k,
+-                v,
+-                tmp,
+-                o,
+-                maybe_lse,
+-                mask_mode,
+-                layout,
+-                window_left,
+-                maybe_packed_custom_mask,
+-                maybe_alibi_slopes,
+-                maybe_k_cache_sf,
+-                maybe_v_cache_sf,
+-                logits_soft_cap,
+-                sm_scale,
+-                1.0 / rope_scale,  # rope_rcp_scale
+-                1.0 / rope_theta,  # rope_rcp_theta
+-            )
++            if q.dtype == torch.int8:  # I-4a: per-token int8-QK dequant scales
++                run_func(
++                    q,
++                    k,
++                    v,
++                    tmp,
++                    o,
++                    maybe_lse,
++                    mask_mode,
++                    layout,
++                    window_left,
++                    maybe_packed_custom_mask,
++                    maybe_alibi_slopes,
++                    maybe_k_cache_sf,
++                    maybe_v_cache_sf,
++                    scale_q,
++                    scale_k,
++                    logits_soft_cap,
++                    sm_scale,
++                    1.0 / rope_scale,  # rope_rcp_scale
++                    1.0 / rope_theta,  # rope_rcp_theta
++                )
++            else:
++                run_func(
++                    q,
++                    k,
++                    v,
++                    tmp,
++                    o,
++                    maybe_lse,
++                    mask_mode,
++                    layout,
++                    window_left,
++                    maybe_packed_custom_mask,
++                    maybe_alibi_slopes,
++                    maybe_k_cache_sf,
++                    maybe_v_cache_sf,
++                    logits_soft_cap,
++                    sm_scale,
++                    1.0 / rope_scale,  # rope_rcp_scale
++                    1.0 / rope_theta,  # rope_rcp_theta
++                )
+         return o
+ 
+     @register_fake_op(f"flashinfer::{uri}_run")
+@@ -496,35 +519,68 @@
+         is_fp8 = scale_q is not None
+ 
+         if backend == "fa2":
+-            ragged_run_func(
+-                float_workspace_buffer,
+-                int_workspace_buffer,
+-                plan_info_vec,
+-                q,
+-                k,
+-                v,
+-                qo_indptr,
+-                kv_indptr,
+-                o,
+-                maybe_lse,
+-                mask_mode,
+-                layout,
+-                window_left,
+-                enable_pdl,
+-                maybe_custom_mask,
+-                maybe_mask_indptr,
+-                maybe_alibi_slopes,
+-                maybe_prefix_len_ptr,
+-                maybe_token_pos_in_items_ptr,
+-                maybe_max_item_len_ptr,
+-                maybe_k_cache_sf,
+-                maybe_v_cache_sf,
+-                logits_soft_cap,
+-                sm_scale,
+-                1.0 / rope_scale,  # rope_rcp_scale
+-                1.0 / rope_theta,  # rope_rcp_theta,
+-                token_pos_in_items_len,
+-            )
++            if q.dtype == torch.int8:  # I-4a: per-token int8-QK dequant scales
++                ragged_run_func(
++                    float_workspace_buffer,
++                    int_workspace_buffer,
++                    plan_info_vec,
++                    q,
++                    k,
++                    v,
++                    qo_indptr,
++                    kv_indptr,
++                    o,
++                    maybe_lse,
++                    mask_mode,
++                    layout,
++                    window_left,
++                    enable_pdl,
++                    maybe_custom_mask,
++                    maybe_mask_indptr,
++                    maybe_alibi_slopes,
++                    maybe_prefix_len_ptr,
++                    maybe_token_pos_in_items_ptr,
++                    maybe_max_item_len_ptr,
++                    maybe_k_cache_sf,
++                    maybe_v_cache_sf,
++                    scale_q,
++                    scale_k,
++                    logits_soft_cap,
++                    sm_scale,
++                    1.0 / rope_scale,  # rope_rcp_scale
++                    1.0 / rope_theta,  # rope_rcp_theta,
++                    token_pos_in_items_len,
++                )
++            else:
++                ragged_run_func(
++                    float_workspace_buffer,
++                    int_workspace_buffer,
++                    plan_info_vec,
++                    q,
++                    k,
++                    v,
++                    qo_indptr,
++                    kv_indptr,
++                    o,
++                    maybe_lse,
++                    mask_mode,
++                    layout,
++                    window_left,
++                    enable_pdl,
++                    maybe_custom_mask,
++                    maybe_mask_indptr,
++                    maybe_alibi_slopes,
++                    maybe_prefix_len_ptr,
++                    maybe_token_pos_in_items_ptr,
++                    maybe_max_item_len_ptr,
++                    maybe_k_cache_sf,
++                    maybe_v_cache_sf,
++                    logits_soft_cap,
++                    sm_scale,
++                    1.0 / rope_scale,  # rope_rcp_scale
++                    1.0 / rope_theta,  # rope_rcp_theta,
++                    token_pos_in_items_len,
++                )
+         elif is_fp8:
+             # FA3 FP8: scale_q, scale_k, scale_v, sm_scale, scale_q_scalar, scale_k_scalar, scale_v_scalar
+             scale_q_tensor, scale_q_scalar = _split_scale_param(scale_q)
+@@ -717,37 +773,72 @@
+             )
+         elif backend == "fa2":
+             assert not is_float8(q)
+-            paged_run_func(
+-                float_workspace_buffer,
+-                int_workspace_buffer,
+-                plan_info_vec,
+-                q,
+-                paged_k_cache,
+-                paged_v_cache,
+-                qo_indptr,
+-                paged_kv_indptr,
+-                paged_kv_indices,
+-                paged_kv_last_page_len,
+-                o,
+-                maybe_lse,
+-                mask_mode,
+-                layout,
+-                window_left,
+-                enable_pdl,
+-                maybe_custom_mask,
+-                maybe_mask_indptr,
+-                maybe_alibi_slopes,
+-                maybe_prefix_len_ptr,
+-                maybe_token_pos_in_items_ptr,
+-                maybe_max_item_len_ptr,
+-                key_block_scales,
+-                value_block_scales,
+-                logits_soft_cap,
+-                sm_scale,
+-                1.0 / rope_scale,  # rope_rcp_scale
+-                1.0 / rope_theta,  # rope_rcp_theta
+-                token_pos_in_items_len,
+-            )
++            if q.dtype == torch.int8:  # I-4a: per-token int8-QK dequant scales
++                paged_run_func(
++                    float_workspace_buffer,
++                    int_workspace_buffer,
++                    plan_info_vec,
++                    q,
++                    paged_k_cache,
++                    paged_v_cache,
++                    qo_indptr,
++                    paged_kv_indptr,
++                    paged_kv_indices,
++                    paged_kv_last_page_len,
++                    o,
++                    maybe_lse,
++                    mask_mode,
++                    layout,
++                    window_left,
++                    enable_pdl,
++                    maybe_custom_mask,
++                    maybe_mask_indptr,
++                    maybe_alibi_slopes,
++                    maybe_prefix_len_ptr,
++                    maybe_token_pos_in_items_ptr,
++                    maybe_max_item_len_ptr,
++                    key_block_scales,
++                    value_block_scales,
++                    scale_q,
++                    scale_k,
++                    logits_soft_cap,
++                    sm_scale,
++                    1.0 / rope_scale,  # rope_rcp_scale
++                    1.0 / rope_theta,  # rope_rcp_theta
++                    token_pos_in_items_len,
++                )
++            else:
++                paged_run_func(
++                    float_workspace_buffer,
++                    int_workspace_buffer,
++                    plan_info_vec,
++                    q,
++                    paged_k_cache,
++                    paged_v_cache,
++                    qo_indptr,
++                    paged_kv_indptr,
++                    paged_kv_indices,
++                    paged_kv_last_page_len,
++                    o,
++                    maybe_lse,
++                    mask_mode,
++                    layout,
++                    window_left,
++                    enable_pdl,
++                    maybe_custom_mask,
++                    maybe_mask_indptr,
++                    maybe_alibi_slopes,
++                    maybe_prefix_len_ptr,
++                    maybe_token_pos_in_items_ptr,
++                    maybe_max_item_len_ptr,
++                    key_block_scales,
++                    value_block_scales,
++                    logits_soft_cap,
++                    sm_scale,
++                    1.0 / rope_scale,  # rope_rcp_scale
++                    1.0 / rope_theta,  # rope_rcp_theta
++                    token_pos_in_items_len,
++                )
+         else:
+             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
+             if not is_float8(q):
+@@ -2456,6 +2547,9 @@
+                     fp8_scale_q = args[0]
+                     fp8_scale_k = args[1]
+                     fp8_scale_v = args[2]
++                elif q.dtype == torch.int8 and len(args) >= 2:  # I-3: per-token int8-QK scales
++                    fp8_scale_q = args[0]
++                    fp8_scale_k = args[1]
+                 run_args += [
+                     self._custom_mask_buf,
+                     self._mask_indptr_buf,
+@@ -3361,7 +3455,11 @@
+         out_head_dim = q.shape[-1] if kv_cache_sf is not None else v.shape[-1]
+         if out is None:
+             # when input dtype is fp8, we need to use bf16 output
+-            out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
++            # I-3: int8-QK module is compiled with o_data_type=float16 -> honor it (not bf16).
++            if q.dtype == torch.int8:
++                out_dtype = self._cached_o_data_type or torch.float16
++            else:
++                out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
+             out = torch.empty(
+                 q.shape[:-1] + (out_head_dim,),
+                 dtype=out_dtype,
+@@ -3511,6 +3609,8 @@
+             # For FP8, append scale tensors
+             if is_float8(q):
+                 run_args.extend(list(args))  # scale_q, scale_k, scale_v
++            elif q.dtype == torch.int8:  # I-3: per-token int8-QK scales (scale_q, scale_k)
++                run_args.extend(list(args))
+ 
+         assert self._cached_module is not None, "cached module is not initialized"
+         self._cached_module.ragged_run(*run_args)

@@ -13,7 +13,10 @@ Status legend: ✅ shipped · 🔨 build-now · ⏳ gated on measurement · 🧪
 
 ## Already shipped ✅
 - **W4A8-int8 Marlin un-gate** (patch 0001) + int8 8-row decode tile (patch 0002). The flagship.
-  Measured: decode = W4A16 parity (weight-bandwidth-bound), prefill +15-18% (int8 TC).
+  Measured: decode = W4A16 parity (weight-bandwidth-bound); prefill **+19-49% on consumer sm_86**
+  (9B dense 8k +49%, 35B-A3B pp2 +19%; 3090 fp16-FP32acc is half-rate → int8 ~4× TC lever), but
+  **~0 on A100 sm_80** (dense; +8% MoE — full-rate fp16). The W4A8 *enabler* + int4 decode/VRAM win
+  hold on all Ampere; the int8 *prefill* TC win is a consumer-sm_86 effect (measured 2026-06-20).
 - **RTX-3090 fused_moe Triton config** (configs/fused_moe). NOTE: used by the **Triton** fused-MoE
   path (bf16/fp16/int8_w8a8), confirmed triggered. NOT read by the Marlin `moe_wna16` path. Keep;
   document which path it serves. (Earlier "delete it as dead" was wrong — it's live for Triton MoE.)
@@ -29,20 +32,20 @@ fork value is *guaranteeing the captured wins don't silently regress on Ampere a
    Smartest impl: RUN the UPSTREAM mamba/GDN kernel pytest suite on the Ampere runner against the shipped
    image (upstream CI doesn't gate consumer-Ampere). Shipped: `scripts/ampere_kernel_ci.sh <image> <tag>`
    (host sparse-clones the tag's tests/, mounts ro into the image, `pip install pytest einops tblib`, runs
-   the vetted subset; skips w/o GPU) + new `ampere-kernel-ci` job in build.yml (needs image-overlay, gated
-   BUILD_RUNNER). Validated on real RTX 3090 (sm_86): test_fused_gdn_post_conv + test_causal_conv1d = 228
+   the vetted subset; skips w/o GPU) — run locally after `build_image_source.sh` (no CI auto-build).
+   Validated on real RTX 3090 (sm_86): test_fused_gdn_post_conv + test_causal_conv1d = 228
    passed; test_mamba_ssm = 286 passed; test_mamba_ssm_ssd / test_ssu_dispatch (8) / test_mamba_ssm_configs
    (6) pass; test_gdn_forward_core_split is sm_86-gated→skipped→excluded. Combined: 641 cases collect clean.
    E2E-VALIDATED against the SHIPPED image: pulled ghcr overlay v0.23.0, ran the subset inside it on
    sm_86 → **622 passed, 19 skipped, exit 0** (~27min, cold-Triton-JIT slow but green). The e2e caught +
    fixed a real bug: the official image has NO `python` (only `python3`) — script now uses `python3 -m
    pip`/`python3 -m pytest` + `--entrypoint /bin/bash`. Push-ready (test deps installed in-container:
-   pytest einops tblib). CI job ~27min cold (opt-in, gated BUILD_RUNNER, per-release).
+   pytest einops tblib). Runs locally ~27min cold (after build_image_source.sh, per-release).
 2. **Ampere runtime path-selection smoke — BUILT + WIRED; sandbox-validation pending 🔨.**
    `scripts/ampere_defaults_check.sh <image>` loads a tiny hybrid (Qwen3.5-0.8B-Base) in the shipped image
    on an Ampere GPU and asserts the runtime SELECTS the right paths: GDN prefill → Triton/FLA, attention →
    FlashAttention (catches a regression class the kernel tests can't — an upstream bump silently routing
-   Ampere to a slow/broken path). Wired as a 2nd step in the `ampere-kernel-ci` build.yml job. (Dropped the
+   Ampere to a slow/broken path). Run locally alongside the kernel CI after a build. (Dropped the
    triton≥3.4 + check_shared_mem asserts as redundant — the kernel CI already exercises both.) REMAINING:
    sandbox-validate the in-image model-load smoke (was blocked by a transient Bash classifier outage).
 3. **Ship the diagnostic harness ✅** — `benchmarks/README.md` written (documents the ncu IMMA-occupancy,

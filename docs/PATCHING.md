@@ -19,8 +19,8 @@ python patches/regenerate.py vllm
   corresponding `old`/`new` string in `patches/regenerate.py`, and rerun until clean, then emit
   the diff as above.
 
-Commit the refreshed `.patch` (and any `regenerate.py` anchor edits). The next `build.yml` run for
-that tag will pass the `git apply --check` gate.
+Commit the refreshed `.patch` (and any `regenerate.py` anchor edits). The `patch-drift-check` canary
+(and your next local `scripts/revendor.sh`) will then pass the `git apply --check` gate.
 
 ## Why `git apply --3way`, not `git am`
 
@@ -29,18 +29,14 @@ fails on them outright. Plain `git apply` dies on the smallest context drift. `g
 falls back to a 3-way merge when context shifts (cross-version resilience) and returns a clean
 non-zero exit only when a hunk genuinely can't apply — which is what the drift canary keys on.
 
-## The native-code rule
+## Native code ships from source
 
-Keep patches **pure-Python** where you can. The default ship is an OVERLAY: the wheel
-(`scripts/build_wheel_overlay.sh`) applies only the `vllm/*` (Python) hunks onto the official
-**released** wheel (`pip download vllm==<tag>`), and the image is `FROM vllm/vllm-openai:<tag>` +
-the same Python hunks. Neither can carry native (`.cu/.cpp/.cuh/CMakeLists/csrc/`) changes — a native
-patch's kernels are simply **absent** from the default overlay wheel/image (the overlay just logs
-`(no applicable vllm/ hunks …)` and moves on). A native patch therefore ships **only** via the opt-in
-from-source image (`scripts/build_image_ampere.sh`, set repo var `BUILD_RUNNER`), which applies the
-full patch and compiles. `scripts/apply_patches.sh` flags native hunks (`NATIVE_CHANGED=1`) so a
-release that needs them is known to require the from-source path. (Example: patch 0002, the int8
-8-row Marlin tile, is native → from-source image only; the overlay wheel/image carries patch 0001.)
+The fork carries native (`.cu/.cuh/csrc/`) edits — patch 0002 (the int8 8-row Marlin decode tile) and
+the int8-QK FlashInfer kernels — which a pip-overlay onto an official wheel/image cannot carry. So the
+whole fork is **vendored and built from source** (`scripts/build_image_source.sh`, run locally on a
+GPU box; there is no overlay wheel/image path and no CI build). Pure-Python edits (0001 W4A8 routing,
+0003 the AOT cache key) are baked into the same vendored tree and ship the same way. Keep edits
+minimal and anchor-based so `regenerate.py` / `apply_to_source.py` can replay them onto a new tag.
 
 ## If upstream fixes it
 
