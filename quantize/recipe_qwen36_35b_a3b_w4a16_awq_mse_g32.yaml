@@ -1,0 +1,42 @@
+# Qwen/Qwen3.6-35B-A3B (MoE hybrid VL, 40 layers, 256 experts top-8, shared_expert; full-attn at
+# 3,7,...,39) — W4A16 symmetric int4 group_size=32, AWQ + observer=mse.
+# This is the user's validated recipe (ref Avesed/Qwopus3.6-35B-A3B-v1-int4-mixed) applied to the
+# official base. Quantizes the MoE EXPERT FFNs only (the bulk); self_attn, router (mlp.gate),
+# shared_expert, GatedDeltaNet (linear_attn), lm_head, vision tower and MTP head stay bf16 — the
+# quality-sensitive parts. Serve as W4A8 with --marlin-input-dtype int8 (the int8-act MoE path,
+# patch 0005).
+default_stage:
+  default_modifiers:
+    AWQModifier:
+      mappings:
+      - smooth_layer: re:model.*post_attention_layernorm$
+        balance_layers: ['re:model.*mlp[.]experts.*gate_proj$', 're:model.*mlp[.]experts.*up_proj$',
+          're:model.*mlp[.]shared_expert[.]gate_proj$', 're:model.*mlp[.]shared_expert[.]up_proj$',
+          're:model.*mlp[.]gate$', 're:model.*mlp[.]shared_expert_gate$']
+        activation_hook_target: null
+      - smooth_layer: re:model.*mlp[.]experts.*up_proj$
+        balance_layers: ['re:model.*mlp[.]experts.*down_proj$']
+        activation_hook_target: null
+      offload_device: !!python/object/apply:torch.device [cpu]
+      duo_scaling: both
+      n_grid: 20
+    QuantizationModifier:
+      config_groups:
+        group_0:
+          targets: [Linear]
+          weights:
+            num_bits: 4
+            type: int
+            symmetric: true
+            group_size: 32
+            strategy: group
+            dynamic: false
+            observer: mse
+          input_activations: null
+          output_activations: null
+          format: null
+      targets: [Linear]
+      ignore: [lm_head, 're:.*embed_tokens', 're:.*linear_attn.*', 're:.*shared_expert.*',
+        're:.*shared_expert_gate$', 're:.*mlp\.gate$', 're:.*self_attn.*', 're:model\.visual.*',
+        're:mtp.*']
+      bypass_divisibility_checks: false

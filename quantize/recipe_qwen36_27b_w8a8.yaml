@@ -1,0 +1,30 @@
+# Qwen/Qwen3.6-27B (dense hybrid VL) — W8A8: int8 per-channel weights + int8 dynamic-per-token
+# activations (both symmetric). int8 is robust, so plain observer=mse weight quant (no AWQ) is enough,
+# and dynamic-per-token activations absorb outliers without SmoothQuant. Quantizes MLP + self_attn;
+# GatedDeltaNet (linear_attn), lm_head, embed, vision tower, MTP head stay bf16.
+# vLLM serves this via the int8 W8A8 CUTLASS path (works on Ampere sm_80+sm_86).
+default_stage:
+  default_modifiers:
+    QuantizationModifier:
+      config_groups:
+        group_0:
+          targets: [Linear]
+          weights:
+            num_bits: 8
+            type: int
+            symmetric: true
+            strategy: channel
+            dynamic: false
+            observer: mse
+          input_activations:
+            num_bits: 8
+            type: int
+            symmetric: true
+            strategy: token
+            dynamic: true
+            observer: null
+          output_activations: null
+          format: null
+      targets: [Linear]
+      ignore: [lm_head, 're:.*embed_tokens', 're:.*linear_attn.*', 're:.*visual.*', 're:.*mtp.*']
+      bypass_divisibility_checks: false

@@ -1,0 +1,39 @@
+# Qwen/Qwen3.6-27B (dense hybrid VL, 64 layers, full-attn at 3,7,...,63; 48 GatedDeltaNet layers)
+# W4A16 — symmetric int4, group_size=32, AWQ scale-search smoothing + observer=mse.
+# Reference: cyankiwi/Qwen3.6-27B-AWQ-INT4, but SYMMETRIC (asymmetric AWQ can't serve W4A8 int8-act
+# on Ampere — the Marlin W4A8 kernel needs uint4b8/int4). Serve as W4A8 with --marlin-input-dtype int8.
+# Quantizes MLP (all 64 layers) + self_attn (the 16 full-attn layers); GatedDeltaNet (linear_attn),
+# lm_head, embed, vision tower and MTP head stay bf16.
+default_stage:
+  default_modifiers:
+    AWQModifier:
+      mappings:
+      - smooth_layer: re:.*post_attention_layernorm$
+        balance_layers: ['re:.*mlp[.]gate_proj$', 're:.*mlp[.]up_proj$']
+        activation_hook_target: null
+      - smooth_layer: re:.*mlp[.]up_proj$
+        balance_layers: ['re:.*mlp[.]down_proj$']
+        activation_hook_target: null
+      - smooth_layer: re:.*layers\.(3|7|11|15|19|23|27|31|35|39|43|47|51|55|59|63)\.input_layernorm$
+        balance_layers: ['re:.*self_attn[.]q_proj$', 're:.*self_attn[.]k_proj$', 're:.*self_attn[.]v_proj$']
+        activation_hook_target: null
+      duo_scaling: both
+      n_grid: 20
+    QuantizationModifier:
+      config_groups:
+        group_0:
+          targets: [Linear]
+          weights:
+            num_bits: 4
+            type: int
+            symmetric: true
+            group_size: 32
+            strategy: group
+            dynamic: false
+            observer: mse
+          input_activations: null
+          output_activations: null
+          format: null
+      targets: [Linear]
+      ignore: [lm_head, 're:.*embed_tokens', 're:.*linear_attn.*', 're:.*visual.*', 're:.*mtp.*']
+      bypass_divisibility_checks: false
