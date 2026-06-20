@@ -18,6 +18,8 @@ Marlin can run it on Ampere, but vLLM gates its W4A8 path to Hopper: on an Amper
 - **int8 8-row Marlin decode tile** (`patches/0002`) — completes the W4A8 small-batch decode path.
 - **int8-QK prefill attention** (`flashinfer/`) — int8 QK^T + fp16 PV for head_dim-256 hybrids (Qwen3.5/3.6); a long-context prefill lever.
 - **AOT-compile cache-key fix** (`patches/0003`) — keys the torch.compile cache on the quant scheme.
+- **int8-act opt-in flag + MoE support** (`patches/0005`–`0006`) — `--marlin-input-dtype int8` (or env
+  `VLLM_MARLIN_INPUT_DTYPE=int8`) turns a W4A16 checkpoint into W4A8 at serve time, for **dense and MoE**.
 
 `vllm/` and `flashinfer/` carry the edits baked in; `patches/` + `scripts/revendor.sh` replay them on an
 upstream bump, and `scripts/build_image_source.sh` builds + pushes the image.
@@ -50,6 +52,8 @@ docker run --gpus all -p 8000:8000 \
   --model Avesed/Qwen3.6-27B-W4A8 --pipeline-parallel-size 2 --max-model-len 8192
 ```
 *(cu130 image needs NVIDIA driver ≥ 580.65. With NVLink use `--tensor-parallel-size 2`; single GPU, drop both.)*
+
+Run a plain **W4A16** checkpoint as **W4A8** by adding **`--marlin-input-dtype int8`** (dense or MoE).
 
 **No Docker?** A from-source wheel (`sm_80`+`sm_86`) is on
 [Releases](https://github.com/avesed/vllm-ampere-optimized/releases) — `pip install` it (needs torch 2.11
