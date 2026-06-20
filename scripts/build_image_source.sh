@@ -48,7 +48,16 @@ if [ ! -d vllm/.git ]; then
 fi
 
 VLLM_IMG="${IMAGE}:${VLLM_TAG}-vllm-${CU}"             # intermediate (vLLM-only) tag
-FINAL="${IMAGE}:${VLLM_TAG}-ampere-${CU}"
+# Tagging channel: CHANNEL=dev -> :dev only (do NOT move :latest). Default
+# (release) -> :<VLLM_TAG>-ampere-<cu> + :latest (the existing release scheme).
+CHANNEL="${CHANNEL:-}"
+if [ -n "$CHANNEL" ]; then
+  FINAL="${IMAGE}:${CHANNEL}"
+  LATEST_TAG_ARG=""
+else
+  FINAL="${IMAGE}:${VLLM_TAG}-ampere-${CU}"
+  LATEST_TAG_ARG="--tag ${IMAGE}:latest"
+fi
 
 echo "== stage 1/2: build vLLM from vendored fork source (sm_80+sm_86) =="
 docker buildx build vllm \
@@ -73,7 +82,7 @@ docker buildx build . \
   --platform linux/amd64 \
   --provenance=false \
   --tag "$FINAL" \
-  --tag "${IMAGE}:latest" \
+  $LATEST_TAG_ARG \
   $PUSH_FLAG
 
-echo "$([ "$PUSH" = 1 ] && echo pushed || echo 'built (local)') $FINAL + :latest  [complete from-source fork: W4A8 + int8-8row + int8-QK flashinfer]"
+echo "$([ "$PUSH" = 1 ] && echo pushed || echo 'built (local)') $FINAL${LATEST_TAG_ARG:+ + :latest}  [complete from-source fork: W4A8 + int8-8row + int8-QK flashinfer]"
