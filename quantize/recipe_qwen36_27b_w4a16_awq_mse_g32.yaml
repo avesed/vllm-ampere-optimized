@@ -4,6 +4,8 @@
 # on Ampere — the Marlin W4A8 kernel needs uint4b8/int4). Serve as W4A8 with --marlin-input-dtype int8.
 # Quantizes MLP (all 64 layers) + self_attn (the 16 full-attn layers); GatedDeltaNet (linear_attn),
 # lm_head, embed, vision tower and MTP head stay bf16.
+# NOTE: dense model -> AWQ does NOT auto-offload the activation cache (only MoE does). Use the canonical
+# AWQ calib (128 samples x 512 seq) so the cache fits a 24 GB card: run_recipe.py ... 128 512.
 default_stage:
   default_modifiers:
     AWQModifier:

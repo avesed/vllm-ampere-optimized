@@ -17,7 +17,6 @@ default_stage:
       - smooth_layer: re:model.*mlp[.]experts.*up_proj$
         balance_layers: ['re:model.*mlp[.]experts.*down_proj$']
         activation_hook_target: null
-      offload_device: !!python/object/apply:torch.device [cpu]
       duo_scaling: both
       n_grid: 20
     QuantizationModifier:

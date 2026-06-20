@@ -15,6 +15,11 @@ from llmcompressor import oneshot
 MODEL, RECIPE, OUT = sys.argv[1], sys.argv[2], sys.argv[3]
 NUM = int(sys.argv[4]) if len(sys.argv) > 4 else 256
 MAXLEN = int(sys.argv[5]) if len(sys.argv) > 5 else 2048
+# Optional: sequential-pipeline target granularity. "Linear" onloads one Linear at a time
+# (low GPU mem) — use for schemes without AWQ. AWQ recipes instead keep the default
+# (decoder-layer, needed for the smooth->balance mappings) and offload the cache via the
+# recipe's offload_device: cpu.
+SEQT = sys.argv[6] if len(sys.argv) > 6 else None
 SEED = 1234
 
 def build_calib(tok):
@@ -37,13 +42,16 @@ def build_calib(tok):
     print(f"[calib] {len(samples)} Magicoder samples (seed={SEED})", flush=True)
     return Dataset.from_list(samples)
 
-print(f"[run_recipe] {MODEL} -> {OUT}  recipe={RECIPE}  calib={NUM} maxlen={MAXLEN}", flush=True)
+print(f"[run_recipe] {MODEL} -> {OUT}  recipe={RECIPE}  calib={NUM} maxlen={MAXLEN} seq_targets={SEQT}", flush=True)
 tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
 model = AutoModelForImageTextToText.from_pretrained(
     MODEL, dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True)
 calib = build_calib(tok)
-oneshot(model=model, dataset=calib, recipe=RECIPE, processor=tok, max_seq_length=MAXLEN,
-        num_calibration_samples=len(calib), output_dir=OUT, save_compressed=True)
+ok = dict(model=model, dataset=calib, recipe=RECIPE, processor=tok, max_seq_length=MAXLEN,
+          num_calibration_samples=len(calib), output_dir=OUT, save_compressed=True)
+if SEQT:
+    ok["sequential_targets"] = [SEQT]
+oneshot(**ok)
 tok.save_pretrained(OUT)
 
 import json  # noqa: E402
