@@ -49,7 +49,7 @@ Stock vLLM **won't load W4A8 on any Ampere GPU** — the fork is the only way to
 ```bash
 docker run --gpus all -p 8000:8000 \
   ghcr.io/avesed/vllm-ampere-optimized:latest \
-  --model Avesed/Qwen3.6-27B-W4A8 --pipeline-parallel-size 2 --max-model-len 8192
+  --model Avesed/Qwen3.6-27B-INT4-W4A16 --marlin-input-dtype int8 --pipeline-parallel-size 2 --max-model-len 8192
 ```
 *(cu130 image needs NVIDIA driver ≥ 580.65. With NVLink use `--tensor-parallel-size 2`; single GPU, drop both.)*
 
@@ -59,7 +59,9 @@ Run a plain **W4A16** checkpoint as **W4A8** by adding **`--marlin-input-dtype i
 [Releases](https://github.com/avesed/vllm-ampere-optimized/releases) — `pip install` it (needs torch 2.11
 + CUDA 13). Enable W4A8 with `--marlin-input-dtype int8`.
 
-- **Ready-made W4A8:** [Avesed/Qwen3.6-27B-W4A8](https://huggingface.co/Avesed/Qwen3.6-27B-W4A8)
+- **Ready-made quants** — [huggingface.co/Avesed](https://huggingface.co/Avesed):
+  - Qwen3.6-27B: [INT4-W4A16](https://huggingface.co/Avesed/Qwen3.6-27B-INT4-W4A16) · [INT8-W8A8](https://huggingface.co/Avesed/Qwen3.6-27B-INT8-W8A8) — int4: GSM8K 96.8% / MMLU-Pro 82.4%
+  - Qwen3.6-35B-A3B (MoE): [INT4-W4A16](https://huggingface.co/Avesed/Qwen3.6-35B-A3B-INT4-W4A16) · [INT8-W8A8](https://huggingface.co/Avesed/Qwen3.6-35B-A3B-INT8-W8A8) — int4: GSM8K 96.8% / MMLU-Pro 80.2%
 - **Quantize your own:** `python quantize/quantize_w4a8.py <hf-model> <out-dir>` — best quality = the AWQ + mse + g32 recipe in [`quantize/README.md`](quantize/README.md)
 
 ## Credits
