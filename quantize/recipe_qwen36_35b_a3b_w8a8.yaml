@@ -1,0 +1,25 @@
+default_stage:
+  default_modifiers:
+    QuantizationModifier:
+      config_groups:
+        group_0:
+          targets: [Linear]
+          weights:
+            num_bits: 8
+            type: int
+            symmetric: true
+            strategy: channel
+            dynamic: false
+            observer: mse
+          input_activations:
+            num_bits: 8
+            type: int
+            symmetric: true
+            strategy: token
+            dynamic: true
+            observer: null
+          output_activations: null
+          format: null
+      targets: [Linear]
+      ignore: [lm_head, 're:.*embed_tokens', 're:.*linear_attn.*', 're:.*shared_expert.*', 're:.*shared_expert_gate$', 're:.*mlp\.gate$', 're:.*self_attn.*', 're:model\.visual.*', 're:mtp.*']
+      bypass_divisibility_checks: false

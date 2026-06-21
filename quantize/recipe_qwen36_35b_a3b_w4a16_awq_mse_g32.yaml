@@ -1,0 +1,32 @@
+default_stage:
+  default_modifiers:
+    AWQModifier:
+      mappings:
+      - smooth_layer: re:model.*post_attention_layernorm$
+        balance_layers: ['re:model.*mlp[.]experts.*gate_proj$', 're:model.*mlp[.]experts.*up_proj$',
+          're:model.*mlp[.]shared_expert[.]gate_proj$', 're:model.*mlp[.]shared_expert[.]up_proj$',
+          're:model.*mlp[.]gate$', 're:model.*mlp[.]shared_expert_gate$']
+        activation_hook_target: null
+      - smooth_layer: re:model.*mlp[.]experts.*up_proj$
+        balance_layers: ['re:model.*mlp[.]experts.*down_proj$']
+        activation_hook_target: null
+      duo_scaling: both
+      n_grid: 20
+    QuantizationModifier:
+      config_groups:
+        group_0:
+          targets: [Linear]
+          weights:
+            num_bits: 4
+            type: int
+            symmetric: true
+            group_size: 32
+            strategy: group
+            dynamic: false
+            observer: mse
+          input_activations: null
+          output_activations: null
+          format: null
+      targets: [Linear]
+      ignore: [lm_head, 're:.*embed_tokens', 're:.*linear_attn.*', 're:.*shared_expert.*', 're:.*shared_expert_gate$', 're:.*mlp\.gate$', 're:.*self_attn.*', 're:model\.visual.*', 're:mtp.*']
+      bypass_divisibility_checks: false
