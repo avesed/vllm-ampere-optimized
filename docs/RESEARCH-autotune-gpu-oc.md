@@ -32,9 +32,12 @@ chasing (shm/ckpt). The adversarial round **refuted** the three claims that woul
 a clean GO:
 - **Golden-drift alone is NOT a sufficient correctness gate** (CLAIM 3 REFUTED) — it only covers
   the cells/paths the probe touches; must pair with a memtest + GEMM self-check + soak.
-- **Mem-OC does NOT generalize across the Ampere line** (CLAIM 4 REFUTED) — it is a GeForce/3090
-  lever; A100/A40/A10 are clock-locked, A6000/A5000 only via an *unintended* Windows-Afterburner
-  unlock. The portable cross-Ampere levers are just {power-limit, locked-clocks}.
+- **Mem-OC does NOT generalize across the Ampere line** (CLAIM 4 REFUTED) — it is a consumer-GeForce
+  (3090/3080) **+ workstation A6000/A5000** lever (their GA102 vBIOS leaves offsets unlocked on
+  **headless Linux** — corrected from the earlier "Windows-Afterburner-only" framing); **A100 / A40 /
+  A10 / A2 are clock-locked**. The portable cross-*line* levers are still just {power-limit,
+  locked-clocks}. And the **EDR bandwidth-knee gate is GDDR6X-only** (3090/3080) — GDDR6 parts
+  (A6000/A5000) gate on ECC counters / golden-drift instead.
 - **Sustained 3090 mem-OC is NOT thermally stable by default** (CLAIM 6 REFUTED) — GDDR6X
   mem-junction heat-soaks toward its ~110 °C throttle (bandwidth reduction starts ~92-95 °C),
   invisible to Linux `nvidia-smi`, and OC drifts unstable over weeks.
@@ -48,6 +51,14 @@ but a few % loss, not literally free).
 So the **tool is shippable and worth building**; the **autotuner + power-limit + locked-clocks are
 a clean GO**; **mem-OC is a guardrailed opt-in whose payoff (~+6-8% decode) must be proven on the
 rig in §7 to exceed the gating engineering cost before it is enabled anywhere.**
+
+**Packaging conclusion.** The autotuner does **NOT** ship in the fork `scripts/` or image — three
+independently-sufficient reasons: (1) it needs **sudo** (host-root NVML SET / BAR0 `/dev/mem`); (2) in a
+container it needs **`--privileged` + `/dev/mem` + `SYS_ADMIN`**; (3) it **will not run in the shipped
+unprivileged serving deployment**. It splits into **HALF-A** (no-privilege vLLM-flag tuner) → the vLLM
+tuning ecosystem (contribute to `jungledesh/profile` / `vllm auto_tune`) and **HALF-B** (host-root
+silicon-OC supervisor) → a separate opt-in host-side repo (static binary + `systemd` unit). The fork
+keeps only the `benchmarks/` diagnostic harness + this doc + a pointer (see §5/§6).
 
 ---
 
@@ -83,7 +94,10 @@ effective-bandwidth gained — and stop at the knee. The knee is a *soft* ceilin
 safe band below corruption; the correctness gate is still the real line of defense. A direct
 **achieved-bandwidth + integrity measurement** (the BW+verify kernel, §4) makes the knee *observable* — but it is a
 **proxy, not a safety gate**: EDR only covers CRC'd *bus* errors, so no-ECC *cell/retention* flips can
-corrupt output with **zero bandwidth penalty** (adversarial verdict: PARTIAL). Correctness stays the gate.
+corrupt output with **zero bandwidth penalty** (adversarial verdict: PARTIAL). Correctness stays the gate. **The EDR knee is GDDR6X-only** (3090/3080-class):
+plain GDDR6 (A6000/A5000/A40/A10/A2, and Turing) has no auto-replay — it CRC/EDC-flags but hard-errors
+past the limit rather than rolling off, so those parts gate on **ECC counters / golden-drift**, not BW
+rollover.
 
 ---
 
@@ -105,7 +119,9 @@ Three layers of "tuning the silicon", with very different headless behavior:
 |---|---|---|---|---|---|
 | **RTX 3090** (GA102, GeForce sm_86) | ✓ | ✓ | ✓ | ✓ | `nvmlDeviceSetClockOffsets` (R555.85+) or deprecated VF-offset; field-proven +150 core / +1700 MT/s VRAM (~+850 MHz mem) via LACT headless |
 | **A40** (GA102, server sm_86) | ✓ | ✓ | ✗ | ✗ | datacenter-locked vBIOS; **no offset path** (CLAIM 4) — power-limit + locked/application clocks only |
-| **A6000** (GA102, workstation sm_86) | ✓ | ✓ | ~ | ~ | mem-offset seen **only** as an *unintended* MSI-Afterburner unlock on **Windows** ("they forgot to block it"); **not** documented, **not** validated on headless-Linux NVML/coolbits → **NOT a shippable lever** |
+| **A6000** (GA102, workstation sm_86, GDDR6, ECC-toggleable) | ✓ | ✓ | ✓ | ✓ | mem-offset is a **REAL headless-Linux** NVML/LACT lever — field-verified +150 core / **+2000 MT/s VRAM** (LACT, Fedora-42 headless, Level1Techs); workstation GA102 vBIOS leaves offsets **UNLOCKED** (the earlier "Windows-Afterburner-only" framing was wrong). GDDR6 → **no EDR knee**; gate on ECC counters (ECC on) or golden-token drift (ECC off), NOT BW rollover. `gputemps` **supports** A6000 (junction-abort works). **Safest mem-OC target** (see ECC note below) |
+| **A5000** (GA102, workstation sm_86, GDDR6, ECC-toggleable) | ✓ | ✓ | ✓ | ✓ | same GA102 offset-unlocked headless-Linux path as A6000; toggleable ECC; `gputemps` supports it. GDDR6 → no EDR knee → gate via ECC/golden-token. 24GB sibling — RECOMMENDABLE |
+| **A4000** (GA104, workstation sm_86, GDDR6, ECC finicky) | ✓ | ✓ | ~ | ~ | GA104 → offset path *likely* works but **UNVERIFIED** in field reports; ECC toggle forum-finicky; **NOT in `gputemps` list → no thermal-abort path**; 140W single-slot → least headroom. LEAST attractive — leave experimental |
 | **A10** (GA102, server sm_86) | ✓ | ✓ | ✗ | ✗ | passively-cooled server card, locked vBIOS; offsets not exposed |
 | **A100** (GA100, sm_80) | ✓ | ✓ (+ `nvidia-smi -ac` application clocks) | ✗ | ✗ | clock-LOCKED — offset API returns **Not-Supported** (NVIDIA staff confirm "A100 doesn't support overclocking"); HBM2e mem-clock **fixed at 1215 MHz** (no mem-OC, no 2nd P-state) + **true HBM2e ECC**. Only Tier-0/1 **anti-throttle pin** (SM gain caps at stock **1410 MHz**; ~0 on a healthy card, reclaims perf only if throttling) + NVML/DCGM ECC counters as ground truth — **not** OC |
 | **A30 / A40 / A10 / A2** (GA100/GA10x, datacenter) | ✓ | ✓ | ✗ | ✗ | all clock-LOCKED like A100 (offset Not-Supported, pin-only); all have **ECC** (A30 HBM2; A40/A10/A2 GDDR6, **not** GDDR6X) → Tier-0/1 + ECC counters only; consumer mem-OC does not transfer |
@@ -133,9 +149,33 @@ Three layers of "tuning the silicon", with very different headless behavior:
 - **Units gotcha**: a memory **"MT/s" / transfer-rate** offset is **~2× the underlying GDDR clock**
   offset. `+1700 MT/s` on a 3090 ≈ `+850 MHz` mem clock. `nvidia_oc --mem-offset 850` is
   clock-domain; LACT/coolbits use the doubled transfer-rate number — the tool **must** disambiguate.
-- **Container vs host**: clocks/power are **global HOST GPU state**. You **cannot** set them from
-  inside the unprivileged serving container (the fork's documented host-vs-container landmine). Clean
-  design = **host root daemon applies clocks; container runs the correctness probe**.
+- **Container vs host**: clocks/power are **global physical-GPU / driver-session state**, never
+  per-container virtualized. The **NVIDIA Container Toolkit injects no OC feature** — it is only a
+  device-node + driver-lib injector (`compute`/`utility` caps, `/dev/nvidia*`, libs) and **never
+  injects `/dev/mem`**, so the `gputemps` BAR0-MMIO read cannot run via the Toolkit. The SET
+  capability lives in the **driver/NVML**, which is privileged: an **unprivileged serving container
+  cannot set** clocks/power — **root alone is not enough** (Docker drops `CAP_SYS_ADMIN` →
+  `NVML_ERROR_NO_PERMISSION`; nvidia-docker #495). A **root container + `--cap-add=SYS_ADMIN` (or
+  `--privileged`) CAN set** them, **but the change is global** (hits the host + every co-resident
+  workload) and **does NOT revert when that container restarts** (only reboot / driver-reload /
+  explicit reset does) → it **breaks the reboot dead-man's-switch + watchdog isolation**. Clean
+  design = **a host root daemon (or a dedicated privileged sidecar that is NOT the serving container)
+  applies clocks; the unprivileged serving container runs only the correctness probe**.
+
+**ECC-on workstation mem-OC profile (A6000/A5000).** Unlike the no-ECC 3090, the A6000/A5000 can run
+with **ECC enabled** (`nvidia-smi -e 1`), turning silent corruption into a machine-readable signal: SBEs
+corrected + counted, DBEs detected (DBE → app termination + page retirement), polled via
+`nvmlDeviceGetMemoryErrorCounter` / `nvidia-smi -q -d ECC` / DCGM. This is a *useful additional* abort
+signal but **NOT a complete gate**: it is **DRAM-array ECC, not documented bus/link ECC**, and mem-OC
+instability frequently shows up as bus/signal-integrity transmission errors the array ECC may miss; only
+SBE is corrected (DBE = crash); and the SBE-rise→reliability-knee relationship is uncharacterized. So
+keep golden-token-drift + BW+verify + junction-temp gating and **never treat "no ECC counter rise" as
+proof of correctness**. Cost: **~6.25% VRAM** (1/16 inline GDDR6) + a real bandwidth tax that partly
+offsets the mem-OC gain (magnitude unverified; NVIDIA calls it "minor latency overhead"). Offer two
+profiles: **ECC-ON "safe/gated"** vs **ECC-OFF "max-headroom"** (the latter falls back to 3090-style
+probe-only gating).
+
+---
 
 ### 3.1 OC-tool backend — LACT & peers vs roll-own NVML (decided: roll-own)
 
@@ -172,7 +212,8 @@ the no-ECC GDDR6X gate needs a **synchronous, instant** revert it fully owns. Ow
 also lets the gate encode the **mem-offset unit footgun explicitly** (NVML clock-domain value = **½**
 the GDDR transfer-rate number LACT/coolbits expose → getting it wrong over/under-steps the riskiest
 knob 2×; §3 "Units gotcha"). Roll-own keeps the tool **pure-Python** (pynvml + driver already present
-for vLLM), host-side root, one `scripts/autotune/silicon.py` + a systemd oneshot for persistence.
+for vLLM), host-side root, in the **HALF-B host-side repo** (static binary + `systemd` unit) — **not** a
+fork `scripts/` exe.
 **Packaging = hybrid**: a thin backend interface (`set_core_offset` / `set_mem_offset` /
 `set_power_limit` / `read_back`) with **NVML default** and an **optional LACT adapter**; recommend
 LACT to users as the interactive GUI + the `/etc/lact/config.yaml` boot-persistence path, never as the
@@ -341,20 +382,184 @@ perf-measure + probe substrate):
   cross-validate compute-vs-comm.
 - `benchmarks/bench_marlin_gemm_imma.py` → ncu IMMA occupancy (≥65% = saturated decision rule).
 
-**Proposed tool shape**: `scripts/autotune/` — **Python** (matches the rest of the fork's tooling;
-Rust like Profile is unnecessary since the harness is already Python):
-- `probe.py` — classify via DCGM/NVML (`pynvml`/`nvidia-ml-py`).
-- `silicon.py` — wrap `nvmlDeviceSetClockOffsets` / `SetPowerManagementLimit` /
-  `SetGpuLockedClocks` behind the §4 correctness gate; readback-verify offsets
-  (`nvmlDeviceGetClockOffsets`) since datacenter cards silently no-op.
-- driver of `vllm_verify.py` for perf-delta + a greedy token-id golden under `VLLM_BATCH_INVARIANT=1`.
-- **Persisted per-GPU profile** keyed by **GPU UUID** (per-card silicon lottery — never a fork
-  default): `~/.config/ampere-autotune/<gpu-uuid>.json` =
-  `{arch, driver, stock_mem_mhz, max_stable_mem_offset, max_stable_gpc_offset, power_limit,
-  validated_temp_c, decode_gain, prefill_gain, vllm_flags}`. **Re-validate on temp delta or driver
-  change.** **Runs on the HOST as root** (can't set clocks in a container).
-- **Search staging**: clocks first via **bisection + correctness gate**, then flags via TPE
-  (simpler, keeps the gate cheap) rather than a joint multi-objective space.
+**Packaging shape (NOT a fork `scripts/` directory).** This loop ships as **two external tools plus the
+fork's existing harness — no executable autotuner under fork `scripts/`**:
+- **HALF-A — vLLM-flag tuner** (no privilege: NVML-read + `/metrics` + roofline → prescribe
+  `max-num-seqs` / `max-num-batched-tokens` / `gpu-memory-utilization` / `--enable-prefix-caching` /
+  `--tensor-parallel-size` / `kv_cache_dtype=fp8`). This is **per-deployment config, out of fork scope**,
+  and belongs in the vLLM tuning ecosystem. Recommended home: contribute the Ampere parts (hardware
+  catalog + quant-byte-aware roofline + DCGM-PROF bottleneck classifier) **upstream to
+  `jungledesh/profile`** (Apache-2.0; its roadmap slots v5 DCGM-classifier / v6 quant-sensitivity / v8
+  safe auto-apply already match) — best-effort (single maintainer, no plugin API, Rust), gated on a
+  confirming issue first. **Fallback:** a thin external Python wrapper on `vllm bench serve` + `/metrics`
+  reusing the fork's `benchmarks/` (NOT an in-worker `general_plugins` plugin — wrong layer for an
+  out-of-process measure-and-restart tuner; NOT a fork `scripts/` exe).
+- **HALF-B — silicon-OC supervisor** (`nvmlDeviceSetClockOffsets` / `SetPowerManagementLimit` /
+  `SetGpuLockedClocks` behind the §4 gate; readback-verify offsets via `nvmlDeviceGetClockOffsets`; BAR0
+  `gputemps` junction abort; the §9 two-cadence supervisor): a **separate host-side repo** — static
+  binary + `systemd` unit ordered `Before=` the vLLM container, host-root, opt-in, monitor-only default,
+  independently versioned. **Never in any vLLM image.** Internally Python (pynvml) is fine; ship as a
+  self-contained binary so it carries no fork dependency.
+- **Persisted per-GPU profile** keyed by **GPU UUID** (silicon lottery — never a fork default):
+  `~/.config/ampere-autotune/<gpu-uuid>.json` = `{arch, driver, stock_mem_mhz, max_stable_mem_offset,
+  max_stable_gpc_offset, power_limit, validated_temp_c, decode_gain, prefill_gain, vllm_flags}`;
+  re-validate on temp delta or driver change. Owned by **HALF-B (host root)**.
+- The **fork itself keeps only** the `benchmarks/` harness (perf-delta + token-id golden under
+  `VLLM_BATCH_INVARIANT=1`; **parametrize the `tensor_parallel_size=2` hardcode in `vllm_verify.py`** so
+  external tuners can drive tp1 rigs) + this design doc + a README/ROADMAP pointer to the two tools.
+- **Search staging** (inside HALF-B): clocks first via **bisection + correctness gate**, then HALF-A
+  flags via TPE — separately, not a joint multi-objective space.
+
+### 5.1 Runtime-tuning boundary (what can change WHILE serving, no restart)
+
+vLLM's eight perf-critical engine flags (`max-num-seqs`, `max-num-batched-tokens`,
+`gpu-memory-utilization`, TP/PP, `kv-cache-dtype`, `block-size`, `max-model-len`,
+`enable-prefix-caching`) are bound at `EngineArgs.create_engine_config()` and have **no runtime
+hot-reload** — the KV-block count is frozen by one-time startup `gpu-memory-utilization` profiling and
+the CUDA graphs are captured against those values; TP/PP fix the worker process group. So **HALF-A
+(Profile-style) is necessarily offline-iterative** (measure → recommend → **restart** → re-measure);
+"online" flag changes mean **canary/blue-green relaunch, not live mutation**.
+
+- **Tunable WHILE serving (no restart):** silicon clocks/power (HALF-B, NVML — global *driver* state,
+  not engine state); admission/concurrency throttling **below** the startup `max-num-seqs` ceiling;
+  KV-aware routing / autoscaling across replicas; and narrow vLLM admin ops that **do not touch the
+  perf-flag set** (dynamic LoRA add/unload, `/sleep`+`/wake_up`, `/update_weights`, and the **MoE-only**
+  `/scale_elastic_ep` live EP/DP rescaling, shipped vLLM 0.17.0, single-node/TP=1/Ray-coupled).
+- **NOT without restart:** raising `max-num-seqs` / `max-num-batched-tokens` / `gpu-memory-utilization`,
+  TP/PP, `kv-cache-dtype`, `block-size`, `max-model-len`, `enable-prefix-caching`.
+- **Already dynamic (not a knob we set):** vLLM's continuous-batching scheduler self-adapts occupancy
+  every iteration — admit/retire/preempt up to the startup ceilings. HALF-A only sets the **bound**; you
+  can throttle admission below it live, never raise it without a restart.
+
+**The only continuously in-place *perf* knob is silicon (HALF-B).** A true "online tuner" for us is thus
+a 3-tier system: (1) **silicon** = HALF-B continuous supervisor (§9, derate-only + canary + auto-revert);
+(2) **control-plane** shim (admission/concurrency + KV-aware routing + drained canary relaunch to apply
+*new* HALF-A flags with zero dropped traffic) — this is **orchestration, lean on existing stacks**
+(production-stack / AIBrix / llm-d / Dynamo), not flag hot-reload; (3) **free in-engine admin ops** above
+(LoRA, sleep/wake, watch-not-build Elastic-EP). Keep HALF-A itself offline; do **not** advertise
+in-process hot-reload of engine flags.
+
+### 5.2 In-engine adaptive runtime optimization (fork patch)
+
+§5.1 is the **stock-vLLM** boundary (external, restart-bound, coarse ~2s windows). **As a fork we can do
+better IN-ENGINE** — close the loop inside the scheduler step with ground-truth internal state
+(per-request batch composition, KV free-list, per-request spec accept-length — the accept signal
+`num_accepted = len(generated)-1` is already computed every step in `update_from_output`,
+`scheduler.py` ~L1418) at a **5-20 ms decode-step cadence**, ~2-3 orders finer than a `/metrics` scraper
+— but only for **one class of knob**:
+- **Class A (mutable in-engine, re-read every `schedule()` step):** spec-decode **K** (down free = fewer
+  draft forwards; up only to the startup-**captured cudagraph ceiling**), chunked-prefill token budget
+  `max_num_scheduled_tokens` (down free, up to startup max), `long_prefill_token_threshold` (zero
+  plumbing), `max_num_seqs` (down trivial, up bounded by the **frozen KV blocks**), policy / pause /
+  prefix-cache / watermark.
+- **Class B (genuinely immutable live, even in a fork):** KV-pool size / `gpu_memory_utilization`,
+  cudagraph capture sizes, TP/PP process groups, `kv_cache_dtype` / `block_size` layout — each needs a
+  stop-the-world re-profile + re-alloc + re-capture (vLLM routes capacity change through the heavyweight
+  EEP `RECONFIGURE` path, `core.py:843`, never a per-step hook). `max_model_len` is immutable only
+  **upward** (a live `update_max_model_len` RPC can shrink it). **For Class B the fork move is a smarter
+  STARTUP profile, not a runtime knob.**
+
+**Honest bar:** adaptive beats the optimal *static* flag **only under workload variability**
+(bursty / mixed prefill-decode / variable per-step difficulty); on bandwidth-bound **steady** decode,
+static optimum ≈ adaptive. So a lever must both **attack the bandwidth wall** and **gain from
+variability**. Ranked for this fork (W4A8 + MTP + hybrid/MoE):
+1. **Adaptive spec-decode K — goodput-driven, per-step.** The only lever that modulates **MTP**, our
+   measured #1 bandwidth-wall breaker (static K=2 = **+25%, 126→158 tok/s** W4A8-9B tp2). Drive on
+   **GOODPUT** (accepted tok/s net of verify), **NOT accept-rate** (PR #26504's data: accept-rate flat
+   0.86-0.91 while optimal K flips → miscalibrated), with a hard **K=0 floor so it provably never
+   regresses below static**. Ship **uniform-per-step K** only (per-request varying K falls out of the
+   captured `uniform_decode` cudagraph / pads to max-K — open upstream gap, #28015). **Honest go/no-go:**
+   static K=2 already captures the 25%; the *adaptive premium over best-static-K + the existing
+   auto-disable* is an **UNMEASURED ~5-15%**, likely small on steady traffic, real only under
+   variability — validate on the W4A8-9B tp2 MTP rig (`--shm-size=8g`) under **bursty** load (steady
+   single-stream falsely shows static==adaptive).
+2. **Batch-saturation K→0 gate** (RFC #41821; CPU-side counts, zero GPU overhead) — a superset of the
+   static disable-by-batch-size≈32 cliff; incremental win = the smooth edge, not a step-change.
+3. **Decode-aware `long_prefill_token_threshold`** — protects decode tok/s during prefill bursts;
+   cheapest patch, ~0 on pure streams.
+4. **Down-safe `max_num_seqs` / watermark guards** — stability/SLO under KV pressure (e.g. 27B-W4A8
+   mamba-cache regime), not steady-throughput drivers.
+
+**Scope win:** an in-engine adaptive controller is a **shippable fork patch** that generalizes across the
+Ampere line (sm_80+sm_86, portable Python) and serves our MTP/hybrid/MoE target — **strictly more
+on-scope than the shelved external autotuner** (which was per-deployment + privileged). Ship the
+**thinnest form**: a goodput-driven proposer via the existing `custom_class` proposer seam (loads a class
+by path — **no core patch**), feeding it the scheduler's per-step accept counters; respect the real
+guards (`mamba_cache_mode='all'`+spec gate, async-scheduling/PP gate). It overlaps active upstream (PR
+#26504 DynamicProposer, RFC #41821) → keep it thin so it can later defer to upstream (minimal rebase).
+
+**UPDATE (decision):** the in-engine adaptive **RUNTIME tuner is NOT pursued**. Rationale: the adaptive
+spec-K premium is unmeasured (~5-15%), materializes only under bursty load, overlaps active upstream
+(PR #26504 / RFC #41821), and a live control loop adds a correctness-gating cost for a speculative gain.
+**PIVOT:** the fork advantage is realized instead as a passive **fine-grained measurement PROBE** for
+**OFFLINE** tuning + the `benchmarks/` diagnostic harness (§5.3) — not a controller. (The probe does
+**not** "prove" the runtime tuner unnecessary — workload shape on a test rig is a deployment property;
+the tuner is shelved on its own merits.)
+
+### 5.3 Fine-grained in-engine probe (the fork's actual lever)
+
+The runtime tuner is dropped; the fork's real edge is **observability no external tool can match** —
+**but be honest about what stock already gives.** Stock vLLM V1 already ships a full Prometheus set
+(TTFT/ITL/e2e histograms, `kv_cache_usage`, preemptions, prefix-cache, and **per-position spec counters**
+`spec_decode_num_accepted_tokens_per_pos`), OTLP request tracing (`--collect-detailed-traces`, one span
+per *finished* request), the torch profiler, and `SpecDecodingLogging.log()` which already prints mean
+accept-length + the full per-position vector + goodput each interval. So **per-position acceptance is NOT
+net-new** — only its *cadence and joinability* are. Stock collapses everything into fixed Histogram
+buckets / most-recent Gauges / monotonic Counters over a **10 s** in-engine window
+(`VLLM_LOG_STATS_INTERVAL` default — 2 s was only an assumed external scrape; the gap is *larger* than
+first stated).
+
+**Net-new the probe adds:** (a) a **per-step** trace at decode cadence (5-20 ms), ~2-3 orders finer than
+the 10 s window; (b) per-request, **un-bucketed** detail; (c) the **same-step join** of accept-length ↔
+batch size (`num_running_reqs`) so the **accept-len-vs-batch crossover** (= the `disable-by-batch-size`
+threshold) comes from **ONE mixed-load run**, not N sweeps; (d) per-phase prefill/decode timing **without**
+the heavy torch profiler.
+
+**Seam:** a passive `StatLoggerBase` subclass via the `vllm.stat_logger_plugins` entry point (or the
+in-process `stat_loggers=` arg) — **zero core patch**, env-gated (`VLLM_STEP_PROBE=1`). Taps the per-step
+`SchedulerStats` + `IterationStats` + `SpecDecodingStats` vLLM already materializes on CPU each step
+(`v1/metrics/loggers.py`, `stats.py`, `spec_decode/metrics.py`).
+
+**Cudagraph-safety (load-bearing):** `record()` runs in the frontend/engine-core process **outside** the
+captured forward graph; every field is already a CPU int/float/list (the sampler's `.tolist()` is in the
+model runner, not here). **Hard rules:** NO `.item()`/`.tolist()`/`.cpu()` anywhere reachable from the
+forward; bounded ring buffer; JSONL flush off the hot path; **validate under FULL cudagraph** (the int8qk
+`.tolist()` bug was masked by `enforce_eager`); target **<1% overhead** on the 126-158 tok/s W4A8-9B path.
+
+**Taps, ranked by decision-value:**
+- **A (ship first) — spec/MTP:** per-step per-position accept + goodput **joined to co-step batch size**.
+  Yields the `disable-by-batch-size` threshold (GOTCHA3≈32) + static-K confirmation from one mixed run,
+  and the `mtp.fc`-quant **0%-accept bug shows as a flat-zero vector instantly**.
+- **B — decode roofline:** `perf_stats` bytes/flops per step → GB/s and TF/s. **Needs a small ENGINE FIX
+  for hybrid-GDN** — add a Mamba/GDN `ComponentMetrics` and correct `num_kv_layers` to full-attn-only;
+  the stock analytic model has **zero mamba terms and overcounts KV ~3× on the 3:1 hybrid 27B**. Ship
+  decode-only + label "estimate" until the GDN fix lands.
+- **C — KV/mamba pressure:** `kv_cache_usage` + preemptions per step **plus a NEW mamba-state-cache
+  occupancy counter** (`kv_cache_usage` tracks only the 8 full-attn layers; the **mamba state cache is
+  what actually OOMs**). Pins `max-num-seqs` at the per-step usage cliff instead of bisecting via
+  OOM-or-not serving runs.
+- **D (once, go/no-go) — burstiness:** `num_waiting` + coarse hit-rate, captured once.
+
+**Drop as noise:** continuous prefix-hit-rate streaming, fine queue-depth time series, full per-request
+ITL streaming, and any **new GPU-side** counter (reintroduces a sync). Per-request per-step token split
+needs a thin EngineCore tap (`SchedulerOutput.num_scheduled_tokens`), not the `record()` seam — defer.
+
+**Consumers / harness:** ships as a **pluggable logger** (entry-point + in-process arg), NOT a core
+patch — *except* the two `perf.py` correctness fixes (GDN `ComponentMetrics`, mamba-state counter) that
+gate TAP B/C trust and are small genuine fork patches. It **improves, not replaces** the harness: makes
+`prof_decode_batchsweep.py`'s synthetic fixed-batch sweep optional (per-step join gives accept-len-vs-batch
++ bytes-vs-batch from one mixed run); acts as a cheap serving-realistic tier **before**
+`analyze_torch_prof.py`/`bench_marlin_gemm_imma.py` (only pay kineto/ncu when the cheap tier says "go").
+Add `benchmarks/analyze_step_probe.py` to parse the JSONL into the same is-this-lever-worth-it verdicts.
+**Strictly offline diagnostics — never a control input.**
+
+**Honest caveat:** for the #1 use (spec-K, disable-by-batch threshold, 0%-accept bug) stock
+`SpecDecodingLogging.log()` **already suffices** for a one-time offline characterization — the fork's
+measured K=2 (9B) / K=3 (27B) numbers came from exactly those stock logs. So for pure one-time
+characterization, **just run the existing bench** — a probe is not required. The probe earns its keep
+**only** where finer cadence/joins genuinely help: accept-len-vs-batch and KV-pressure-vs-step curves
+from single mixed runs, and the **hybrid mamba-state pressure stock literally cannot see**. Maintenance
+cost: `SchedulerStats`/`IterationStats` are explicitly **non-stable** vLLM interfaces (rebase risk).
 
 ---
 
@@ -369,8 +574,15 @@ Rust like Profile is unnecessary since the harness is already Python):
 | **2** | **Core OFFSET** (GPC) | **OPT-IN, gated** | **consumer sm_86 only** | core errors tend to crash/hang (less *silent* than mem); still needs root/host + correctness gate; helps prefill only (compute-tapped → small win) |
 | **3** | **Mem OFFSET** (VRAM) | **OPT-IN, default OFF, HIGH-CAUTION** | **GeForce/3090 only** (CLAIM 4) | the +6-8% decode hook — but no-ECC silent corruption + EDR auto-downclock + thermal heat-soak. MUST gate on **measured decode tok/s** + correctness probe + mem-junction ceiling + soak. |
 
-**Host/root/container reality**: clocks are global host root state → the tool runs as a **host
-systemd unit ordered `Before=` the vLLM container**, never inside it. CUDA-graph capture is
+**Host/root/container reality**: clocks/power are **global physical-GPU/driver-session state**, and the
+**NVIDIA Container Toolkit adds no OC path** (no `/dev/mem`, no SET capability — it only injects device
+nodes + driver libs). The **unprivileged serving container cannot** set them (root alone fails; needs
+`--cap-add=SYS_ADMIN`/`--privileged`); a **privileged root container *can*, but the effect is global
+and survives that container's restart with no auto-revert**, forfeiting the reboot/driver-reload
+dead-man's-switch + watchdog isolation. So the SET path **never lives in the serving container** — it
+runs as a **host systemd unit ordered `Before=` the vLLM container** (the default, and the only place
+the BAR0 `gputemps` read can live), or a **dedicated privileged sidecar / k8s privileged DaemonSet**
+where a host daemon is disallowed. CUDA-graph capture is
 **independent of clock state** (a graph records the kernel-launch DAG, not frequency) — so setting
 locked-clocks once at boot before vLLM starts is clean, and runtime clock changes don't invalidate
 captured graphs; only *measure* during steady REPLAY, not capture.
@@ -379,7 +591,9 @@ captured graphs; only *measure* during steady REPLAY, not capture.
 mismatch → instant `-rgc -rmc`/zero-offset → stock + alert); reboot/driver-reload free
 dead-man's-switch; continuous low-rate golden canary; conservative safety margin; **periodic
 re-validation** (a cold-validated profile drifts unstable over a 24/7 window as GDDR6X heat-soaks —
-CLAIM 6).
+CLAIM 6). The continuous-serve loop is **fully specified in §9** (two-cadence supervisor +
+observability): **monitor-only by default**, FREE-knobs + offset-derate-only on live traffic, with all
+offset *UP* gated to drained maintenance windows.
 
 **Thermal reality (CLAIM 6 REFUTED — sustained 3090 mem-OC is NOT stable by default)**: GDDR6X
 mem-junction hits ~104-110 °C even at **stock** clocks under sustained load; bandwidth reduction
@@ -396,19 +610,36 @@ aggressive power cap to hold junction ≤~90-95 °C, (b) out-of-band mem-temp mo
 abort, (c) steady-state-measured gating, (d) periodic re-validation. **Document this; do not assume
 thermal stability.**
 
-**Scope-fit argument (the tool is shippable even though tuned values are per-card)**: the project
-mandate is **general Ampere, shippable artifacts, NOT per-deployment config**. The shipped thing is
-the **loop + classifier + correctness gate + silicon driver** — a generalizable artifact, exactly
-like `jungledesh/profile`. The **per-card profile JSON is an output, not a shipped default**; the
-tool must **never ship a default offset** or let a user copy another card's profile (silicon
-lottery). Tiers 0/1 generalize across the whole line and are pure wins. This keeps the feature
-inside the "general Ampere, not the box" bar while honestly flagging that Tier-2/3 only help
-consumer sm_86. **The datacenter Ampere (A100/A30/A40/A10/A2) get Tier-0/1 ONLY** — all are
-clock-LOCKED (offset API Not-Supported; A100 NVIDIA-staff-confirmed), so they drop both offset tiers
-*and the entire no-ECC safety stack* (golden-knee / BAR0-MMIO junction abort don't apply): they have
-**real ECC** (A100/A30 HBM2e/HBM2, A40/A10/A2 GDDR6) → Tier-0 power-limit + Tier-1 lock-to-max as a
-pure **anti-throttle** play, with **NVML/DCGM SBE/DBE counters** as ground-truth health. Tier-1
-pinning yields a real gain only when the card was throttling; ~0 on a thermally/power-healthy one.
+**Scope-fit / shippability (NOT shipped in the fork image or `scripts/`)**: the project mandate is
+**general Ampere, shippable artifacts, NOT per-deployment config** — so the autotuner is **not a fork
+deliverable**. **HALF-B** (silicon-OC) is excluded on **privilege** (host root / `--privileged` +
+`/dev/mem` + `SYS_ADMIN`; cannot run in the shipped unprivileged serving container) *and* on per-card
+silicon-lottery output → a **separate opt-in host-side tool**. **HALF-A** (flag tuner) is excluded on
+**scope** (per-deployment flag-tuning) → it joins the **vLLM tuning ecosystem** (`jungledesh/profile` /
+`vllm benchmarks/auto_tune`) as an upstream/ecosystem contribution, thin external wrapper as fallback.
+**The fork ships only the diagnostic `benchmarks/` harness + this research doc + a pointer to the two
+external tools.** The **per-card profile JSON is an output, never a shipped default** (no default offset,
+no copying another card's profile — silicon lottery). Tiers 0/1 (power-limit / locked-clocks) generalize
+across the whole line, but as global GPU-driver state they are exercised **by the external HALF-B
+supervisor**, not by anything in the fork image. **The datacenter Ampere (A100/A30/A40/A10/A2) get
+Tier-0/1 ONLY** — all are clock-LOCKED (offset API Not-Supported; A100 NVIDIA-staff-confirmed), so they
+drop both offset tiers *and the entire no-ECC safety stack* (golden-knee / BAR0-MMIO junction abort don't
+apply): they have **real ECC** (A100/A30 HBM2e/HBM2, A40/A10/A2 GDDR6) → Tier-0 power-limit + Tier-1
+lock-to-max as a pure **anti-throttle** play, with **NVML/DCGM SBE/DBE counters** as ground-truth health.
+Tier-1 pinning yields a real gain only when the card was throttling; ~0 on a thermally/power-healthy one.
+
+**Turing / Pascal generalization (out of declared scope).** The autotuner is hardware-generic GeForce
+machinery (NVML clock-offsets Maxwell-onward + coolbits/nvidia-settings), so its power-limit /
+locked-clocks / core-offset / mem-offset levers **RUN** on consumer Turing (2080 Ti, TU102 sm_75) and
+Pascal "for free." But this is **OUT OF the fork's Ampere sm_80+sm_86 scope**, and not shipped/validated
+there: (1) the W4A8/Marlin value-add does not transfer — **Marlin GEMM produces GARBAGE on sm_75** (vLLM
+#33461, closed not-planned); (2) the EDR bandwidth-knee gate has **no signal on GDDR6** (EDR is
+GDDR6X-exclusive; GDDR6 hard-crashes past the limit) → must re-gate on golden-token drift + Xid/crash;
+(3) `gputemps`/BAR0-MMIO has **no TU102 support** and the 2080 Ti mem-temp sensor is often absent → no
+thermal hard-abort. Corollary: **all GDDR6 Ampere parts (A6000/A5000/A40/A10/A2) also lack the EDR knee**
+and use the ECC/golden-token gate instead — the EDR-knee gate is **GDDR6X-only** (3090/3080-class). Treat
+Turing/Pascal as "**runs-but-unvalidated, opt-in, gates differ**"; do **not** list the 2080 Ti in the
+shipped matrix.
 
 **Hardware/warranty realism**: power-limit and locked-clocks are benign (never void warranty / damage).
 Offset OC can void warranty and stress GDDR6X under sustained server load → opt-in with a clear
@@ -514,6 +745,125 @@ always-on serving lever independent of whether mem-OC ships.
   (LACT/`nvidia_oc` add zero capability over the same NVML calls, and a daemon's 5 s auto-revert
   fights the synchronous gate), with an optional LACT adapter + LACT documented as the manual /
   boot-persistence helper.
+
+---
+
+## 9. Continuous runtime supervisor + observability
+
+The offline characterizer (§7) **finds** the safe operating point; the online supervisor **holds** it
+as ambient / workload / aging drift, and gives margin back the instant the silicon is unhappy — **never
+the reverse on live traffic**. A HOST-root daemon (or privileged sidecar, §3.1/§6), never the serving
+container; the container exposes only vLLM `/metrics` and the in-band golden/tok-s probe. Per §5.1,
+**silicon is the only continuously in-place *perf* knob** — engine flags are restart-bound, so this
+supervisor tunes clocks/power, not vLLM flags.
+
+### 9.1 Two-cadence controller
+- **Fast watchdog** — 250 ms (4 Hz), single-threaded, no alloc/network, `SCHED_RR`. **SUBTRACT-ONLY**:
+  it can revert/derate, **never raise** a knob (its dumbness *is* the safety property). Signals: NVML
+  clock-event-reason bitmask (HW_SLOWDOWN / SW+HW_THERMAL / HW_POWER_BRAKE), NVML **Xid** event-set
+  (corruption class 48/63/64/79/92-95 → hard trip; Xid 79 fell-off-bus → permanent quarantine), GDDR6X
+  junction via BAR0 `gputemps`, ECC volatile DBE/SBE (ECC SKUs only), latched golden-probe verdict.
+  **Hard trip** (Xid-corruption / golden mismatch / DBE / junction ≥ 95 °C) → offsets to 0 +
+  ratchet-down + alert, zero-debounce. **Soft trip** (thermal bit / junction WARN / SBE spike) → derate
+  one FINE (30 MHz), debounced. **The watchdog ACTS before it logs** — revert is one NVML write (µs);
+  logging never gates it. Detect→revert < ~300 ms.
+- **Slow controller** — 5 s sample → 30-60 s rate-limited decision tick. Reads vLLM `/metrics`
+  (TPOT→decode tok/s objective, TTFT→prefill, KV%, queue, prefix-hit) + the shared NVML/junction
+  snapshot, all EWMA. Holds the point with **FREE knobs only**; never raises an offset on live traffic.
+  One controller computes `max_safe_clock(junction)` **then** hill-climbs under that cap (thermal
+  strictly dominant → no two-loop oscillation). Objective deltas are load-conditioned (credited only
+  when running-requests / KV% are stable) and probe-excluded.
+
+### 9.2 Asymmetric knob policy
+
+| Knob | Lane | Live-traffic rule |
+|---|---|---|
+| Power-limit (T0) | **FREE both ways** | hill-climb within [min, factory-default]; cannot corrupt |
+| Locked/app clocks (T1) | **FREE both ways** | select within published [VFmin, VFmax]; factory-blessed, not OC. **Thermal restore re-raises HERE, not offsets** |
+| Core offset (T2) | **DERATE-only online** | ratchet DOWN anytime; UP forbidden on live traffic |
+| Mem offset (T3) | **DERATE-only online** | ratchet DOWN anytime; UP forbidden on live traffic |
+| Any offset **UP** | **FULL-GATE-only** | drain (admission-control-confirmed 503/hold) → full offline gate → reopen. Single-card / TP-group always drains; only replica-parallel rolls |
+
+**Invariant: on live traffic, offsets are monotone-non-increasing within a serving epoch.** There is
+**no** live-traffic upward-offset path — no "below-ceiling re-gated restore", no live RESEARCH state, no
+inferred-trough self-promote.
+
+### 9.3 Thermal-adaptive derate + re-promotion
+Junction is the live proxy for the temperature-dependent stability boundary. Step-function derate with a
+deadband + **asymmetric hysteresis** (release gap ≫ trip gap): WARN_LO hold / WARN_HI −1 FINE / approach
+−2 FINE / ABORT (≥ 95 °C) → 0. Debounce short going down, long (minutes) going up. **Thermal RESTORE
+acts on the FREE lane** (re-raise the locked-clock/power-limit lowered for heat) — it **never** re-raises
+an offset on live traffic. Offset re-promotion is maintenance-window / drained-gate only; a HARD-TRIP
+arms exponential backoff (1 h, doubling) + a ratchet-ceiling drop, capped → quarantine.
+
+### 9.4 Modes (default leans conservative)
+- **offline-characterize** — drained; the **only** mode that discovers a new *higher* offset.
+- **online monitor-only [DEFAULT]** — watchdog + perf reporting; FREE knobs may be held but no offset
+  motion beyond derate. Reverts/derates active.
+- **online safe-adapt** — adds FREE-knob hill-climb (perf/watt) + offset DOWN-only derate; degrades
+  cleanly to FREE-only on A100/A40/A10.
+- **aggressive-gated** — self-schedules drains for gated promotion; **NOT shipped in v1** (trough-detector
+  TOCTOU; drain must be admission-control-enforced).
+
+Per the adversarial review, the **production default is monitor-only**, all offset tuning gated to
+drained maintenance windows; safe-adapt is opt-in.
+
+### 9.5 Production-safety verdict
+On no-ECC GDDR6X a marginal OC flips **intermittent, data/address/temperature-dependent** bits with **no
+Xid/ECC/throttle signal**. The golden canary is a **coverage/health probe, NOT a corruption
+interceptor**: at ~0.2 Hz beside 150+ tok/s served, ~750+ real tokens go un-inspected per probe gap, and
+a flip in a tile the fixed golden prompt never touches reads `canary=OK` forever. The "180 ms revert" is
+**detect→revert, not corruption-onset→revert** (which can be ~100 s ≈ ~15,000 silent-wrong tokens).
+**Safety therefore lives in the cold-gated guard band (§4/§7), not in any runtime catch** — which is
+exactly why the default is monitor-only and every offset-UP is drained-gated. The only honest inspector
+of *real* outputs is an optional, throughput-costed, opt-in **redundant-recompute** (recompute a fraction
+of decode tokens at stock / on a second replica, compare token-ids).
+
+### 9.6 Observability
+Two independent paths so a tick flood never delays an event; **all string formatting off the watchdog
+thread**.
+
+**Per-tick line** (5 s aggregate of fast polls; absent signals render `-`): `ts | gpu | state |
+mem_off(MHz+MT/s) | core_off | sm_clk | mem_clk | read_GBs | bw_pct | dec_toks | dec_pct | pf_toks |
+vram_jc | core_C | pwr_W/cap | throttle | ecc(s/d/mm) | knee | guard | canary`. Example:
+
+```
+2026-06-21T14:32:07.412Z gpu0 SERVE mem_off=+1100MHz(+2200MT/s) core_off=+90 sm_clk=1965 mem_clk=9751MHz read=842GB/s bw=+11.4% dec=171.3tok/s +9.8% pf=2480tok/s vram_jc=88C core=71C pwr=312/350W thr=none ecc=noecc/mm0 knee=BELOW guard=60MHz canary=OK
+```
+
+The JSONL mirror carries `kind:"tick"`, `schema_version`, `epoch_ms`, `uuid`, raw numbers, and a sample
+block `{window_s, n, agg, probe_in_window}`. **NVML offset = ½ the MT/s number — log both.**
+
+**EVENT lines** (never coalesced/dropped; every derate/revert self-explains trigger + value + threshold +
+new safe clock):
+
+```
+THERMAL_DERATE  SERVE→DERATE gpu0 trigger=vram_junction value=94C thr=>=92C action=mem_off +1100→+800MHz dec 171→164tok/s reason="1C under hard-abort" cooldown=120s
+WATCHDOG_REVERT SERVE→REVERT gpu0 trigger=golden_canary value=token_mismatch mm=1 pos[88] exp=785 got=791 action=mem_off +1100→0(STOCK) latency=180ms SEVERITY=CRITICAL
+PROMOTE         CHARACTERIZE→SERVE gpu0 mem_off=+1100 core_off=+90 guard=60MHz baseline 156.0→live 171.3tok/s (+9.8%)
+```
+
+Other events: KNEE_DETECTED, STEP_ACCEPTED/REJECTED, RATCHET_DOWN, RESTORE (FREE-lane only), RECOMMEND
+(deploy-flag, never auto-applied), WATCHDOG_REVERT(Xid). Severity → journald priority + TTY color.
+
+**Formats:** colored TTY (auto-plain when piped / `NO_COLOR`); rotating **JSONL** audit (authoritative,
+100 MB / 7 d gzip); optional **Prometheus** exporter reusing DCGM gauge names
+(`DCGM_FI_DEV_SM_CLOCK`/`_MEM_CLOCK`/`_GPU_TEMP`/`_MEMORY_TEMP`, gpu+UUID labels) plus `octuner_*` series
+(offsets, state-set, decode_toks, vram_junction_celsius, guard_band_mhz, reverts_total / derates_total /
+steps_*); optional `octunerctl top` TUI. Verbosity: quiet (events + 1 tick/min) / normal / debug (raw
+polls + classifier internals).
+
+**Watching the host daemon:** stdout → journald with structured fields → `journalctl -u octuner -f`,
+`-p warning` (derates/reverts/Xid), `EVT=WATCHDOG_REVERT` native filter; `octunerctl watch`/`--follow`
+attaches the event-bus socket for a low-latency colored stream (multiple read-only viewers);
+`octunerctl status [--json]` prints a cached snapshot (no GPU poll, safe to spam).
+
+**Per-signal source + cadence:** NVML clocks/power/core-temp/throttle/Xid/ECC = watchdog ~1 Hz (Xid
+event-driven, instant-revert); junction via BAR0 `gputemps` = ~1 Hz (95 °C abort / 92 °C derate);
+**BW+verify kernel = per-step in CHARACTERIZE, maintenance-only in SERVE** (it bandwidth-saturates and
+contends with decode — demoted from the live path); vLLM `/metrics` = scrape 5-10 s (objective, *not* a
+safety gate); golden canary = ~0.2 Hz in SERVE + dense per characterize step; DCGM PROF = optional,
+datacenter only. The objective EWMA drops any `probe_in_window` sample.
 
 ---
 

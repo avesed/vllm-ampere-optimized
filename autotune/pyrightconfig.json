@@ -1,0 +1,6 @@
+{
+  "include": ["ampere_autotune", "tests"],
+  "extraPaths": ["."],
+  "reportMissingImports": "warning",
+  "pythonVersion": "3.10"
+}

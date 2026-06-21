@@ -1,0 +1,27 @@
+[project]
+name = "ampere-autotune"
+version = "0.0.1"
+description = "Host-side two-tier tuner (vLLM flags + GPU silicon OC) for Ampere vLLM serving. NOT shipped in any vLLM image."
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# HALF-A (default --vllm) needs only NVML read + an HTTP client for /metrics.
+dependencies = [
+    "nvidia-ml-py>=12.535",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+# HALF-B (--hw) silicon tuning. Still pure-Python NVML; the host still needs root +
+# (for GDDR6X junction) iomem=relaxed + Secure-Boot-off. See DESIGN.md.
+hw = []
+dev = ["pytest>=7"]
+
+[project.scripts]
+ampere-autotune = "ampere_autotune.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ampere_autotune*"]
