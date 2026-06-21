@@ -8,7 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 def chat(base, model, prompt, max_tokens, timeout=1200):
     body = json.dumps({"model": model,
                        "messages": [{"role": "user", "content": prompt}],
-                       "max_tokens": max_tokens}).encode()
+                       "max_tokens": max_tokens,
+                       "temperature": 0.6, "top_p": 0.95}).encode()
     req = urllib.request.Request(base.rstrip("/") + "/chat/completions",
                                  data=body, headers={"Content-Type": "application/json"})
     err = "?"

@@ -9,6 +9,10 @@ and W8A8 (int8) recipes in this dir."""
 import os, sys, random
 import torch
 from transformers import AutoTokenizer, AutoModelForImageTextToText
+try:
+    from transformers import AutoProcessor
+except Exception:
+    AutoProcessor = None
 from datasets import load_dataset, Dataset
 from llmcompressor import oneshot
 
@@ -53,6 +57,13 @@ if SEQT:
     ok["sequential_targets"] = [SEQT]
 oneshot(**ok)
 tok.save_pretrained(OUT)
+# Save the full processor too (preprocessor_config.json / video_preprocessor_config.json) so VL
+# checkpoints are servable as-is; no-op for text-only models that have no processor.
+if AutoProcessor is not None:
+    try:
+        AutoProcessor.from_pretrained(MODEL, trust_remote_code=True).save_pretrained(OUT)
+    except Exception as e:
+        print(f"[run_recipe] no processor saved ({type(e).__name__})", flush=True)
 
 import json  # noqa: E402
 qc = json.load(open(os.path.join(OUT, "config.json"))).get("quantization_config", {})
