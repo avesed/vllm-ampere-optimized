@@ -114,6 +114,31 @@ def test_invariant_no_bare_offset_anywhere_and_render_ok():
             assert "recommend-only" in out
 
 
+def test_golden_unchecked_telemetry_only():
+    # telemetry-only run (real NVML, no vLLM golden, no bw): golden_ok=None -> "not checked",
+    # no FAIL, no headroom projection; real thermal/power telemetry recs still fire.
+    m = Measurements(golden_ok=None, achieved_gbs=None, decode_toks=None,
+                     power_w=240.0, power_limit_w=350.0, core_temp_c=62.0)
+    recs = advise(m, GEFORCE_GDDR6X, ROOF)
+    n = _names(recs)
+    assert "A-CORRECTNESS-not-checked" in n
+    assert "A-CORRECTNESS-stock-FAIL" not in n
+    assert "A-CORRECTNESS-stock-baseline" not in n
+    assert "A-HEADROOM-mem-oc-projection" not in n   # never project without a clean stock golden
+    assert "A-POWER-perf-per-watt" in n              # real telemetry still actionable
+
+
+def test_golden_none_is_not_a_fail():
+    # regression for the `is False` fix: None must NOT be treated as a correctness FAIL
+    assert "A-CORRECTNESS-stock-FAIL" not in _names(advise(Measurements(golden_ok=None), GEFORCE_GDDR6X, ROOF))
+
+
+def test_headroom_needs_clean_golden():
+    # bandwidth-bound but golden unchecked -> still no projection (correctness baseline required)
+    m = Measurements(golden_ok=None, achieved_gbs=608.0, bw_flat_across_batch=True)
+    assert "A-HEADROOM-mem-oc-projection" not in _names(advise(m, GEFORCE_GDDR6X, ROOF))
+
+
 def test_bare_offset_regex_catches_real_offsets():
     # guard the guard: the regex must actually catch the things we forbid
     assert _BARE_OFFSET.search("set +1000 MHz")
