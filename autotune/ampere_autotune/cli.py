@@ -89,7 +89,14 @@ def main(argv=None) -> int:
 
     # --hw path: gate on preflight.
     if not _hw_unlocked(matrix):
-        print("HALF-B REFUSED by preflight. Run `ampere-autotune preflight --hw` for details:", file=sys.stderr)
+        # No OC-write privilege. `tune` degrades to the no-root ADVISORY (measure + recommend)
+        # instead of refusing; monitor/revert still need write privilege.
+        advisory_capable = bool(matrix.gpus) and any(g.advisory_capable for g in matrix.gpus)
+        if args.cmd == "tune" and advisory_capable:
+            from .half_b import advise
+            return advise.run_advisory(args, matrix)
+        print("HALF-B REFUSED by preflight (need host root for OC writes). "
+              "Run `ampere-autotune preflight --hw` for details:", file=sys.stderr)
         print(preflight.render(matrix), file=sys.stderr)
         return 3
 

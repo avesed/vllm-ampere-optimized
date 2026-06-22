@@ -104,6 +104,29 @@ caveat: stock `SpecDecodingLogging.log()` already suffices for one-time spec-K
 characterization; the probe earns its keep only on finer cadence/joins (accept-len-vs-batch
 crossover) and the **hybrid mamba-state pressure stock cannot see**.
 
+## No-root advisory mode (`half_b/advise.py`)
+
+When `tune --hw` runs **without OC-write privilege** but NVML reads + a CUDA GPU (for
+`bw_verify`) + a reachable vLLM endpoint are present, preflight returns the **ADVISORY**
+decision instead of refusing. The advisory runs the no-root signal stack — NVML
+clocks/power/temp/throttle-reasons/ECC, the `bw_verify` kernel (achieved read_GB/s +
+mismatch_count), a golden token-id check at stock under `VLLM_BATCH_INVARIANT=1`, and vLLM
+`/metrics` — and emits a structured report: a **stock correctness baseline**, a
+**thermal/throttle diagnosis** (which suppresses any encouraging projection), a
+**perf-per-watt** note, **SKU-specific** guidance, and a roofline-based mem-OC **projection**
+labelled UPPER-BOUND / UNMEASURED with an honest **zero floor** ("up to +X% — or nothing").
+
+**Safety invariants (enforced in `render()` + unit-tested):** it **NEVER** prints an
+apply-ready offset magnitude (no MHz/Gbps/MT-s — headroom is a dimensionless tok/s
+projection only; *the safe offset is found by the gate, not stated*); every projected-gain
+line co-locates the warning that an ungated GDDR6X offset silently corrupts and the only safe
+realization is **root + the gated `characterize`**; a stock-correctness FAIL suppresses the
+entire silicon section. `advise(measurements, sku, roofline)` is a **pure, no-GPU-tested**
+function (the live collector is the GPU/endpoint-bound part); `m=None` yields static SKU
+guidance only (never a fabricated correctness/headroom claim). It composes with HALF-A flag
+recs into one report; `--json` emits `half_a` + `half_b_advisory` with **no apply-offset
+field by design**.
+
 ## Packaging & safety posture
 
 Self-contained host package (`pyproject.toml`, console-script `ampere-autotune`, deps

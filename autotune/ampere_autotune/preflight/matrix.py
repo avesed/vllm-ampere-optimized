@@ -22,6 +22,7 @@ class GpuCapabilities:
     half_b_unlocked: bool
     max_tier: str               # highest tier the host may attempt for this GPU
     gate_family: str
+    advisory_capable: bool = False   # NVML-read OK -> the no-root advisory can measure + recommend
     refusals: List[str] = field(default_factory=list)
     decision: str = ""
 
@@ -108,12 +109,18 @@ def collect(write_probe: bool = False) -> CapabilityMatrix:
             t = _tel.probe_telemetry(sess, i)
             o = _oc.probe_oc_perm(sess, i, write_probe=write_probe)
             d = _ds.probe_driver_state(sess, i)
-            any_read = any_read or (t.nvml_read == _tel.READ_OK)
+            read_ok = (t.nvml_read == _tel.READ_OK)
+            any_read = any_read or read_ok
             half_b, max_tier, refusals, decision = _decide(s, t, o, d)
+            # No-root advisory can measure (NVML read + bw_verify + golden) even without write priv.
+            advisory_capable = read_ok and not half_b
+            if advisory_capable:
+                decision += "  |  HALF-B ADVISORY available (no OC-write; read+measure+recommend only)"
             gpus.append(GpuCapabilities(
                 index=i, sku=s.to_dict(), telemetry=t.to_dict(), oc=o.to_dict(),
                 driver_state=d.to_dict(), half_b_unlocked=half_b, max_tier=max_tier,
-                gate_family=s.gate_family, refusals=refusals, decision=decision))
+                gate_family=s.gate_family, advisory_capable=advisory_capable,
+                refusals=refusals, decision=decision))
         return CapabilityMatrix(half_a_available=any_read or n > 0, gpus=gpus)
 
 
