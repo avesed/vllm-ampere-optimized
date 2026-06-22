@@ -3,7 +3,41 @@ import pytest
 
 from ampere_autotune.half_a.cotune import (
     parse_sweep, expand_grid, config_flags, score, render, make_restart_fn, SweepPoint,
+    auto_tune, Trial,
 )
+
+
+def _quiet(*a, **k):
+    pass
+
+
+def test_auto_tune_adaptive_finds_optimum_without_grid():
+    # fake server: tps rises with seqs to 256; OOM past 128 unless fp8; mnbt=8192 adds 10%.
+    def fake(cfg):
+        seqs = int(cfg.get("--max-num-seqs", "32"))
+        fp8 = cfg.get("--kv-cache-dtype") == "fp8"
+        mnbt = int(cfg.get("--max-num-batched-tokens", "0"))
+        if seqs > 256 or (seqs > 128 and not fp8):
+            return Trial(cfg, float("-inf"), False, note="OOM")
+        tps = min(seqs, 256) * 10.0 * (1.10 if mnbt == 8192 else 1.0)
+        kv = min(0.99, seqs / (256.0 if fp8 else 128.0))
+        return Trial(cfg, tps, True, kv, 0.0)
+
+    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=256, log=_quiet)
+    assert best.config["--max-num-seqs"] == "256"               # expanded past the 128 OOM wall
+    assert best.config["--kv-cache-dtype"] == "fp8"             # AUTO-applied the coupled unlock
+    assert best.config["--max-num-batched-tokens"] == "8192"    # secondary knob picked up
+    assert len(hist) >= 5                                       # it actually searched
+
+
+def test_auto_tune_stops_at_plateau_without_unlocking():
+    def fake(cfg):
+        seqs = int(cfg.get("--max-num-seqs", "32"))
+        return Trial(cfg, min(seqs, 64) * 10.0, True, min(0.5, seqs / 512.0), 0.0)  # plateaus at 64, KV never high
+
+    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=256, log=_quiet)
+    assert best.config["--max-num-seqs"] == "64"
+    assert "--kv-cache-dtype" not in best.config               # no wall -> no unlock attempted
 
 
 def test_parse_sweep():

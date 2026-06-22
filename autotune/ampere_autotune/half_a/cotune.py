@@ -12,7 +12,7 @@ import itertools
 import subprocess
 import time
 from dataclasses import dataclass, asdict
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 from . import measure
 
@@ -160,12 +160,129 @@ def render(points: List[SweepPoint], objective: str) -> str:
     return "\n".join(lines)
 
 
+# ------------------------------------------------------------------------------------------------
+# AUTO mode — adaptive coordinate-ascent search (no manual grid; the tuner picks knobs + values).
+# ------------------------------------------------------------------------------------------------
+
+@dataclass
+class Trial:
+    config: Dict[str, str]
+    score: float
+    feasible: bool
+    kv: float = 0.0
+    preempt: float = 0.0
+    note: str = ""
+
+
+def _seqs_ladder(start: int, ceiling: int) -> List[int]:
+    v, out = start, []
+    while v <= ceiling:
+        out.append(v)
+        v *= 2
+    return out
+
+
+def auto_tune(trial_fn: Callable[[Dict[str, str]], Trial],
+              seed_seqs: int = 32, seqs_ceiling: int = 256, kv_high: float = 0.90, eps: float = 0.03,
+              mnbt_candidates=("8192",), log=print):
+    """Adaptive multi-variable search. trial_fn(config)->Trial restarts+measures one config.
+    Returns (best Trial or None, history). PURE given trial_fn (tested with a fake)."""
+    history: List[Trial] = []
+
+    def T(cfg):
+        t = trial_fn(cfg)
+        history.append(t)
+        log(f"  try {config_flags(cfg) or '(defaults)'} -> {t.score:.0f} "
+            f"(kv {t.kv:.0%}, preempt {t.preempt:.2f}{'' if t.feasible else ', ' + t.note})")
+        return t
+
+    # Phase A — expand the primary knob (max-num-seqs) until it stops paying or hits a wall.
+    best: Optional[Trial] = None
+    capped = False
+    for v in _seqs_ladder(seed_seqs, seqs_ceiling):
+        t = T({"--max-num-seqs": str(v)})
+        if not t.feasible or t.preempt > 0.05:
+            capped = True
+            break
+        if best is not None and t.score <= best.score * (1 + eps):
+            break                                   # diminishing returns
+        best = t
+        if t.kv >= kv_high:
+            capped = True                           # KV ceiling -> a coupled unlock may extend it
+            break
+    if best is None:
+        return None, history
+
+    # Phase B — if a wall stopped us, AUTO-apply the coupled unlock (fp8) and resume climbing.
+    if capped:
+        best_v = int(best.config["--max-num-seqs"])
+        for v in _seqs_ladder(best_v * 2, seqs_ceiling):
+            t = T({"--max-num-seqs": str(v), "--kv-cache-dtype": "fp8"})
+            if not t.feasible or t.preempt > 0.05:
+                break
+            if t.score <= best.score * (1 + eps):
+                break
+            best = t
+
+    # Phase C — at the winning concurrency, sweep the secondary knob (token budget).
+    for mnbt in mnbt_candidates:
+        t = T({**best.config, "--max-num-batched-tokens": mnbt})
+        if t.feasible and t.score > best.score * (1 + eps):
+            best = t
+
+    return best, history
+
+
+def _live_trial(restart_fn, endpoint: str, objective: str):  # pragma: no cover - drives a server
+    def trial(cfg: Dict[str, str]) -> Trial:
+        try:
+            up = restart_fn(cfg)
+        except Exception as e:
+            return Trial(cfg, float("-inf"), False, note=f"restart error: {e}")
+        if not up:
+            return Trial(cfg, float("-inf"), False, note="not ready (OOM?)")
+        st = measure.build_state(endpoint, levels=(1, 32, 128), burst_c=160)
+        if st is None:
+            return Trial(cfg, float("-inf"), False, note="measure failed")
+        sp = SweepPoint(cfg, True, st.decode_tps_max_c, st.decode_tps_single,
+                        st.kv_cache_usage, st.preempt_per_s)
+        return Trial(cfg, score(sp, objective), True, st.kv_cache_usage, st.preempt_per_s)
+    return trial
+
+
+def render_auto(best: Optional[Trial], history: List[Trial], objective: str) -> str:
+    lines = [f"ampere-autotune — HALF-A AUTO-tune (adaptive search), objective={objective}\n",
+             "search path:"]
+    for t in history:
+        tag = "ok  " if t.feasible else "FAIL"
+        lines.append(f"  [{tag}] {config_flags(t.config) or '(defaults)'} -> "
+                     + (f"{t.score:.0f} (kv {t.kv:.0%})" if t.feasible else t.note))
+    if best:
+        lines.append(f"\nBEST: {config_flags(best.config)} -> {best.score:.0f} ({objective}); kv {best.kv:.0%}.")
+        lines.append(f"  {len(history)} configs tried (auto-chosen). Apply + re-measure with `recommend`.")
+    else:
+        lines.append("\nNo feasible config found from the seed — loosen the seed/ceiling.")
+    return "\n".join(lines)
+
+
 def run(args) -> int:  # pragma: no cover - drives a server
-    grid = expand_grid(parse_sweep(args.sweep))
     endpoint = (getattr(args, "endpoint", None) or "http://localhost:8000").rstrip("/")
     obj = getattr(args, "objective", "throughput")
-    print(f"[cotune] grid = {len(grid)} configs; each restarts the server (~minutes). objective={obj}")
     restart = make_restart_fn(args.restart_cmd, endpoint, getattr(args, "ready_timeout", 600))
+
+    if getattr(args, "auto", False):
+        print(f"[cotune] AUTO adaptive search (no manual grid). objective={obj}")
+        best, history = auto_tune(_live_trial(restart, endpoint, obj),
+                                  seed_seqs=getattr(args, "seed", 32),
+                                  seqs_ceiling=getattr(args, "seqs_ceiling", 256))
+        print("\n" + render_auto(best, history, obj))
+        return 0
+
+    if not getattr(args, "sweep", None):
+        print("[cotune] need --sweep <grid> (manual) or --auto (adaptive search).")
+        return 2
+    grid = expand_grid(parse_sweep(args.sweep))
+    print(f"[cotune] grid = {len(grid)} configs; each restarts the server (~minutes). objective={obj}")
     points = run_sweep(grid, restart, endpoint, obj)
     print("\n" + render(points, obj))
     return 0

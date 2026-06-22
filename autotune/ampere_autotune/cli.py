@@ -47,8 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
     ct.add_argument("--endpoint", default="http://localhost:8000", help="vLLM base URL")
     ct.add_argument("--restart-cmd", required=True,
                     help="shell template that (re)launches the server; MUST contain {flags}")
-    ct.add_argument("--sweep", required=True,
-                    help='grid, e.g. "--max-num-seqs=32,64,96;--kv-cache-dtype=auto,fp8"')
+    ct.add_argument("--sweep", default=None,
+                    help='MANUAL grid, e.g. "--max-num-seqs=32,64,96;--kv-cache-dtype=auto,fp8"')
+    ct.add_argument("--auto", action="store_true",
+                    help="ADAPTIVE search instead of a manual grid (picks knobs/values itself)")
+    ct.add_argument("--seed", type=int, default=32, help="(--auto) starting max-num-seqs")
+    ct.add_argument("--seqs-ceiling", type=int, default=256, help="(--auto) max max-num-seqs to probe")
     ct.add_argument("--objective", default="throughput", choices=["throughput", "latency"])
     ct.add_argument("--ready-timeout", type=int, default=600, help="seconds to wait for /health per config")
 
