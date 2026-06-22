@@ -16,8 +16,10 @@ from typing import Callable, Dict, List
 
 from . import measure
 
-# values meaning "use the server default" -> omit the flag entirely
-_DEFAULTY = {"auto", "default", "", "-"}
+# values meaning "use the server default / disabled toggle" -> omit the flag entirely
+_DEFAULTY = {"auto", "default", "", "-", "false", "off", "no", "0"}
+# values meaning "enable this store_true toggle" -> emit the bare flag (no value)
+_TRUEY = {"true", "on", "yes", "1"}
 
 
 @dataclass
@@ -57,8 +59,15 @@ def expand_grid(spec: Dict[str, List[str]]) -> List[Dict[str, str]]:
 
 
 def config_flags(cfg: Dict[str, str]) -> str:
-    """Render a config to a flag string; default-y values are omitted (server default)."""
-    return " ".join(f"{k} {v}" for k, v in cfg.items() if str(v).lower() not in _DEFAULTY)
+    """Render a config to a flag string. Default-y values are omitted; a store_true toggle
+    (value true/on) emits the bare flag; everything else emits 'flag value'."""
+    parts: List[str] = []
+    for k, v in cfg.items():
+        s = str(v).lower()
+        if s in _DEFAULTY:
+            continue
+        parts.append(k if s in _TRUEY else f"{k} {v}")
+    return " ".join(parts)
 
 
 def score(p: SweepPoint, objective: str = "throughput") -> float:

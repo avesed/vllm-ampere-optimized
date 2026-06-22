@@ -27,6 +27,12 @@ def test_config_flags_omits_defaulty_values():
     assert config_flags({"--max-num-seqs": "96", "--kv-cache-dtype": "fp8"}) == "--max-num-seqs 96 --kv-cache-dtype fp8"
 
 
+def test_config_flags_store_true_toggle():
+    # enforce-eager=true -> bare flag (no value); false -> omitted (cudagraph stays on = default)
+    assert config_flags({"--max-num-seqs": "128", "--enforce-eager": "true"}) == "--max-num-seqs 128 --enforce-eager"
+    assert config_flags({"--max-num-seqs": "128", "--enforce-eager": "false"}) == "--max-num-seqs 128"
+
+
 def test_score_infeasible_is_neg_inf():
     assert score(SweepPoint({}, feasible=False)) == float("-inf")
 
