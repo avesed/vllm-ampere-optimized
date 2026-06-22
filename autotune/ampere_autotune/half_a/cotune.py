@@ -236,7 +236,7 @@ def auto_tune(trial_fn: Callable[[Dict[str, str]], Trial],
         s //= 2
         a = T({"--max-num-seqs": str(s)})
     if not _valid(a):
-        return None, history
+        return None, history, []
     b = T({"--max-num-seqs": str(s * 2)})
     samples = [(s, a.kv, a.score)]
     best = a
@@ -278,25 +278,27 @@ def auto_tune(trial_fn: Callable[[Dict[str, str]], Trial],
             v *= 2
         return cur, (stale == 0)                            # exhausted the wall while still improving
 
-    # CLIMB (auto dtype) to the knee within the predicted wall.
+    # CLIMB (only the accuracy-neutral knob) to the throughput knee within the predicted wall.
     best, hit_cap = climb({}, best)
 
-    # fp8 ONLY when capacity (OOM/thrash/ceiling-while-rising) stopped us. Anchor fp8 at the SAME
-    # seqs first (apples-to-apples), climb fp8-vs-fp8, and adopt ONLY if it beats the non-fp8 best.
-    if hit_cap and wall_fp8 > int(best.config["--max-num-seqs"]):
-        anchor = T({"--kv-cache-dtype": "fp8", "--max-num-seqs": best.config["--max-num-seqs"]})
-        if _valid(anchor):
-            fp8_best, _ = climb({"--kv-cache-dtype": "fp8"}, anchor)
-            if _valid(fp8_best) and fp8_best.score > best.score * (1 + eps):
-                best = fp8_best
-
-    # Secondary knob (token budget) at the winning point — kept only if it clears the eps bar.
+    # Secondary accuracy-neutral knob (token budget) — kept only if it clears the eps bar.
     for mnbt in mnbt_candidates:
         t = T({**best.config, "--max-num-batched-tokens": mnbt})
         if _valid(t) and t.score > best.score * (1 + eps):
             best = t
 
-    return (best, history) if _valid(best) else (None, history)
+    # EXTRA recommendations — opt-in, NOT auto-swept (they touch precision/accuracy or the checkpoint;
+    # the operator decides against their quality budget). kv-cache-dtype / MTP / mamba-dtype live here,
+    # never in the sweep above.
+    recs: List[str] = []
+    if hit_cap and _valid(best):
+        recs.append(f"capacity-bound at ~{best.config['--max-num-seqs']} seqs (KV wall) while throughput was "
+                    f"still rising. To push further -> --kv-cache-dtype fp8 ~2x KV room (wall ~{wall} -> ~{wall_fp8}; "
+                    f"NOT auto-swept, verify accuracy — sm80/86 fp8 is emulated/storage), or the accuracy-neutral "
+                    f"--gpu-memory-utilization up / --max-model-len trim.")
+    recs.append("per-stream (single/few-session) decode speed is bandwidth-bound; the lever is MTP/spec-decode "
+                "(needs an mtp head + an accept-rate check), not these flags. See --objective latency.")
+    return (best if _valid(best) else None, history, recs)
 
 
 def _live_trial(restart_fn, endpoint: str, objective: str):  # pragma: no cover - drives a server
@@ -316,60 +318,21 @@ def _live_trial(restart_fn, endpoint: str, objective: str):  # pragma: no cover 
     return trial
 
 
-def auto_tune_lowc(trial_fn: Callable[[Dict[str, str]], Trial], log=print):
-    """Single/few-session MAX THROUGHPUT (per-stream regime). max-num-seqs / kv-dtype / max-model-len
-    are IRRELEVANT here (the batch is load-determined, not flag-determined), so we do NOT climb them.
-    The only flag lever is cudagraph (must stay ON) -> verify on vs enforce-eager and pick the winner;
-    spec-decode/MTP is the real per-stream lever (a checkpoint feature, reported as a pointer)."""
-    history: List[Trial] = []
-
-    def T(cfg):
-        t = trial_fn(cfg)
-        history.append(t)
-        log(f"  try {config_flags(cfg) or '(default: cudagraph on)'} -> {t.score:.0f} tok/s"
-            f"{'' if t.feasible else ' (' + t.note + ')'}")
-        return t
-
-    base = T({})                                    # cudagraph on (default)
-    eager = T({"--enforce-eager": "true"})          # cudagraph off
-    cands = [t for t in (base, eager) if _valid(t)]
-    if not cands:
-        return None, history
-    return max(cands, key=lambda t: t.score), history
-
-
-def _live_trial_lowc(restart_fn, endpoint: str, c: int):  # pragma: no cover - drives a server
-    def trial(cfg: Dict[str, str]) -> Trial:
-        try:
-            up = restart_fn(cfg)
-        except Exception as e:
-            return Trial(cfg, float("-inf"), False, note=f"restart error: {e}")
-        if not up:
-            return Trial(cfg, float("-inf"), False, note="not ready (OOM?)")
-        tps = measure.lowc_throughput(endpoint, c=c)
-        if tps is None:
-            return Trial(cfg, float("-inf"), False, note="measure failed")
-        return Trial(cfg, tps, True, 0.0, 0.0)
-    return trial
-
-
-def render_lowc(best: Optional[Trial], history: List[Trial], c: int) -> str:
-    lines = [f"ampere-autotune — single/few-session ({c}-concurrency) MAX THROUGHPUT (per-stream regime)\n",
-             "measured:"]
-    for t in history:
-        lines.append(f"  {config_flags(t.config) or 'cudagraph on (default)'} -> "
-                     + (f"{t.score:.0f} tok/s" if t.feasible else t.note))
-    on = next((t for t in history if "--enforce-eager" not in t.config and _valid(t)), None)
-    off = next((t for t in history if t.config.get("--enforce-eager") == "true" and _valid(t)), None)
-    if on and off and off.score > 0:
-        lines.append(f"\ncudagraph is worth ~{(on.score / off.score - 1) * 100:.0f}% here "
-                     f"(on {on.score:.0f} vs enforce-eager {off.score:.0f} tok/s) -> NEVER enforce-eager.")
-    lines.append("max-num-seqs / kv-cache-dtype / max-model-len do NOT change per-stream speed (capacity knobs).")
-    lines.append("The real lever beyond flags is spec-decode / MTP (one forward -> k tokens) if the "
-                 "checkpoint ships an mtp head (Qwen3.5/3.6 do).")
-    if best:
-        lines.append(f"\nBEST: {config_flags(best.config) or 'defaults (cudagraph on)'} -> {best.score:.0f} tok/s @ {c}-conc.")
-    return "\n".join(lines)
+def render_lowc_advice(tps, c: int) -> str:
+    """Single/few-session: nothing accuracy-neutral to AUTO-SWEEP (per-stream is bandwidth-bound).
+    Measure the running server (no restart) + emit the opt-in levers."""
+    if tps is None:
+        return "single/few-session: endpoint unreachable."
+    head = (f"ampere-autotune — single/few-session ({c}-concurrency) throughput = {tps:.0f} tok/s "
+            f"(TPOT ~{1000.0 / tps:.1f} ms)" if tps > 0 else "single/few-session: no throughput measured")
+    return "\n".join([head, "",
+        "Nothing to auto-sweep here: per-stream decode is bandwidth-bound and accuracy-neutral flags don't move it.",
+        "Settled (not a tuning dimension): cudagraph stays ON — enforce-eager loses ~3-4x on hybrid-GDN.",
+        "EXTRA levers (opt-in, NOT auto-swept — they touch accuracy or the checkpoint):",
+        "  - MTP / spec-decode K=2 — THE per-stream lever; needs an mtp head + an accept-rate/quality check.",
+        "  - long-ctx only: --kv-cache-dtype fp8 / --mamba-cache-dtype (the GDN-state analogue) — trade a little",
+        "    accuracy for bytes; verify quality (sm80/86 fp8 is emulated/storage).",
+        "  - max-num-seqs / max-model-len are CAPACITY knobs — they do NOT change per-stream speed."])
 
 
 def batch_curve(endpoint: str, levels, max_tokens: int = 128):  # pragma: no cover - needs a server
@@ -397,9 +360,9 @@ def render_curve(rows) -> str:
     return "\n".join(lines)
 
 
-def render_auto(best: Optional[Trial], history: List[Trial], objective: str) -> str:
+def render_auto(best: Optional[Trial], history: List[Trial], recs, objective: str) -> str:
     lines = [f"ampere-autotune — HALF-A AUTO-tune (adaptive search), objective={objective}\n",
-             "search path:"]
+             "search path (accuracy-neutral knobs only):"]
     for t in history:
         tag = "ok  " if t.feasible else "FAIL"
         lines.append(f"  [{tag}] {config_flags(t.config) or '(defaults)'} -> "
@@ -409,6 +372,10 @@ def render_auto(best: Optional[Trial], history: List[Trial], objective: str) -> 
         lines.append(f"  {len(history)} configs tried (auto-chosen). Apply + re-measure with `recommend`.")
     else:
         lines.append("\nNo feasible config found from the seed — loosen the seed/ceiling.")
+    if recs:
+        lines.append("\nEXTRA recommendations (opt-in, NOT auto-swept — touch accuracy / the checkpoint):")
+        for r in recs:
+            lines.append(f"  - {r}")
     return "\n".join(lines)
 
 
@@ -422,23 +389,23 @@ def run(args) -> int:  # pragma: no cover - drives a server
         print("\n" + render_curve(batch_curve(endpoint, levels)))
         return 0
 
+    if obj == "latency":                            # single/few-session: measure + recommend, NO restart/sweep
+        c = getattr(args, "concurrency", 1)
+        print(f"[cotune] single/few-session ({c}-conc): measure + recommend (nothing accuracy-neutral to sweep).")
+        print("\n" + render_lowc_advice(measure.lowc_throughput(endpoint, c=c), c))
+        return 0
+
     if not getattr(args, "restart_cmd", None):
-        print("[cotune] --sweep/--auto need --restart-cmd \"...{flags}...\" (or use --batch-curve, no restart).")
+        print("[cotune] --sweep/--auto need --restart-cmd \"...{flags}...\" (or --batch-curve / --objective latency, no restart).")
         return 2
     restart = make_restart_fn(args.restart_cmd, endpoint, getattr(args, "ready_timeout", 600))
 
     if getattr(args, "auto", False):
-        if obj == "latency":                        # single/few-session max throughput (per-stream)
-            c = getattr(args, "concurrency", 1)
-            print(f"[cotune] AUTO single/few-session ({c}-conc) max throughput; lever = cudagraph (+ spec-decode pointer).")
-            best, history = auto_tune_lowc(_live_trial_lowc(restart, endpoint, c))
-            print("\n" + render_lowc(best, history, c))
-            return 0
-        print(f"[cotune] AUTO adaptive search (no manual grid). objective={obj}")
-        best, history = auto_tune(_live_trial(restart, endpoint, obj),
-                                  seed_seqs=getattr(args, "seed", 32),
-                                  seqs_ceiling=getattr(args, "seqs_ceiling", 256))
-        print("\n" + render_auto(best, history, obj))
+        print(f"[cotune] AUTO predict-then-verify (accuracy-neutral sweep). objective={obj}")
+        best, history, recs = auto_tune(_live_trial(restart, endpoint, obj),
+                                        seed_seqs=getattr(args, "seed", 32),
+                                        seqs_ceiling=getattr(args, "seqs_ceiling", 256))
+        print("\n" + render_auto(best, history, recs, obj))
         return 0
 
     if not getattr(args, "sweep", None):

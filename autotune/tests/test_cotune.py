@@ -3,7 +3,7 @@ import pytest
 
 from ampere_autotune.half_a.cotune import (
     parse_sweep, expand_grid, config_flags, score, render, make_restart_fn, SweepPoint,
-    auto_tune, auto_tune_lowc, render_curve, banned_in, Trial,
+    auto_tune, render_curve, render_lowc_advice, banned_in, Trial,
 )
 
 
@@ -18,72 +18,51 @@ def _quiet(*a, **k):
     pass
 
 
-def test_auto_predict_verify_climbs_with_fp8_when_throughput_still_rising():
-    # throughput genuinely keeps rising; KV wall ~128 (auto) / ~256 (fp8) -> capacity-bound, fp8 pays.
-    def fake(cfg):
-        seqs = int(cfg.get("--max-num-seqs", "32"))
-        fp8 = cfg.get("--kv-cache-dtype") == "fp8"
-        if seqs > (270 if fp8 else 135):
-            return Trial(cfg, float("-inf"), False, note="OOM")
-        tps = 4000.0 * seqs / (seqs + 200.0)                   # saturating but still rising at 256
-        kv = seqs / (270.0 if fp8 else 135.0)
-        return Trial(cfg, tps, True, kv, 0.0)
-
-    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
-    assert best.config["--max-num-seqs"] == "256"              # climbed past the 128 wall...
-    assert best.config["--kv-cache-dtype"] == "fp8"            # ...because fp8 was needed AND throughput rose
-    assert all(int(t.config.get("--max-num-seqs", "0")) <= 270 for t in hist)  # never blind-probed past the wall
-
-
-def test_auto_predict_verify_takes_knee_not_wall_and_skips_pointless_fp8():
-    # throughput PLATEAUS at 128 though the KV wall is far (486) -> take the knee, do NOT push to wall / fp8.
-    # (this is exactly the 9B lesson: 278+fp8 maxed KV for ~0 gain and must be rejected.)
+def test_auto_predict_verify_takes_knee_not_wall():
+    # throughput PLATEAUS at 128 though the KV wall is far -> take the knee. kv-dtype is NOT swept.
     def fake(cfg):
         seqs = int(cfg.get("--max-num-seqs", "32"))
         tps = 3000.0 if seqs >= 128 else 3000.0 * seqs / 128.0   # hard plateau at 128
-        return Trial(cfg, tps, True, seqs / 512.0, 0.0)          # KV never binds in range
+        return Trial(cfg, tps, True, seqs / 512.0, 0.0)
 
-    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
+    best, hist, recs = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
     assert best.config["--max-num-seqs"] == "128"             # the throughput knee
-    assert "--kv-cache-dtype" not in best.config             # no pointless KV-maxing fp8
+    assert "--kv-cache-dtype" not in best.config             # never auto-swept
+
+
+def test_auto_recommends_fp8_when_capacity_bound_but_never_sweeps_it():
+    # capacity-bound (still rising at the KV wall) -> fp8 is a RECOMMENDATION, NOT in the swept config/history
+    def fake(cfg):
+        seqs = int(cfg.get("--max-num-seqs", "32"))
+        if seqs > 140:
+            return Trial(cfg, float("-inf"), False, note="OOM")
+        tps = 4000.0 * seqs / (seqs + 200.0)                     # still rising at the wall
+        return Trial(cfg, tps, True, seqs / 140.0, 0.0)
+
+    best, hist, recs = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
+    assert "--kv-cache-dtype" not in best.config                 # not swept
+    assert any("fp8" in r for r in recs)                         # but recommended (opt-in)
+    assert all("kv-cache-dtype" not in config_flags(t.config) for t in hist)   # never tried in the sweep
 
 
 def test_auto_returns_none_when_everything_thrashes():
     # H1: a feasible-but-thrashing config (score -inf) must NEVER be returned as best
     def fake(cfg):
         return Trial(cfg, float("-inf"), True, 0.99, 0.5, "thrash")   # feasible but preempting
-    best, hist = auto_tune(fake, seed_seqs=32, log=_quiet)
+    best, hist, recs = auto_tune(fake, seed_seqs=32, log=_quiet)
     assert best is None
 
 
-def test_auto_rejects_kv_maxing_fp8_with_no_throughput_gain():
-    # H4/H5: throughput plateaus at 128; fp8 lets KV go higher but tps is FLAT -> fp8 must be rejected
-    # (this is the exact 9B 278+fp8 trap).
+def test_auto_does_not_reprobe_a_measured_oom_config():
+    # H3: when s*2 OOMs at probe, the climb must not re-probe that config
     def fake(cfg):
         seqs = int(cfg.get("--max-num-seqs", "32"))
-        fp8 = cfg.get("--kv-cache-dtype") == "fp8"
-        if seqs > (400 if fp8 else 140):
-            return Trial(cfg, float("-inf"), False, note="OOM")
-        tps = 3000.0 if seqs >= 128 else 3000.0 * seqs / 128.0        # hard plateau at 128
-        return Trial(cfg, tps, True, seqs / (400.0 if fp8 else 140.0), 0.0)
-
-    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
-    assert best.config["--max-num-seqs"] == "128"
-    assert "--kv-cache-dtype" not in best.config                     # fp8 evaluated but rejected (no gain)
-
-
-def test_auto_does_not_reprobe_a_measured_oom_auto_config():
-    # H3: when s*2 OOMs at probe, the auto climb must not re-probe that same (auto) config
-    def fake(cfg):
-        seqs = int(cfg.get("--max-num-seqs", "32"))
-        cap = 80 if cfg.get("--kv-cache-dtype") == "fp8" else 40
-        if seqs > cap:
+        if seqs > 40:
             return Trial(cfg, float("-inf"), False, note="OOM")
         return Trial(cfg, seqs * 10.0, True, seqs / 100.0, 0.0)
 
-    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
-    auto64 = [t for t in hist if t.config.get("--max-num-seqs") == "64" and "--kv-cache-dtype" not in t.config]
-    assert len(auto64) == 1                                          # probed once, never re-probed
+    best, hist, recs = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
+    assert len([t for t in hist if t.config.get("--max-num-seqs") == "64"]) == 1
 
 
 def test_auto_patience_passes_a_noisy_flat_rung():
@@ -93,30 +72,8 @@ def test_auto_patience_passes_a_noisy_flat_rung():
         seqs = int(cfg.get("--max-num-seqs", "32"))
         return Trial(cfg, float(tbl.get(seqs, 3000)), True, seqs / 2000.0, 0.0)   # KV tiny -> wall huge
 
-    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
+    best, hist, recs = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
     assert best.config["--max-num-seqs"] == "512"
-
-
-def test_auto_lowc_picks_cudagraph_over_enforce_eager():
-    # single-session: only cudagraph matters; pick it over enforce-eager (the 9B 85 vs 22 reality)
-    def fake(cfg):
-        eager = cfg.get("--enforce-eager") == "true"
-        return Trial(cfg, 22.0 if eager else 85.0, True, 0.0, 0.0)
-    best, hist = auto_tune_lowc(fake, log=_quiet)
-    assert best.score == 85.0 and "--enforce-eager" not in best.config
-    assert len(hist) == 2                                       # 2 configs only — no max-num-seqs climb
-
-
-def test_render_curve_shows_per_session_and_tpot():
-    out = render_curve([(1, 85.0, 85.0), (128, 3060.0, 23.9)])
-    assert "per-session" in out and "TPOT" in out
-    assert "85" in out and "3060" in out and "11.8" in out      # TPOT@85 tok/s ~ 11.8 ms
-    assert "SLA" in out                                          # the operating-point guidance
-
-
-def test_auto_lowc_none_when_server_wont_come_up():
-    best, hist = auto_tune_lowc(lambda cfg: Trial(cfg, float("-inf"), False, note="OOM"), log=_quiet)
-    assert best is None
 
 
 def test_auto_probe_halves_down_when_seed_ooms():
@@ -126,8 +83,22 @@ def test_auto_probe_halves_down_when_seed_ooms():
             return Trial(cfg, float("-inf"), False, note="OOM")
         return Trial(cfg, seqs * 10.0, True, seqs / 100.0, 0.0)
 
-    best, hist = auto_tune(fake, seed_seqs=128, seqs_ceiling=512, log=_quiet)   # seed OOMs -> halve to 32
+    best, hist, recs = auto_tune(fake, seed_seqs=128, seqs_ceiling=512, log=_quiet)   # seed OOMs -> halve
     assert best is not None and int(best.config["--max-num-seqs"]) <= 40
+
+
+def test_render_curve_shows_per_session_and_tpot():
+    out = render_curve([(1, 85.0, 85.0), (128, 3060.0, 23.9)])
+    assert "per-session" in out and "TPOT" in out
+    assert "85" in out and "3060" in out and "11.8" in out      # TPOT@85 tok/s ~ 11.8 ms
+    assert "SLA" in out                                          # the operating-point guidance
+
+
+def test_render_lowc_advice_recommends_mtp_keeps_cudagraph_no_sweep():
+    out = render_lowc_advice(85.0, 1)
+    assert "85" in out and "TPOT" in out
+    assert "MTP" in out and "enforce-eager" in out              # opt-in MTP lever + cudagraph guardrail
+    assert "auto-sweep" in out.lower() or "opt-in" in out.lower()
 
 
 def test_parse_sweep():
