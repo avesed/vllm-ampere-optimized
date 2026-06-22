@@ -11,33 +11,45 @@ def _quiet(*a, **k):
     pass
 
 
-def test_auto_tune_adaptive_finds_optimum_without_grid():
-    # fake server: tps rises with seqs to 256; OOM past 128 unless fp8; mnbt=8192 adds 10%.
+def test_auto_predict_verify_climbs_with_fp8_when_throughput_still_rising():
+    # throughput genuinely keeps rising; KV wall ~128 (auto) / ~256 (fp8) -> capacity-bound, fp8 pays.
     def fake(cfg):
         seqs = int(cfg.get("--max-num-seqs", "32"))
         fp8 = cfg.get("--kv-cache-dtype") == "fp8"
-        mnbt = int(cfg.get("--max-num-batched-tokens", "0"))
-        if seqs > 256 or (seqs > 128 and not fp8):
+        if seqs > (270 if fp8 else 135):
             return Trial(cfg, float("-inf"), False, note="OOM")
-        tps = min(seqs, 256) * 10.0 * (1.10 if mnbt == 8192 else 1.0)
-        kv = min(0.99, seqs / (256.0 if fp8 else 128.0))
+        tps = 4000.0 * seqs / (seqs + 200.0)                   # saturating but still rising at 256
+        kv = seqs / (270.0 if fp8 else 135.0)
         return Trial(cfg, tps, True, kv, 0.0)
 
-    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=256, log=_quiet)
-    assert best.config["--max-num-seqs"] == "256"               # expanded past the 128 OOM wall
-    assert best.config["--kv-cache-dtype"] == "fp8"             # AUTO-applied the coupled unlock
-    assert best.config["--max-num-batched-tokens"] == "8192"    # secondary knob picked up
-    assert len(hist) >= 5                                       # it actually searched
+    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
+    assert best.config["--max-num-seqs"] == "256"              # climbed past the 128 wall...
+    assert best.config["--kv-cache-dtype"] == "fp8"            # ...because fp8 was needed AND throughput rose
+    assert all(int(t.config.get("--max-num-seqs", "0")) <= 270 for t in hist)  # never blind-probed past the wall
 
 
-def test_auto_tune_stops_at_plateau_without_unlocking():
+def test_auto_predict_verify_takes_knee_not_wall_and_skips_pointless_fp8():
+    # throughput PLATEAUS at 128 though the KV wall is far (486) -> take the knee, do NOT push to wall / fp8.
+    # (this is exactly the 9B lesson: 278+fp8 maxed KV for ~0 gain and must be rejected.)
     def fake(cfg):
         seqs = int(cfg.get("--max-num-seqs", "32"))
-        return Trial(cfg, min(seqs, 64) * 10.0, True, min(0.5, seqs / 512.0), 0.0)  # plateaus at 64, KV never high
+        tps = 3000.0 if seqs >= 128 else 3000.0 * seqs / 128.0   # hard plateau at 128
+        return Trial(cfg, tps, True, seqs / 512.0, 0.0)          # KV never binds in range
 
-    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=256, log=_quiet)
-    assert best.config["--max-num-seqs"] == "64"
-    assert "--kv-cache-dtype" not in best.config               # no wall -> no unlock attempted
+    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
+    assert best.config["--max-num-seqs"] == "128"             # the throughput knee
+    assert "--kv-cache-dtype" not in best.config             # no pointless KV-maxing fp8
+
+
+def test_auto_probe_halves_down_when_seed_ooms():
+    def fake(cfg):
+        seqs = int(cfg.get("--max-num-seqs", "32"))
+        if seqs > 40:
+            return Trial(cfg, float("-inf"), False, note="OOM")
+        return Trial(cfg, seqs * 10.0, True, seqs / 100.0, 0.0)
+
+    best, hist = auto_tune(fake, seed_seqs=128, seqs_ceiling=512, log=_quiet)   # seed OOMs -> halve to 32
+    assert best is not None and int(best.config["--max-num-seqs"]) <= 40
 
 
 def test_parse_sweep():

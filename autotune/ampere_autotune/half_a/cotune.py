@@ -174,19 +174,27 @@ class Trial:
     note: str = ""
 
 
-def _seqs_ladder(start: int, ceiling: int) -> List[int]:
-    v, out = start, []
-    while v <= ceiling:
-        out.append(v)
-        v *= 2
-    return out
+def _predict_walls(samples):
+    """(feasible_wall, feasible_wall_fp8) from the capacity model — the RELIABLE part of the math.
+    2 points -> roofline+KV fit; 1 point -> baseline. None if it can't fit."""
+    from .analytical import predict, predict_from_baseline, Sample
+    pts = [Sample(s, kv, tps) for (s, kv, tps) in samples]
+    if len({p.seqs for p in pts}) >= 2:
+        p = predict(pts)
+        if p:
+            return p.feasible_seqs, p.feasible_seqs_fp8
+    bp = predict_from_baseline(pts[-1])
+    return (bp.feasible_seqs, bp.feasible_seqs_fp8) if bp else (None, None)
 
 
 def auto_tune(trial_fn: Callable[[Dict[str, str]], Trial],
-              seed_seqs: int = 32, seqs_ceiling: int = 256, kv_high: float = 0.90, eps: float = 0.03,
-              mnbt_candidates=("8192",), log=print):
-    """Adaptive multi-variable search. trial_fn(config)->Trial restarts+measures one config.
-    Returns (best Trial or None, history). PURE given trial_fn (tested with a fake)."""
+              seed_seqs: int = 32, seqs_ceiling: int = 512, eps: float = 0.03,
+              mnbt_candidates=(), log=print):
+    """PREDICT-THEN-VERIFY adaptive search. Two cheap probes anchor the CAPACITY model (reliable);
+    the predicted feasible wall BOUNDS the climb (no blind-OOM rungs); we verify upward and take the
+    THROUGHPUT KNEE (not the wall); fp8 is tried ONLY if capacity stopped us while throughput was
+    still rising (else a KV-maxing config with no gain is correctly rejected at the knee).
+    Returns (best Trial or None, history). PURE given trial_fn."""
     history: List[Trial] = []
 
     def T(cfg):
@@ -196,35 +204,55 @@ def auto_tune(trial_fn: Callable[[Dict[str, str]], Trial],
             f"(kv {t.kv:.0%}, preempt {t.preempt:.2f}{'' if t.feasible else ', ' + t.note})")
         return t
 
-    # Phase A — expand the primary knob (max-num-seqs) until it stops paying or hits a wall.
-    best: Optional[Trial] = None
-    capped = False
-    for v in _seqs_ladder(seed_seqs, seqs_ceiling):
-        t = T({"--max-num-seqs": str(v)})
-        if not t.feasible or t.preempt > 0.05:
-            capped = True
-            break
-        if best is not None and t.score <= best.score * (1 + eps):
-            break                                   # diminishing returns
-        best = t
-        if t.kv >= kv_high:
-            capped = True                           # KV ceiling -> a coupled unlock may extend it
-            break
-    if best is None:
+    # PROBE — find a feasible seed (halve down if it OOMs), then one rung up to anchor the slope.
+    s = seed_seqs
+    a = T({"--max-num-seqs": str(s)})
+    while not a.feasible and s > 1:
+        s //= 2
+        a = T({"--max-num-seqs": str(s)})
+    if not a.feasible:
         return None, history
+    b = T({"--max-num-seqs": str(s * 2)})
+    samples = [(s, a.kv, a.score)]
+    best = a
+    if b.feasible:
+        samples.append((s * 2, b.kv, b.score))
+        if b.score > a.score:
+            best = b
 
-    # Phase B — if a wall stopped us, AUTO-apply the coupled unlock (fp8) and resume climbing.
-    if capped:
-        best_v = int(best.config["--max-num-seqs"])
-        for v in _seqs_ladder(best_v * 2, seqs_ceiling):
-            t = T({"--max-num-seqs": str(v), "--kv-cache-dtype": "fp8"})
+    # PREDICT — the feasible wall bounds the climb (don't probe past what the math says fits).
+    wall, wall_fp8 = _predict_walls(samples)
+    wall = min(wall or seqs_ceiling, seqs_ceiling)
+    wall_fp8 = min(wall_fp8 or wall, seqs_ceiling)
+    log(f"  [predict] feasible wall ~{wall} seqs (fp8 ~{wall_fp8}); climb to the throughput KNEE within it")
+
+    def climb(extra, cur, ceiling):
+        """Verify upward (x2) from cur within `ceiling`; stop at the throughput knee.
+        Returns (best-so-far, wall_limited) — wall_limited = stopped by capacity, still rising."""
+        wall_limited = False
+        v = int(cur.config["--max-num-seqs"]) * 2
+        while v <= ceiling:
+            t = T({**extra, "--max-num-seqs": str(v)})
             if not t.feasible or t.preempt > 0.05:
+                wall_limited = True
                 break
-            if t.score <= best.score * (1 + eps):
-                break
-            best = t
+            if t.score <= cur.score * (1 + eps):
+                break                               # KNEE: throughput plateaued before the wall
+            cur = t
+            v *= 2
+        else:
+            wall_limited = True                     # hit the predicted ceiling while still improving
+        return cur, wall_limited
 
-    # Phase C — at the winning concurrency, sweep the secondary knob (token budget).
+    # CLIMB to the knee within the predicted wall.
+    best, wall_limited = climb({}, best, wall)
+
+    # fp8 ONLY when capacity (not a plateau) stopped us -> unlock more room and keep climbing.
+    # If throughput had already plateaued, the knee test below rejects the (KV-maxing) fp8 rungs.
+    if wall_limited and wall_fp8 > int(best.config["--max-num-seqs"]):
+        best, _ = climb({"--kv-cache-dtype": "fp8"}, best, wall_fp8)
+
+    # Secondary knob (token budget) at the winning point — kept only if it clears the eps bar.
     for mnbt in mnbt_candidates:
         t = T({**best.config, "--max-num-batched-tokens": mnbt})
         if t.feasible and t.score > best.score * (1 + eps):
