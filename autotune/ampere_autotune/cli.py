@@ -42,6 +42,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(rec)
     rec.add_argument("--endpoint", default="http://localhost:8000", help="vLLM /metrics base URL")
 
+    ct = sub.add_parser("cotune", help="HALF-A: MEASURED co-tuning sweep (restart per config, find best)")
+    _add_common(ct)
+    ct.add_argument("--endpoint", default="http://localhost:8000", help="vLLM base URL")
+    ct.add_argument("--restart-cmd", required=True,
+                    help="shell template that (re)launches the server; MUST contain {flags}")
+    ct.add_argument("--sweep", required=True,
+                    help='grid, e.g. "--max-num-seqs=32,64,96;--kv-cache-dtype=auto,fp8"')
+    ct.add_argument("--objective", default="throughput", choices=["throughput", "latency"])
+    ct.add_argument("--ready-timeout", type=int, default=600, help="seconds to wait for /health per config")
+
     tune = sub.add_parser("tune", help="HALF-B: characterize a stable clock profile (host root)")
     _add_common(tune)
     tune.add_argument("--mode", choices=["characterize", "monitor-only", "safe-adapt"],
@@ -84,6 +94,10 @@ def main(argv=None) -> int:
     if args.cmd == "preflight":
         _emit(matrix, args.json, preflight.render)
         return 0
+
+    if args.cmd == "cotune":   # HALF-A measured sweep (no NVML/privilege needed; drives the endpoint)
+        from .half_a import cotune
+        return cotune.run(args)
 
     if args.tier == "vllm" or args.cmd == "recommend":
         if not matrix.half_a_available:
