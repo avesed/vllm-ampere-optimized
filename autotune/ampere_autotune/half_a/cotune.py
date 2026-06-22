@@ -115,7 +115,9 @@ def run_sweep(grid: List[Dict[str, str]], restart_fn, endpoint: str,
             points.append(SweepPoint(cfg, note="never became ready (OOM/crash?)"))
             log("    x not ready (likely OOM at this config)")
             continue
-        st = measure.build_state(endpoint)
+        # oversubscribe past the largest swept max-num-seqs so every config is actually saturated
+        # (a fair throughput comparison; otherwise a big-cap config is never exercised)
+        st = measure.build_state(endpoint, levels=(1, 32, 128), burst_c=160)
         if st is None:
             points.append(SweepPoint(cfg, note="measure failed"))
             continue
