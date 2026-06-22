@@ -43,6 +43,12 @@ Stock vLLM **won't load W4A8 on any Ampere GPU** — the fork is the only way to
   int8 gain to +5%).
 - **Quality:** decode is W4A16-parity; int8 activations cost ~zero accuracy — GSM8K (thinking) 9B W4A16
   81.6% / W4A8 85.6% (N=250); 35B-A3B W4A8 GSM8K 95.8%, MMLU-Pro 80.5%. The fork's W4A16 is byte-identical to stock.
+- **dLLM — DiffusionGemma-26B-A4B (block-diffusion MoE):** the int8-act edge reaches diffusion LMs too.
+  RTX 3090 ×1 `sm_86`, canvas 256, cudagraph, single-stream: **204 tok/s** vs stock vLLM W4A16 **156** (**+31%**),
+  both GPU-saturated. dLLM denoising is compute-bound every step (prefill-like), so int8 pays here — unlike AR decode.
+  Quality (W4A8): GSM8K **95.7%** (N=1000), MMLU-Pro **76.4%** (N=500) — W4A16-parity. Run the
+  [cyankiwi W4A16 ckpt](https://huggingface.co/cyankiwi/diffusiongemma-26B-A4B-it-AWQ-INT4) with
+  `VLLM_MARLIN_INPUT_DTYPE=int8 --dtype bfloat16` over the chat endpoint (bf16 required — Gemma activations overflow fp16 under int8).
 
 ## Use
 
