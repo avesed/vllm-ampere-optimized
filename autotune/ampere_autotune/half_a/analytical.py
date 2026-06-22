@@ -147,6 +147,11 @@ def render(p: Optional[Prediction], samples: List[Sample]) -> str:
         f"  roofline ceiling ~{p.tps_ceiling:.0f} tok/s; throughput knee ~{p.knee_seqs} seqs; "
         f"feasible wall ~{p.feasible_seqs} seqs (fp8 ~{p.feasible_seqs_fp8}).",
         f"  -> {p.reason}",
-        f"  PREDICT BEST: {flags}  (~{p.pred_tps:.0f} tok/s aggregate)",
-        f"  VERIFY (one restart): cotune --sweep \"{sweep}\"",
+        f"  feasible wall + fp8 unlock are RELIABLE (capacity model). The throughput number below is an",
+        f"  EXTRAPOLATED UPPER BOUND from {len(samples)} points — it ASSUMES no early plateau; decode",
+        f"  throughput often saturates BEFORE the capacity wall, so it MUST be verified (measured 278+fp8",
+        f"  on a real 9B = ~flat vs 128, not the projected gain).",
+        f"  CANDIDATE: {flags}  (<= ~{p.pred_tps:.0f} tok/s, unverified upper bound)",
+        f"  VERIFY (the deciding run): cotune --sweep \"{sweep}\"  — and a point or two below it,",
+        f"  then take the throughput knee, NOT the wall.",
     ])
