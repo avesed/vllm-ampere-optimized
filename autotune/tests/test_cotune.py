@@ -41,6 +41,55 @@ def test_auto_predict_verify_takes_knee_not_wall_and_skips_pointless_fp8():
     assert "--kv-cache-dtype" not in best.config             # no pointless KV-maxing fp8
 
 
+def test_auto_returns_none_when_everything_thrashes():
+    # H1: a feasible-but-thrashing config (score -inf) must NEVER be returned as best
+    def fake(cfg):
+        return Trial(cfg, float("-inf"), True, 0.99, 0.5, "thrash")   # feasible but preempting
+    best, hist = auto_tune(fake, seed_seqs=32, log=_quiet)
+    assert best is None
+
+
+def test_auto_rejects_kv_maxing_fp8_with_no_throughput_gain():
+    # H4/H5: throughput plateaus at 128; fp8 lets KV go higher but tps is FLAT -> fp8 must be rejected
+    # (this is the exact 9B 278+fp8 trap).
+    def fake(cfg):
+        seqs = int(cfg.get("--max-num-seqs", "32"))
+        fp8 = cfg.get("--kv-cache-dtype") == "fp8"
+        if seqs > (400 if fp8 else 140):
+            return Trial(cfg, float("-inf"), False, note="OOM")
+        tps = 3000.0 if seqs >= 128 else 3000.0 * seqs / 128.0        # hard plateau at 128
+        return Trial(cfg, tps, True, seqs / (400.0 if fp8 else 140.0), 0.0)
+
+    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
+    assert best.config["--max-num-seqs"] == "128"
+    assert "--kv-cache-dtype" not in best.config                     # fp8 evaluated but rejected (no gain)
+
+
+def test_auto_does_not_reprobe_a_measured_oom_auto_config():
+    # H3: when s*2 OOMs at probe, the auto climb must not re-probe that same (auto) config
+    def fake(cfg):
+        seqs = int(cfg.get("--max-num-seqs", "32"))
+        cap = 80 if cfg.get("--kv-cache-dtype") == "fp8" else 40
+        if seqs > cap:
+            return Trial(cfg, float("-inf"), False, note="OOM")
+        return Trial(cfg, seqs * 10.0, True, seqs / 100.0, 0.0)
+
+    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
+    auto64 = [t for t in hist if t.config.get("--max-num-seqs") == "64" and "--kv-cache-dtype" not in t.config]
+    assert len(auto64) == 1                                          # probed once, never re-probed
+
+
+def test_auto_patience_passes_a_noisy_flat_rung():
+    # M9: one flat intermediate rung must not end the ascent when a higher rung is much better
+    tbl = {32: 800, 64: 1500, 128: 2000, 256: 2010, 512: 3000}      # 256 ~flat vs 128, 512 jumps
+    def fake(cfg):
+        seqs = int(cfg.get("--max-num-seqs", "32"))
+        return Trial(cfg, float(tbl.get(seqs, 3000)), True, seqs / 2000.0, 0.0)   # KV tiny -> wall huge
+
+    best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
+    assert best.config["--max-num-seqs"] == "512"
+
+
 def test_auto_probe_halves_down_when_seed_ooms():
     def fake(cfg):
         seqs = int(cfg.get("--max-num-seqs", "32"))

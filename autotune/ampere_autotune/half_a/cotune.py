@@ -176,25 +176,33 @@ class Trial:
 
 def _predict_walls(samples):
     """(feasible_wall, feasible_wall_fp8) from the capacity model — the RELIABLE part of the math.
-    2 points -> roofline+KV fit; 1 point -> baseline. None if it can't fit."""
+    2 points -> roofline+KV fit; else the MOST CONSERVATIVE single point (highest per-seq KV ->
+    smallest wall, so we never over-predict feasibility). None if it can't fit."""
     from .analytical import predict, predict_from_baseline, Sample
     pts = [Sample(s, kv, tps) for (s, kv, tps) in samples]
     if len({p.seqs for p in pts}) >= 2:
         p = predict(pts)
         if p:
             return p.feasible_seqs, p.feasible_seqs_fp8
-    bp = predict_from_baseline(pts[-1])
+    cons = max(pts, key=lambda p: (p.kv / p.seqs) if p.seqs else 0.0)
+    bp = predict_from_baseline(cons)
     return (bp.feasible_seqs, bp.feasible_seqs_fp8) if bp else (None, None)
 
 
+def _valid(t) -> bool:
+    """A usable result: feasible (server came up) AND not thrashing (finite score; score() -inf's
+    a feasible-but-preempting config)."""
+    return t.feasible and t.score > float("-inf")
+
+
 def auto_tune(trial_fn: Callable[[Dict[str, str]], Trial],
-              seed_seqs: int = 32, seqs_ceiling: int = 512, eps: float = 0.03,
+              seed_seqs: int = 32, seqs_ceiling: int = 512, eps: float = 0.03, patience: int = 2,
               mnbt_candidates=(), log=print):
     """PREDICT-THEN-VERIFY adaptive search. Two cheap probes anchor the CAPACITY model (reliable);
-    the predicted feasible wall BOUNDS the climb (no blind-OOM rungs); we verify upward and take the
-    THROUGHPUT KNEE (not the wall); fp8 is tried ONLY if capacity stopped us while throughput was
-    still rising (else a KV-maxing config with no gain is correctly rejected at the knee).
-    Returns (best Trial or None, history). PURE given trial_fn."""
+    the predicted feasible wall BOUNDS the climb (no blind-OOM rungs); verify upward to the THROUGHPUT
+    KNEE (not the wall, with patience for noise); fp8 is tried ONLY if capacity stopped us, anchored
+    apples-to-apples (fp8 at the same seqs first) and adopted ONLY if it beats the non-fp8 best by eps
+    (so a KV-maxing config with ~0 gain is rejected). Returns (best Trial or None, history)."""
     history: List[Trial] = []
 
     def T(cfg):
@@ -204,61 +212,74 @@ def auto_tune(trial_fn: Callable[[Dict[str, str]], Trial],
             f"(kv {t.kv:.0%}, preempt {t.preempt:.2f}{'' if t.feasible else ', ' + t.note})")
         return t
 
-    # PROBE — find a feasible seed (halve down if it OOMs), then one rung up to anchor the slope.
+    # PROBE — a feasible AND non-thrashing seed (halve down otherwise), then one rung up.
     s = seed_seqs
     a = T({"--max-num-seqs": str(s)})
-    while not a.feasible and s > 1:
+    while not _valid(a) and s > 1:
         s //= 2
         a = T({"--max-num-seqs": str(s)})
-    if not a.feasible:
+    if not _valid(a):
         return None, history
     b = T({"--max-num-seqs": str(s * 2)})
     samples = [(s, a.kv, a.score)]
     best = a
-    if b.feasible:
+    b_oom = not b.feasible                                   # hard OOM at s*2 (a measured infeasibility)
+    if _valid(b):
         samples.append((s * 2, b.kv, b.score))
         if b.score > a.score:
             best = b
 
-    # PREDICT — the feasible wall bounds the climb (don't probe past what the math says fits).
+    # PREDICT — the feasible wall bounds the climb (never probe past what the math says fits, and
+    # never past a MEASURED OOM at s*2).
     wall, wall_fp8 = _predict_walls(samples)
     wall = min(wall or seqs_ceiling, seqs_ceiling)
     wall_fp8 = min(wall_fp8 or wall, seqs_ceiling)
+    if b_oom:
+        wall = min(wall, s * 2 - 1)
     log(f"  [predict] feasible wall ~{wall} seqs (fp8 ~{wall_fp8}); climb to the throughput KNEE within it")
 
-    def climb(extra, cur, ceiling):
-        """Verify upward (x2) from cur within `ceiling`; stop at the throughput knee.
-        Returns (best-so-far, wall_limited) — wall_limited = stopped by capacity, still rising."""
-        wall_limited = False
-        v = int(cur.config["--max-num-seqs"]) * 2
+    def climb(extra, start):
+        """Verify upward (x2) from `start` up to the relevant wall; keep the argmax; stop at the
+        throughput knee (patience consecutive non-improving rungs). Returns (argmax, hit_capacity)
+        where hit_capacity = stopped by OOM/thrash/ceiling rather than a genuine plateau."""
+        ceiling = wall_fp8 if extra.get("--kv-cache-dtype") == "fp8" else wall
+        cur = start
+        stale = 0
+        v = int(start.config["--max-num-seqs"]) * 2
         while v <= ceiling:
             t = T({**extra, "--max-num-seqs": str(v)})
-            if not t.feasible or t.preempt > 0.05:
-                wall_limited = True
-                break
-            if t.score <= cur.score * (1 + eps):
-                break                               # KNEE: throughput plateaued before the wall
-            cur = t
+            if not t.feasible or t.preempt > 0.05:          # OOM or thrash -> capacity wall
+                return cur, True
+            if t.score > cur.score * (1 + eps):
+                cur, stale = t, 0
+            else:
+                if t.score > cur.score:
+                    cur = t                                 # keep the argmax even on a sub-eps gain
+                stale += 1
+                if stale >= patience:
+                    return cur, False                       # genuine throughput knee
             v *= 2
-        else:
-            wall_limited = True                     # hit the predicted ceiling while still improving
-        return cur, wall_limited
+        return cur, (stale == 0)                            # exhausted the wall while still improving
 
-    # CLIMB to the knee within the predicted wall.
-    best, wall_limited = climb({}, best, wall)
+    # CLIMB (auto dtype) to the knee within the predicted wall.
+    best, hit_cap = climb({}, best)
 
-    # fp8 ONLY when capacity (not a plateau) stopped us -> unlock more room and keep climbing.
-    # If throughput had already plateaued, the knee test below rejects the (KV-maxing) fp8 rungs.
-    if wall_limited and wall_fp8 > int(best.config["--max-num-seqs"]):
-        best, _ = climb({"--kv-cache-dtype": "fp8"}, best, wall_fp8)
+    # fp8 ONLY when capacity (OOM/thrash/ceiling-while-rising) stopped us. Anchor fp8 at the SAME
+    # seqs first (apples-to-apples), climb fp8-vs-fp8, and adopt ONLY if it beats the non-fp8 best.
+    if hit_cap and wall_fp8 > int(best.config["--max-num-seqs"]):
+        anchor = T({"--kv-cache-dtype": "fp8", "--max-num-seqs": best.config["--max-num-seqs"]})
+        if _valid(anchor):
+            fp8_best, _ = climb({"--kv-cache-dtype": "fp8"}, anchor)
+            if _valid(fp8_best) and fp8_best.score > best.score * (1 + eps):
+                best = fp8_best
 
     # Secondary knob (token budget) at the winning point — kept only if it clears the eps bar.
     for mnbt in mnbt_candidates:
         t = T({**best.config, "--max-num-batched-tokens": mnbt})
-        if t.feasible and t.score > best.score * (1 + eps):
+        if _valid(t) and t.score > best.score * (1 + eps):
             best = t
 
-    return best, history
+    return (best, history) if _valid(best) else (None, history)
 
 
 def _live_trial(restart_fn, endpoint: str, objective: str):  # pragma: no cover - drives a server
