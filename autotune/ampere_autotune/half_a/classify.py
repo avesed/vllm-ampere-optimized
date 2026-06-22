@@ -39,6 +39,8 @@ class ServerState:
     prefix_hit_rate: Optional[float] = None   # None = prefix caching off / unknown
     mean_prompt_toks: float = 0.0
     qps: float = 0.0
+    max_model_len: Optional[int] = None       # from /v1/models (for the R10 capacity trim)
+    has_mtp_head: Optional[bool] = None        # None = unknown (can't tell from the endpoint)
 
 
 @dataclass
@@ -114,4 +116,41 @@ def classify(s: ServerState, hw: HwSpec, achieved_bw_gbs: Optional[float] = None
             {"--enable-prefix-caching": True},
             reason="shared prefixes (system prompts / few-shot) would be reused"))
 
+    # R6 — the ONLY real DECODE-tok/s lever: spec-decode / MTP (amortizes the weight-byte read
+    # across k accepted tokens). A pointer, not a flag HALF-A owns (needs an MTP head).
+    if eff < 0.6:
+        recs.append(FlagRec(
+            "R6-spec-decode-pointer", INFO,
+            f"single-stream decode is {eff:.0%} of the bandwidth ceiling -> the #1 way past the wall is "
+            f"MTP/speculative decode (one forward -> k tokens). This is the only flag-level lever that moves "
+            f"DECODE tok/s here; flag tuning won't (decode is bandwidth-bound).",
+            {"--speculative-config": "(MTP, if the checkpoint ships an mtp head; Qwen3.5/3.6 do)"},
+            reason="measured +25% (9B) / +52% (27B) at K=2-3; keep mtp.fc bf16 + in the quant ignore"))
+
+    # R7 — TOKEN-BUDGET limited (NOT concurrency-limited): queue with running BELOW the seq cap ->
+    # the per-step batched-token budget is the bottleneck, not max-num-seqs. Moves PREFILL/TTFT.
+    if s.num_waiting > 0 and not saturated and not kv_pressure:
+        recs.append(FlagRec(
+            "R7-batched-token-budget", INFO,
+            f"requests queue ({s.num_waiting:.0f} waiting) while running ({s.num_running:.0f}) is BELOW the "
+            f"seq cap ({s.max_num_seqs}) -> limited by the per-step token budget, not concurrency.",
+            {"--max-num-batched-tokens": 8192},
+            reason="raise the prefill token budget (>=8192 for throughput); lower to 512-1024 if ITL spikes "
+                   "when prefills land. PREFILL/TTFT lever, not steady decode."))
+
+    # R10 — CAPACITY: configured context far exceeds what's used, while KV is pressured -> trim
+    # max-model-len to reclaim per-seq KV reservation -> more concurrency. NOT a per-stream change.
+    if kv_pressure and s.max_model_len and s.max_model_len > 8192:
+        recs.append(FlagRec(
+            "R10-max-model-len-trim", INFO,
+            f"KV pressured ({s.kv_cache_usage:.0%}) and max-model-len is {s.max_model_len} -> if real prompts "
+            f"are far shorter, trimming it reclaims per-seq KV reservation for more concurrency.",
+            {"--max-model-len": "<your true p99 context>"},
+            reason="CAPACITY lever (more concurrent seqs), not a per-stream decode gain"))
+
+    # GUARDRAIL — never emit flags that don't exist / are inert in v0.23 (broken restart command):
+    #   cuda_graph_sizes, max_seq_len_to_capture  -> renamed (cudagraph_capture_sizes / max_cudagraph_capture_size)
+    #   swap_space, num_scheduler_steps           -> removed/inert in V1
+    # cudagraph_capture_sizes / cudagraph_mode / enforce_eager are startup-mem/latency, NOT tok/s, and
+    # need launch-arg/startup-log inspection (no /metrics signal) -> documented + deferred, not emitted here.
     return recs

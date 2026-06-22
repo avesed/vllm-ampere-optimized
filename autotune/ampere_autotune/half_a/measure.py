@@ -38,9 +38,14 @@ def _max(d: Dict[str, List[float]], name: str) -> float:
     return max(vals) if vals else 0.0
 
 
-def model_id(endpoint: str) -> str:  # pragma: no cover - needs a server
+def model_info(endpoint: str) -> Tuple[str, Optional[int]]:  # pragma: no cover - needs a server
     import requests
-    return requests.get(endpoint.rstrip("/") + "/v1/models", timeout=10).json()["data"][0]["id"]
+    d = requests.get(endpoint.rstrip("/") + "/v1/models", timeout=10).json()["data"][0]
+    return d["id"], d.get("max_model_len")
+
+
+def model_id(endpoint: str) -> str:  # pragma: no cover - needs a server
+    return model_info(endpoint)[0]
 
 
 def _one_completion(endpoint: str, mid: str, prompt: str, max_tokens: int) -> int:  # pragma: no cover
@@ -100,7 +105,7 @@ def _burst_and_scrape(endpoint: str, mid: str, concurrency: int, max_tokens: int
 def build_state(endpoint: str, levels=(1, 8, 32), burst_c: int = 48) -> Optional[ServerState]:  # pragma: no cover - needs a server
     """Throughput from a concurrency sweep + load state from an under-load burst -> ServerState."""
     try:
-        mid = model_id(endpoint)
+        mid, max_len = model_info(endpoint)
     except Exception:
         return None
     sweep = concurrency_sweep(endpoint, mid, levels)
@@ -123,6 +128,7 @@ def build_state(endpoint: str, levels=(1, 8, 32), burst_c: int = 48) -> Optional
         prefix_hit_rate=(None if hit < 0 else hit),
         mean_prompt_toks=0.0,
         qps=0.0,
+        max_model_len=max_len,
     )
 
 
