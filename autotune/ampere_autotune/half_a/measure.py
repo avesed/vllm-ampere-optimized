@@ -92,7 +92,8 @@ def _burst_and_scrape(endpoint: str, mid: str, concurrency: int, max_tokens: int
     dt = max(1e-3, time.time() - t0)
     post = scrape_metrics(endpoint)
     peak["preempt_per_s"] = max(0.0, (_sum(post, "vllm:num_preemptions_total") - pre_preempt) / dt)
-    peak["prefix_hit"] = _prefix_hit(post) if _prefix_hit(post) is not None else -1.0
+    ph = _prefix_hit(post)
+    peak["prefix_hit"] = ph if ph is not None else -1.0
     return peak
 
 
