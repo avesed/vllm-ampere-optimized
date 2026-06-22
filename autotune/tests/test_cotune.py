@@ -88,10 +88,16 @@ def test_auto_probe_halves_down_when_seed_ooms():
 
 
 def test_render_curve_shows_per_session_and_tpot():
-    out = render_curve([(1, 85.0, 85.0), (128, 3060.0, 23.9)])
+    out = render_curve([(1, 85.0, 85.0, None), (128, 3060.0, 23.9, None)])
     assert "per-session" in out and "TPOT" in out
     assert "85" in out and "3060" in out and "11.8" in out      # TPOT@85 tok/s ~ 11.8 ms
     assert "SLA" in out                                          # the operating-point guidance
+
+
+def test_render_curve_adds_economics_with_power():
+    out = render_curve([(1, 85.0, 85.0, 250.0), (128, 3060.0, 23.9, 320.0)], cost_per_hr=0.36)
+    assert "J/tok" in out and "$/1M" in out                     # economics columns appear with power
+    assert "0.10" in out                                         # J/tok @128 = 320/3060 ~ 0.105
 
 
 def test_render_lowc_advice_recommends_mtp_keeps_cudagraph_no_sweep():
@@ -99,6 +105,11 @@ def test_render_lowc_advice_recommends_mtp_keeps_cudagraph_no_sweep():
     assert "85" in out and "TPOT" in out
     assert "MTP" in out and "enforce-eager" in out              # opt-in MTP lever + cudagraph guardrail
     assert "auto-sweep" in out.lower() or "opt-in" in out.lower()
+
+
+def test_render_lowc_advice_shows_economics_with_power():
+    out = render_lowc_advice(85.0, 1, power_w=300.0, cost_per_hr=0.36)
+    assert "tok/W" in out and "J/tok" in out                    # single-session energy block
 
 
 def test_parse_sweep():
