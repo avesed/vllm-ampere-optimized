@@ -30,6 +30,37 @@ measure → recommend → **restart** → re-measure (online == canary/blue-gree
 classify/prescribe logic is upstream `jungledesh/profile` (Apache-2.0); a thin wrapper
 lives here as fallback.
 
+### HALF-A rule catalog (what flags it covers, and HONESTLY what each moves)
+
+Measured against a live server: a concurrency sweep (single-stream + batched-aggregate tok/s)
++ an **under-load** /metrics scrape (in-flight burst, not post-idle) + `/v1/models` (max-model-len).
+Honest framing is the feature: on bandwidth-bound Ampere W4A8 decode, **almost nothing beyond
+R1–R5 moves steady-state decode tok/s** — most fine flags move PREFILL/TTFT/CAPACITY/latency.
+
+| Rule | Flag(s) | Moves | Trigger (measured) |
+|---|---|---|---|
+| R0 | — | context | roofline: single-stream/ceiling, batched aggregate, KV/running/waiting |
+| R1 | (client) | — | throughput still rising + low queue → SERVER under-fed |
+| R2 | `--kv-cache-dtype fp8`, lower `--max-num-seqs` | capacity | KV≥88% + preempt/queue |
+| R3 | `--enable-prefix-caching` | TTFT | hit-rate<35% + prompt volume |
+| R4 | `--tensor-parallel-size` | capacity | weight > usable VRAM |
+| R5 | raise `--max-num-seqs` / scale-out | capacity | running==cap + queue + KV headroom |
+| **R6** | `--speculative-config` (MTP) | **DECODE** | single-stream <60% of ceiling → the ONE real decode lever (pointer; needs an MTP head) |
+| **R7** | `--max-num-batched-tokens` | PREFILL/TTFT | queue while running BELOW the seq cap (token-budget-limited, not concurrency) |
+| **R10** | `--max-model-len` | capacity | KV pressured + configured ctx ≫ used |
+
+**The cudagraph ("canvas") answer.** `cuda_graph_sizes` / `max_seq_len_to_capture` **do not exist
+in v0.23** (renamed `cudagraph_capture_sizes` / `max_cudagraph_capture_size`; mode via `-cc` JSON
+`cudagraph_mode`, level via `-O`). The capture-size list is a **startup-time + VRAM + per-bucket
+latency** lever, NOT a throughput knob; the v1 default `FULL_AND_PIECEWISE` is already optimal and
+the engine auto-downgrades to PIECEWISE for hybrid-GDN/mamba + spec-decode. The only genuine
+cudagraph anti-pattern is `enforce_eager` (empties the capture list → costs low-batch decode).
+These need launch-arg/startup-log inspection (no /metrics signal) → **documented + deferred**, not
+emitted. **GUARDRAIL (CI-tested):** classify() must NEVER emit `cuda_graph_sizes`,
+`max_seq_len_to_capture`, `swap_space`, or `num_scheduler_steps` (removed/inert in V1) — a broken
+restart command. `render()` only joins LITERAL flag values into the copy-paste restart line;
+pointer/placeholder values (R6 `(MTP…)`, R10 `<p99 ctx>`) stay in their per-rule `suggest:`.
+
 ## The tier ladder (HALF-B)
 
 | Tier | Lever | Scope |
