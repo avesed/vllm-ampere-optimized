@@ -20,6 +20,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     sel.add_argument("--hw", dest="tier", action="store_const", const="hw",
                      help="HALF-B: GPU silicon tuning (host root, opt-in)")
     p.set_defaults(tier="vllm")
+    p.add_argument("--gpu", default=None,
+                   help="restrict to ONE GPU by index (e.g. 1) or UUID substring; "
+                        "writes/advisory target only it (never the others)")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.add_argument("-v", "--verbose", action="count", default=0)
     p.add_argument("-q", "--quiet", action="store_true")
@@ -73,7 +76,7 @@ def main(argv=None) -> int:
 
     # Preflight ALWAYS runs first.
     write_probe = getattr(args, "write_probe", False)
-    matrix = preflight.collect(write_probe=write_probe)
+    matrix = preflight.collect(write_probe=write_probe, gpu_filter=getattr(args, "gpu", None))
 
     if args.cmd == "preflight":
         _emit(matrix, args.json, preflight.render)
@@ -94,7 +97,7 @@ def main(argv=None) -> int:
         advisory_capable = bool(matrix.gpus) and any(g.advisory_capable for g in matrix.gpus)
         if args.cmd == "tune" and advisory_capable:
             from .half_b import advise
-            return advise.run_advisory(args, matrix)
+            return advise.run_advisory(matrix)
         print("HALF-B REFUSED by preflight (need host root for OC writes). "
               "Run `ampere-autotune preflight --hw` for details:", file=sys.stderr)
         print(preflight.render(matrix), file=sys.stderr)

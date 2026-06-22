@@ -94,7 +94,17 @@ def _decide(s: _sku.SkuResult, t: _tel.TelemetryResult, o: _oc.OcPermResult,
     return half_b, max_tier, refusals, decision
 
 
-def collect(write_probe: bool = False) -> CapabilityMatrix:
+def _gpu_matches(gpu_filter, index: int, uuid) -> bool:
+    """gpu_filter is an index (e.g. '1') or a UUID substring; None = all."""
+    if gpu_filter is None:
+        return True
+    f = str(gpu_filter).strip()
+    if f.isdigit():
+        return int(f) == index
+    return f.lower() in (uuid or "").lower()
+
+
+def collect(write_probe: bool = False, gpu_filter=None) -> CapabilityMatrix:
     with _nvml.Session() as sess:
         if not sess.ok:
             return CapabilityMatrix(
@@ -105,10 +115,12 @@ def collect(write_probe: bool = False) -> CapabilityMatrix:
         gpus: List[GpuCapabilities] = []
         any_read = False
         for i in range(n):
+            d = _ds.probe_driver_state(sess, i)
+            if not _gpu_matches(gpu_filter, i, d.uuid):
+                continue
             s = _sku.probe_sku(sess, i)
             t = _tel.probe_telemetry(sess, i)
             o = _oc.probe_oc_perm(sess, i, write_probe=write_probe)
-            d = _ds.probe_driver_state(sess, i)
             read_ok = (t.nvml_read == _tel.READ_OK)
             any_read = any_read or read_ok
             half_b, max_tier, refusals, decision = _decide(s, t, o, d)

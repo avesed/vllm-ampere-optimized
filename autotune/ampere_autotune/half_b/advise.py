@@ -44,7 +44,7 @@ class Measurements:
     power_limit_w: Optional[float] = None
     core_temp_c: Optional[float] = None
     throttle_reasons: List[str] = field(default_factory=list)
-    golden_ok: bool = True
+    golden_ok: Optional[bool] = None   # None = not checked (e.g. telemetry-only run, no vLLM endpoint)
     mismatch_count: int = 0
     ecc_current: str = "ECC_UNKNOWN"
     bw_flat_across_batch: bool = True           # True => genuinely bandwidth-bound (corroboration)
@@ -140,7 +140,7 @@ def advise(m: Optional[Measurements], sku: SkuInfo, roof: Roofline) -> List[Reco
     recs = []
 
     # --- A-CORRECTNESS: stock baseline. A FAIL suppresses the entire silicon section. ---
-    if not m.golden_ok or m.mismatch_count > 0:
+    if m.golden_ok is False or m.mismatch_count > 0:
         recs.append(Recommendation(
             "A-CORRECTNESS-stock-FAIL", CRITICAL,
             "Output is NOT coherent at STOCK clocks (golden mismatch / bw_verify mismatch>0). "
@@ -148,11 +148,20 @@ def advise(m: Optional[Measurements], sku: SkuInfo, roof: Roofline) -> List[Reco
             "Verify checkpoint sha256 vs source, then RAM/VRAM health (memtest). Re-run after clean.",
             root_needed=False, trigger_fired="golden_fail_or_mismatch"))
         return recs
-    recs.append(Recommendation(
-        "A-CORRECTNESS-stock-baseline", INFO,
-        "Coherent at stock (exact golden token-id match, mismatch_count==0) — this is the reference "
-        "the gated sweep would hold every step against.",
-        "None.", root_needed=False, trigger_fired="stock_clean"))
+    if m.golden_ok is True:
+        recs.append(Recommendation(
+            "A-CORRECTNESS-stock-baseline", INFO,
+            "Coherent at stock (exact golden token-id match, mismatch_count==0) — this is the reference "
+            "the gated sweep would hold every step against.",
+            "None.", root_needed=False, trigger_fired="stock_clean"))
+    else:  # None = not checked (telemetry-only run; no vLLM golden available)
+        recs.append(Recommendation(
+            "A-CORRECTNESS-not-checked", WARN,
+            "Stock correctness NOT verified (no vLLM golden run available). The thermal/power notes "
+            "below stand, but any mem-OC must FIRST establish a clean stock golden — the gated sweep "
+            "does that; do not project a headroom gain until it is confirmed.",
+            "Run on the serving host with the model loaded for the golden + bandwidth analysis.",
+            root_needed=False, trigger_fired="golden_unchecked"))
 
     bw_fraction = None
     if m.achieved_gbs is not None and roof.sku_peak_gbs > 0:
@@ -189,8 +198,9 @@ def advise(m: Optional[Measurements], sku: SkuInfo, roof: Roofline) -> List[Reco
             root_needed=True, trigger_fired="workstation"))
     elif sku.sku_class == _sku.SKU_GEFORCE and sku.mem_type == _sku.MEM_GDDR6X:
         # The only family where mem-OC is real — and the riskiest (no ECC).
-        if not thermally_limited and bw_fraction is not None and 0.5 <= bw_fraction < 0.85 \
-                and sku.offset_support == _sku.OFFSET_SUPPORTED:
+        # Only PROJECT headroom when stock correctness is confirmed clean (golden is True).
+        if not thermally_limited and m.golden_ok is True and bw_fraction is not None \
+                and 0.5 <= bw_fraction < 0.85 and sku.offset_support == _sku.OFFSET_SUPPORTED:
             if m.bw_flat_across_batch:
                 proj_hi = roof.nominal_bw_headroom_pct * roof.subprop_hi
                 toks = f"~{m.decode_toks * (1 + proj_hi / 100):.0f} tok/s" if m.decode_toks else "more tok/s"
@@ -259,13 +269,55 @@ def render(recs: List[Recommendation]) -> str:
 
 # ----- CLI glue (the live measurement is GPU/endpoint-bound; the pure advise() above is tested) -----
 
-def collect_measurements(index: int, endpoint):  # pragma: no cover - GPU+endpoint bound
-    """Gather the no-root advisory signals for GPU `index`: NVML telemetry + bw_verify kernel +
-    a stock golden token-id check + vLLM /metrics. STUB: needs a CUDA GPU + a reachable endpoint."""
-    raise NotImplementedError(
-        f"advisory live measurement for gpu{index} (endpoint={endpoint}) needs a CUDA GPU (bw_verify) "
-        "+ a stock golden run (VLLM_BATCH_INVARIANT=1) + a reachable vLLM /metrics endpoint. "
-        "Run on the serving host.")
+_THROTTLE_BITS = (
+    ("HwThermalSlowdown", "nvmlClocksThrottleReasonHwThermalSlowdown"),
+    ("SwThermalSlowdown", "nvmlClocksThrottleReasonSwThermalSlowdown"),
+    ("HwPowerBrakeSlowdown", "nvmlClocksThrottleReasonHwPowerBrakeSlowdown"),
+    ("SwPowerCap", "nvmlClocksThrottleReasonSwPowerCap"),
+)
+
+
+def collect_measurements(index: int) -> Optional[Measurements]:  # pragma: no cover - needs a GPU
+    """Gather the NO-ROOT advisory signals for GPU `index`.
+
+    Implemented now (no root, no CUDA build): NVML telemetry — power, power-limit, core temp,
+    throttle reasons. NOT yet collected (need the bw_verify CUDA kernel + a running vLLM under
+    VLLM_BATCH_INVARIANT=1 -> left None): achieved_gbs, decode_toks, golden_ok. advise()
+    handles None honestly (golden_ok None = "not checked"; achieved_gbs None = no projection).
+    Returns None if NVML is unavailable.
+    """
+    from ..preflight import _nvml
+    nv = _nvml.nvml()
+    with _nvml.Session() as sess:
+        if not sess.ok:
+            return None
+        h = sess.handle(index)
+        if h is None:
+            return None
+
+        def _v(fn, *a):
+            c = _nvml.call(fn, h, *a)
+            return c.value if c.ok else None
+
+        power = _v("nvmlDeviceGetPowerUsage")                       # milliwatts
+        limit = _v("nvmlDeviceGetEnforcedPowerLimit")
+        if limit is None:
+            limit = _v("nvmlDeviceGetPowerManagementLimit")
+        temp = _v("nvmlDeviceGetTemperature", 0)                    # 0 == NVML_TEMPERATURE_GPU
+        reasons: List[str] = []
+        mask = _v("nvmlDeviceGetCurrentClocksThrottleReasons")
+        if mask is not None and nv is not None:
+            for label, const in _THROTTLE_BITS:
+                bit = getattr(nv, const, 0)
+                if bit and (int(mask) & int(bit)):
+                    reasons.append(label)
+        return Measurements(
+            achieved_gbs=None, decode_toks=None,
+            power_w=(power / 1000.0 if power is not None else None),
+            power_limit_w=(limit / 1000.0 if limit is not None else None),
+            core_temp_c=(float(temp) if temp is not None else None),
+            throttle_reasons=reasons,
+            golden_ok=None, mismatch_count=0)
 
 
 def _peak_gbs(name: Optional[str], mem_type: str) -> float:
@@ -281,24 +333,24 @@ def _peak_gbs(name: Optional[str], mem_type: str) -> float:
     return 936.0
 
 
-def run_advisory(args, matrix) -> int:
+def run_advisory(matrix) -> int:
     """No-root HALF-B entry: per advisory-capable GPU, measure (or fall back to static) + advise."""
     print("ampere-autotune: no OC-write privilege -> HALF-B ADVISORY (recommend-only).\n")
-    endpoint = getattr(args, "endpoint", None)
     any_gpu = False
     for g in matrix.gpus:
         if not getattr(g, "advisory_capable", False):
             continue
         any_gpu = True
         s = g.sku  # dict from preflight.sku.SkuResult
+        uuid = (g.driver_state.get("uuid") or "")[:20]
         skuinfo = SkuInfo(s.get("sku_class", ""), s.get("mem_type", ""), s.get("offset_support", ""))
         roof = Roofline(sku_peak_gbs=_peak_gbs(s.get("name"), skuinfo.mem_type))
         try:
-            m = collect_measurements(g.index, endpoint)
-        except NotImplementedError as e:
-            print(f"GPU {g.index} {s.get('name')}: {e}\n")
+            m = collect_measurements(g.index)   # no-root NVML telemetry (None if unavailable)
+        except Exception as e:                   # never let a telemetry hiccup break the advisory
+            print(f"GPU {g.index} {s.get('name')}: telemetry collect failed ({e}); static guidance only.\n")
             m = None
-        print(f"=== GPU {g.index} {s.get('name')} [{(s.get('uuid') or '')[:16]}] ===")
+        print(f"=== GPU {g.index} {s.get('name')} [{uuid}] ===")
         print(render(advise(m, skuinfo, roof)))
     if not any_gpu:
         print("No advisory-capable GPU (need NVML read access).")
