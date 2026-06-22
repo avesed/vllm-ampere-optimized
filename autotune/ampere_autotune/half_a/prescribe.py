@@ -8,11 +8,26 @@ from __future__ import annotations
 
 from typing import Dict
 
-from .classify import HwSpec, classify, FlagRec
+from .classify import HwSpec, classify, objective_plans, FlagRec
 
 
-def render(recs, endpoint: str) -> str:
+def render(recs, plans, endpoint: str) -> str:
     lines = [f"ampere-autotune — HALF-A vLLM-flag recommender (recommend-only) [{endpoint}]\n"]
+
+    # Lead with the COORDINATED plans: one objective -> the coupled knob set (not a lone knob).
+    if plans:
+        lines.append("== COORDINATED PLANS (multi-variable; knobs couple/gate each other) ==")
+        for p in plans:
+            prim = " ".join(f"{k} {v}" for k, v in p.primary.items()) or "(no single flag)"
+            lines.append(f"\nGOAL: {p.objective}\n  lead: {prim}")
+            for c in p.couple:
+                lines.append(f"  + coupled: {c}")
+            for t in p.tradeoffs:
+                lines.append(f"  ! tradeoff: {t}")
+            if p.ceiling:
+                lines.append(f"  = ceiling: {p.ceiling}")
+        lines.append("\n== signals (per-knob detail) ==")
+
     merged: Dict[str, object] = {}
     for r in recs:
         lines.append(f"[{r.severity}] {r.rule}\n  {r.finding}")
@@ -52,9 +67,13 @@ def run(args, matrix) -> int:
         if "3080" in nm:
             hw.peak_bw_gbs = 760.0
     recs = classify(state, hw)
+    plans = objective_plans(state, hw)
     if getattr(args, "json", False):
         import json
-        print(json.dumps([r.to_dict() if isinstance(r, FlagRec) else r for r in recs], indent=2))
+        print(json.dumps({
+            "plans": [p.to_dict() for p in plans],
+            "signals": [r.to_dict() if isinstance(r, FlagRec) else r for r in recs],
+        }, indent=2))
     else:
-        print(render(recs, endpoint))
+        print(render(recs, plans, endpoint))
     return 0

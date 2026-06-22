@@ -55,6 +55,20 @@ class FlagRec:
         return asdict(self)
 
 
+@dataclass
+class Plan:
+    """An OBJECTIVE-oriented coordinated bundle (vs an isolated single-knob rule). Tuning is
+    multi-variable: one goal couples several knobs that gate/trade off against each other."""
+    objective: str
+    primary: Dict[str, object] = field(default_factory=dict)   # the lead knob(s)
+    couple: List[str] = field(default_factory=list)            # coupled co-adjustments, each with its own gate
+    tradeoffs: List[str] = field(default_factory=list)
+    ceiling: str = ""                                          # honest note: what this can / cannot move
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
 def classify(s: ServerState, hw: HwSpec, achieved_bw_gbs: Optional[float] = None) -> List[FlagRec]:
     """Apply R1-R5. Returns ordered recommendations (recommend-only; flags are SUGGESTIONS)."""
     recs: List[FlagRec] = []
@@ -154,3 +168,71 @@ def classify(s: ServerState, hw: HwSpec, achieved_bw_gbs: Optional[float] = None
     # cudagraph_capture_sizes / cudagraph_mode / enforce_eager are startup-mem/latency, NOT tok/s, and
     # need launch-arg/startup-log inspection (no /metrics signal) -> documented + deferred, not emitted here.
     return recs
+
+
+def objective_plans(s: ServerState, hw: HwSpec, achieved_bw_gbs: Optional[float] = None) -> List[Plan]:
+    """Coordinated, OBJECTIVE-oriented bundles — the multi-variable view a single rule can't give.
+    Each plan names the lead knob AND the knobs it is coupled to (which gate it or trade off)."""
+    plans: List[Plan] = []
+    ceiling = hw.decode_ceiling_tps(achieved_bw_gbs)
+    eff = (s.decode_tps_single / ceiling) if ceiling > 0 else 0.0
+    saturated = s.num_running >= 0.95 * s.max_num_seqs
+    kv_pressure = s.kv_cache_usage >= 0.88 and (s.preempt_per_s > 0.02 or s.num_waiting > 2)
+    kv_room = max(0.0, 1.0 - s.kv_cache_usage)
+
+    # OBJECTIVE: aggregate decode throughput under HIGH CONCURRENCY (the user's example) —
+    # NOT one knob: concurrency cap is gated by KV budget, coupled to cudagraph coverage + ITL.
+    if (saturated or s.num_waiting > 0) and not kv_pressure:
+        plans.append(Plan(
+            objective="aggregate decode throughput @ high concurrency",
+            primary={"--max-num-seqs": int(s.max_num_seqs * 1.5)},
+            couple=[
+                f"KV budget GATES how far you can push it: KV is at {s.kv_cache_usage:.0%} ({kv_room:.0%} free). "
+                f"Each added seq costs KV -> if it climbs toward ~85%, buy room with --kv-cache-dtype fp8 "
+                f"(~2x seqs/byte), --gpu-memory-utilization up, or --max-model-len trim. Don't raise seqs into preemption.",
+                f"cudagraph coverage moves WITH it: the default capture set is min(2*max_num_seqs, 512), so raising "
+                f"seqs grows captures (more VRAM, competes with KV) AND the new top batch must be captured or it falls "
+                f"to eager at high batch = a latency cliff. Watch capture-OOM / startup time.",
+                "ITL is the other half of 'decode speed under load': more concurrent seqs + prefills interleaving "
+                "raises per-token latency. Tune --max-num-batched-tokens (raise for prefill MFU, or lower to protect "
+                "decode ITL) — measure TPOT under load, not just aggregate tok/s.",
+            ],
+            tradeoffs=[
+                "VRAM is split between KV blocks and cudagraph captures — pushing seqs pulls on both.",
+                "Aggregate tok/s up does NOT mean per-stream decode up; high batch can raise each stream's TPOT.",
+            ],
+            ceiling="Raises AGGREGATE throughput (more streams sharing each weight read). Per-stream decode rate is "
+                    "bandwidth-bound and unchanged — only spec-decode/MTP moves that (and it helps LESS at high batch).",
+        ))
+
+    # OBJECTIVE: stop KV thrashing / win capacity — a 4-way decision, not one flag.
+    if kv_pressure:
+        plans.append(Plan(
+            objective="stop KV thrashing (capacity)",
+            primary={"--kv-cache-dtype": "fp8"},
+            couple=[
+                "Four coupled levers, pick by cause: --kv-cache-dtype fp8 (halve KV bytes, ~lossless <=16k), "
+                "--max-model-len trim (if real ctx << configured), --gpu-memory-utilization up (if host RAM/VRAM headroom), "
+                "or --max-num-seqs down (last resort — costs concurrency).",
+                "After buying KV room, RE-CHECK the high-concurrency plan: more KV room may let you RAISE max-num-seqs.",
+            ],
+            tradeoffs=["fp8 KV at >32k ctx can cost a little accuracy; trimming max-model-len caps long prompts."],
+            ceiling="Capacity/anti-preemption — restores throughput lost to thrashing; not a per-stream speedup.",
+        ))
+
+    # OBJECTIVE: per-stream decode speed (TPOT) — bandwidth-bound; flags barely move it.
+    if eff < 0.6:
+        plans.append(Plan(
+            objective="per-stream decode speed (TPOT)",
+            primary={"--speculative-config": "(MTP, if the checkpoint ships an mtp head)"},
+            couple=[
+                "Decode is bandwidth-bound: flag tuning does NOT raise per-stream tok/s. The lever is spec-decode/MTP "
+                "(one forward -> k tokens). Keep cudagraph on (enforce_eager is the anti-pattern) so the draft+verify "
+                "step is graphed; at long ctx, fp8-KV cuts the per-step KV read.",
+            ],
+            tradeoffs=["spec-decode helps single/low-concurrency most; its win shrinks as batch already amortizes weights."],
+            ceiling=f"single-stream is {eff:.0%} of the ~{ceiling:.0f} tok/s bandwidth ceiling; only fewer bytes "
+                    "(int4/fp8) or spec-decode move it, never scheduler flags.",
+        ))
+
+    return plans

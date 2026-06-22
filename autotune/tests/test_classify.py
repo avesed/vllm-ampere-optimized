@@ -1,5 +1,5 @@
 """HALF-A classifier — pure R1-R5, no server/GPU."""
-from ampere_autotune.half_a.classify import ServerState, HwSpec, classify
+from ampere_autotune.half_a.classify import ServerState, HwSpec, classify, objective_plans
 
 HW = HwSpec()  # 3090 / 9B / W4A8
 
@@ -95,6 +95,29 @@ def test_r7_token_budget_limited_not_concurrency():
 def test_r10_max_model_len_trim_under_kv_pressure():
     recs = classify(_base(kv_cache_usage=0.92, preempt_per_s=0.1, num_waiting=5, max_model_len=32768), HW)
     assert "R10-max-model-len-trim" in _rules(recs)
+
+
+def test_high_concurrency_plan_is_multivariable():
+    # the user's case: saturated @ cap with KV headroom -> a COORDINATED plan, not a lone max-num-seqs
+    s = _base(max_num_seqs=32, num_running=32, num_waiting=16, kv_cache_usage=0.25, decode_tps_single=84.0)
+    p = next(x for x in objective_plans(s, HW) if "high concurrency" in x.objective)
+    assert p.primary["--max-num-seqs"] == 48
+    txt = " ".join(p.couple).lower()
+    assert "kv" in txt and "cudagraph" in txt and "max-num-batched-tokens" in txt   # 3+ coupled knobs
+    assert "aggregate" in p.ceiling.lower() and "per-stream" in p.ceiling.lower()   # honest ceiling
+
+
+def test_kv_pressure_plan_is_a_decision_not_one_flag():
+    s = _base(kv_cache_usage=0.92, preempt_per_s=0.1, num_waiting=5)
+    p = next(x for x in objective_plans(s, HW) if "capacity" in x.objective.lower())
+    blob = (str(p.primary) + " ".join(p.couple)).lower()
+    assert "fp8" in blob and "max-model-len" in blob and "gpu-memory-utilization" in blob
+
+
+def test_per_stream_decode_plan_points_to_spec_not_flags():
+    p = next(x for x in objective_plans(_base(decode_tps_single=84.0), HW) if "per-stream" in x.objective)
+    assert "spec" in (str(p.primary) + " ".join(p.couple)).lower()
+    assert "bandwidth" in p.ceiling.lower()
 
 
 def test_no_removed_or_renamed_flags_ever_emitted():
