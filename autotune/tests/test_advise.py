@@ -66,6 +66,14 @@ def test_headroom_uses_decode_toks_when_present():
     assert "vs 87 now" in proj.message and "OR NOTHING" in proj.message
 
 
+def test_headroom_fires_when_offset_support_unknown():
+    # older nvidia-ml-py lacks GetClockOffsets -> offset_support UNKNOWN; a GeForce GDDR6X is still
+    # OC-capable, so headroom must still project (only explicit NOT_SUPPORTED blocks it).
+    gx_unknown = SkuInfo(sku.SKU_GEFORCE, sku.MEM_GDDR6X, sku.OFFSET_UNKNOWN)
+    recs = advise(_clean_decode(golden_ok=True, decode_toks=87.0), gx_unknown, ROOF)
+    assert "A-HEADROOM-mem-oc-projection" in _names(recs)
+
+
 def test_datacenter_no_projection():
     recs = advise(_clean_decode(), DATACENTER, ROOF)
     n = _names(recs)

@@ -214,7 +214,9 @@ def advise(m: Optional[Measurements], sku: SkuInfo, roof: Roofline) -> List[Reco
         # The only family where mem-OC is real — and the riskiest (no ECC).
         # PROJECT headroom only with a CONFIRMED clean stock golden (correctness baseline) +
         # decode is weight-bandwidth-bound on Ampere (established) -> mem-OC raises the ceiling.
-        if not thermally_limited and m.golden_ok is True and sku.offset_support == _sku.OFFSET_SUPPORTED:
+        # offset_support UNKNOWN (older nvidia-ml-py lacks GetClockOffsets) != unsupported — a
+        # GeForce GDDR6X is OC-capable; only an EXPLICIT NOT_SUPPORTED (datacenter) blocks it.
+        if not thermally_limited and m.golden_ok is True and sku.offset_support != _sku.OFFSET_NOT_SUPPORTED:
             proj_hi = roof.nominal_bw_headroom_pct * roof.subprop_hi
             toks = (f" (~{m.decode_toks * (1 + proj_hi / 100):.0f} tok/s vs {m.decode_toks:.0f} now)"
                     if m.decode_toks else "")
