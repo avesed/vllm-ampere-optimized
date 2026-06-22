@@ -318,16 +318,14 @@ def _live_trial(restart_fn, endpoint: str, objective: str):  # pragma: no cover 
     return trial
 
 
-def render_lowc_advice(tps, c: int, power_w=None, cost_per_hr=None) -> str:
+def render_lowc_advice(tps, c: int) -> str:
     """Single/few-session: nothing accuracy-neutral to AUTO-SWEEP (per-stream is bandwidth-bound).
     Measure the running server (no restart) + emit the opt-in levers."""
-    from .economics import fmt
     if tps is None:
         return "single/few-session: endpoint unreachable."
     head = (f"ampere-autotune — single/few-session ({c}-concurrency) throughput = {tps:.0f} tok/s "
             f"(TPOT ~{1000.0 / tps:.1f} ms)" if tps > 0 else "single/few-session: no throughput measured")
-    econ = fmt(tps, power_w, cost_per_hr)
-    return "\n".join([head] + ([f"  {econ}"] if econ else []) + ["",
+    return "\n".join([head, "",
         "Nothing to auto-sweep here: per-stream decode is bandwidth-bound and accuracy-neutral flags don't move it.",
         "Settled (not a tuning dimension): cudagraph stays ON — enforce-eager loses ~3-4x on hybrid-GDN.",
         "EXTRA levers (opt-in, NOT auto-swept — they touch accuracy or the checkpoint):",
@@ -338,39 +336,27 @@ def render_lowc_advice(tps, c: int, power_w=None, cost_per_hr=None) -> str:
 
 
 def batch_curve(endpoint: str, levels, max_tokens: int = 128):  # pragma: no cover - needs a server
-    """Profile the RUNNING server (no restart) across offered concurrency -> per-batch aggregate +
-    per-session tok/s + board power. Shows the throughput<->latency<->energy tradeoff."""
-    rows = measure.curve_with_power(endpoint, tuple(levels), max_tokens)
-    return [(c, agg, (agg / c if c else 0.0), pw) for (c, agg, pw) in rows]
+    """Profile the RUNNING server (no restart) across offered concurrency -> per-batch aggregate AND
+    per-session tok/s. Shows the throughput<->latency tradeoff so you pick the operating batch."""
+    try:
+        mid, _ = measure.model_info(endpoint)
+    except Exception:
+        return []
+    sweep = measure.concurrency_sweep(endpoint, mid, tuple(levels), max_tokens)
+    return [(c, agg, (agg / c if c else 0.0)) for (c, agg) in sweep]
 
 
-def render_curve(rows, cost_per_hr=None) -> str:
-    from .economics import metrics
+def render_curve(rows) -> str:
     if not rows:
         return "batch-curve: endpoint unreachable."
-    have_power = any(len(r) > 3 and r[3] for r in rows)
-    head = "  batch | aggregate tok/s | per-session tok/s | per-session TPOT ms"
-    if have_power:
-        head += " |   W  | J/tok" + (" | $/1M" if cost_per_hr else "")
-    lines = ["ampere-autotune — batch curve: aggregate throughput <-> per-session speed"
-             + (" <-> energy/$" if have_power else "") + "\n", head]
-    for r in rows:
-        c, agg, ps = r[0], r[1], r[2]
-        pw = r[3] if len(r) > 3 else None
+    lines = ["ampere-autotune — batch (concurrency) curve: aggregate throughput <-> per-session speed\n",
+             "  batch | aggregate tok/s | per-session tok/s | per-session TPOT ms"]
+    for c, agg, ps in rows:
         tpot = (1000.0 / ps) if ps > 0 else 0.0
-        line = f"  {c:>5} | {agg:>15.0f} | {ps:>17.0f} | {tpot:>17.1f}"
-        if have_power:
-            m = metrics(agg, pw, cost_per_hr)
-            line += f" | {(pw or 0):>4.0f} | {m.get('j_per_tok', 0):>5.3f}"
-            if cost_per_hr:
-                line += f" | {m.get('usd_per_mtok', 0):>5.2f}"
-        lines.append(line)
-    lines.append("\nPer-session tok/s falls as batch grows (the same weight read is shared by more streams);")
-    lines.append("J/tok (energy/token) usually IMPROVES with batch (the weight read is amortized).")
+        lines.append(f"  {c:>5} | {agg:>15.0f} | {ps:>17.0f} | {tpot:>17.1f}")
+    lines.append("\nPer-session tok/s falls as batch grows (the same weight read is shared by more streams).")
     lines.append("Pick the LARGEST batch whose per-session tok/s still meets your latency SLA -> that is the")
-    lines.append("max-num-seqs that maximizes aggregate throughput / $ within the per-user speed you require.")
-    if not have_power:
-        lines.append("(no NVML power read -> no energy/$ columns; run on the GPU host for J/tok + $/1M.)")
+    lines.append("max-num-seqs that maximizes aggregate throughput within the per-user speed you require.")
     return "\n".join(lines)
 
 
@@ -397,21 +383,16 @@ def run(args) -> int:  # pragma: no cover - drives a server
     endpoint = (getattr(args, "endpoint", None) or "http://localhost:8000").rstrip("/")
     obj = getattr(args, "objective", "throughput")
 
-    cost_per_hr = getattr(args, "cost_per_hour", None)
-
     if getattr(args, "batch_curve", False):         # no restart — profile the running server as-is
         levels = [int(x) for x in str(getattr(args, "levels", "1,2,4,8,16,32,64,128")).split(",") if x.strip()]
         print(f"[cotune] batch curve (no restart) over concurrency {levels}")
-        print("\n" + render_curve(batch_curve(endpoint, levels), cost_per_hr))
+        print("\n" + render_curve(batch_curve(endpoint, levels)))
         return 0
 
     if obj == "latency":                            # single/few-session: measure + recommend, NO restart/sweep
         c = getattr(args, "concurrency", 1)
         print(f"[cotune] single/few-session ({c}-conc): measure + recommend (nothing accuracy-neutral to sweep).")
-        rows = measure.curve_with_power(endpoint, (c,))
-        tps = rows[0][1] if rows else None
-        power = rows[0][2] if rows else None
-        print("\n" + render_lowc_advice(tps, c, power, cost_per_hr))
+        print("\n" + render_lowc_advice(measure.lowc_throughput(endpoint, c=c), c))
         return 0
 
     if not getattr(args, "restart_cmd", None):

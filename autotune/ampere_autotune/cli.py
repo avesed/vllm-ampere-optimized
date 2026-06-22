@@ -61,9 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     ct.add_argument("--objective", default="throughput", choices=["throughput", "latency"],
                     help="throughput=aggregate @ high concurrency; latency=single/few-session max throughput")
     ct.add_argument("--concurrency", type=int, default=1,
-                    help="(--objective latency) sessions to optimize for (1=single, e.g. 4=few)")
-    ct.add_argument("--cost-per-hour", type=float, default=None,
-                    help="GPU(s) $/hour -> adds J/tok + $/1M-tok economics to the output (power via NVML)")
+                    help="(--auto --objective latency) sessions to optimize for (1=single, e.g. 4=few)")
     ct.add_argument("--ready-timeout", type=int, default=600, help="seconds to wait for /health per config")
 
     tune = sub.add_parser("tune", help="HALF-B: characterize a stable clock profile (host root)")

@@ -75,36 +75,6 @@ def concurrency_sweep(endpoint: str, mid: str, levels=(1, 8, 32, 64),
     return results
 
 
-def curve_with_power(endpoint: str, levels, max_tokens: int = 128):  # pragma: no cover - needs a server
-    """Per concurrency level: aggregate tok/s AND board power (W) sampled mid-burst -> [(c, tps, power)].
-    Power enables the economics block (J/tok, tok/W, $/1M)."""
-    from . import economics
-    try:
-        mid, _ = model_info(endpoint)
-    except Exception:
-        return []
-    prompt = "Write a detailed paragraph about the history of computing, then continue at length."
-    try:
-        _one_completion(endpoint, mid, prompt, 8)            # warm-up
-    except Exception:
-        pass
-    rows = []
-    for c in levels:
-        powers = []
-        t0 = time.time()
-        with ThreadPoolExecutor(max_workers=c) as ex:
-            futs = [ex.submit(_one_completion, endpoint, mid, prompt, max_tokens) for _ in range(c)]
-            while any(not f.done() for f in futs) and time.time() - t0 < 120:
-                p = economics.gpu_power_w()
-                if p:
-                    powers.append(p)
-                time.sleep(0.3)
-            toks = [f.result() if not f.exception() else 0 for f in futs]
-        dt = max(1e-3, time.time() - t0)
-        rows.append((c, sum(toks) / dt, (max(powers) if powers else None)))
-    return rows
-
-
 def lowc_throughput(endpoint: str, c: int = 1, max_tokens: int = 128, reps: int = 2) -> Optional[float]:  # pragma: no cover - needs a server
     """Decode tok/s at a fixed LOW concurrency (c=1 single-session, or a few). Median of reps after
     a warm-up. This is the objective for single/few-session max throughput (per-stream regime)."""
