@@ -47,13 +47,6 @@ def test_geforce_headroom_projection_fires_bandwidth_bound():
     assert not _BARE_OFFSET.search(proj.message)   # no apply-ready MHz/Gbps
 
 
-def test_not_bandwidth_bound_downgrades():
-    recs = advise(_clean_decode(achieved_gbs=608.0, bw_flat_across_batch=False), GEFORCE_GDDR6X, ROOF)
-    n = _names(recs)
-    assert "A-HEADROOM-not-bandwidth-bound" in n
-    assert "A-HEADROOM-mem-oc-projection" not in n
-
-
 def test_thermal_suppresses_projection():
     recs = advise(_clean_decode(throttle_reasons=["HwThermalSlowdown"]), GEFORCE_GDDR6X, ROOF)
     n = _names(recs)
@@ -66,11 +59,11 @@ def test_high_core_temp_counts_as_thermal():
     assert "A-THERMAL-throttle-active" in _names(recs)
 
 
-def test_near_knee_low_headroom():
-    recs = advise(_clean_decode(achieved_gbs=880.0), GEFORCE_GDDR6X, ROOF)  # 0.94 of peak
-    n = _names(recs)
-    assert "A-NEAR-KNEE-low-headroom" in n
-    assert "A-HEADROOM-mem-oc-projection" not in n
+def test_headroom_uses_decode_toks_when_present():
+    # option-b: golden clean + decode_toks -> projection cites a real tok/s baseline
+    recs = advise(_clean_decode(golden_ok=True, decode_toks=87.0), GEFORCE_GDDR6X, ROOF)
+    proj = next(r for r in recs if r.name == "A-HEADROOM-mem-oc-projection")
+    assert "vs 87 now" in proj.message and "OR NOTHING" in proj.message
 
 
 def test_datacenter_no_projection():

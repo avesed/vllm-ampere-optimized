@@ -181,10 +181,6 @@ def advise(m: Optional[Measurements], sku: SkuInfo, roof: Roofline) -> List[Reco
             "Get root and run the gated characterize (below) to turn this into a measured decode gain.",
             root_needed=True, trigger_fired="bw_peak_measured"))
 
-    bw_fraction = None
-    if m.achieved_gbs is not None and roof.sku_peak_gbs > 0:
-        bw_fraction = m.achieved_gbs / roof.sku_peak_gbs
-
     thermally_limited = _is_thermally_limited(m)
 
     # --- A-THERMAL: if already throttling, suppress any encouraging projection. ---
@@ -216,36 +212,21 @@ def advise(m: Optional[Measurements], sku: SkuInfo, roof: Roofline) -> List[Reco
             root_needed=True, trigger_fired="workstation"))
     elif sku.sku_class == _sku.SKU_GEFORCE and sku.mem_type == _sku.MEM_GDDR6X:
         # The only family where mem-OC is real — and the riskiest (no ECC).
-        # Only PROJECT headroom when stock correctness is confirmed clean (golden is True).
-        if not thermally_limited and m.golden_ok is True and bw_fraction is not None \
-                and 0.5 <= bw_fraction < 0.85 and sku.offset_support == _sku.OFFSET_SUPPORTED:
-            if m.bw_flat_across_batch:
-                proj_hi = roof.nominal_bw_headroom_pct * roof.subprop_hi
-                toks = f"~{m.decode_toks * (1 + proj_hi / 100):.0f} tok/s" if m.decode_toks else "more tok/s"
-                recs.append(Recommendation(
-                    "A-HEADROOM-mem-oc-projection", INFO,
-                    f"PROJECTION (UPPER-BOUND, UNMEASURED on any 3090): decode is bandwidth-bound at "
-                    f"{bw_fraction:.0%} of peak, so a gated mem-OC could yield UP TO +{proj_hi:.0f}% "
-                    f"decode tok/s ({toks}) — OR NOTHING. Unknowable without actually OCing: the stable "
-                    f"clock ceiling, the EDR-knee position (silicon lottery), and thermal-steady behavior. "
-                    + UNGATED_WARNING,
-                    "Worth characterizing: get root and run the gated sweep (next).",
-                    root_needed=True, trigger_fired="headroom_bandwidth_bound"))
-            else:
-                recs.append(Recommendation(
-                    "A-HEADROOM-not-bandwidth-bound", INFO,
-                    "Bandwidth scales with batch here, so decode may be launch/occupancy-bound rather "
-                    "than purely bandwidth-bound — mem-OC upside is uncertain; prefer the vLLM-flag "
-                    "recommendations first.",
-                    "Apply the vLLM flag recommendations; reconsider mem-OC only if still bandwidth-bound.",
-                    root_needed=False, trigger_fired="not_bw_bound"))
-        elif bw_fraction is not None and bw_fraction >= 0.85:
+        # PROJECT headroom only with a CONFIRMED clean stock golden (correctness baseline) +
+        # decode is weight-bandwidth-bound on Ampere (established) -> mem-OC raises the ceiling.
+        if not thermally_limited and m.golden_ok is True and sku.offset_support == _sku.OFFSET_SUPPORTED:
+            proj_hi = roof.nominal_bw_headroom_pct * roof.subprop_hi
+            toks = (f" (~{m.decode_toks * (1 + proj_hi / 100):.0f} tok/s vs {m.decode_toks:.0f} now)"
+                    if m.decode_toks else "")
             recs.append(Recommendation(
-                "A-NEAR-KNEE-low-headroom", INFO,
-                f"Decode already sits at {bw_fraction:.0%} of the bandwidth roofline — little room "
-                "before the EDR knee; mem-OC headroom is small. Prefer the vLLM-flag recommendations.",
-                "Apply vLLM flags; mem-OC likely not worth the gated sweep.",
-                root_needed=False, trigger_fired="near_knee"))
+                "A-HEADROOM-mem-oc-projection", INFO,
+                f"PROJECTION (UPPER-BOUND, UNMEASURED on any 3090): stock golden is clean and decode is "
+                f"weight-bandwidth-bound on Ampere, so a gated mem-OC could yield UP TO +{proj_hi:.0f}% "
+                f"decode tok/s{toks} — OR NOTHING. Unknowable without actually OCing: the stable clock "
+                f"ceiling, the EDR-knee position (silicon lottery), and thermal-steady behavior. "
+                + UNGATED_WARNING,
+                "Worth characterizing: get root and run the gated sweep (next).",
+                root_needed=True, trigger_fired="headroom_golden_clean"))
         recs.append(Recommendation(
             "A-SKU-geforce-gated-sweep", WARN,
             "GeForce GDDR6X is the only family where mem-OC is real, and the riskiest: NO ECC. The EDR "
@@ -315,13 +296,41 @@ def _run_bw_verify(scope: str, size_gb: float = 2.0, iters: int = 5) -> Tuple[Op
         return None, 0
 
 
-def collect_measurements(index: int, uuid: Optional[str] = None) -> Optional[Measurements]:  # pragma: no cover - needs a GPU
+def _probe_endpoint(endpoint: str, max_tokens: int = 96) -> Tuple[Optional[bool], Optional[float]]:  # pragma: no cover - needs a server
+    """Stock correctness + decode-rate from a running vLLM. Returns (golden_ok, decode_toks).
+
+    golden_ok = a fixed temp=0/seed=0 single-stream completion is byte-identical across two runs
+    (a pragmatic stock baseline; the gated CHARACTERIZE uses VLLM_BATCH_INVARIANT=1 for the strict
+    version). decode_toks ~= completion_tokens / wall (single-stream). (None, None) on any failure."""
+    import time
+    import requests  # in deps
+    base = endpoint.rstrip("/")
+    try:
+        mid = requests.get(base + "/v1/models", timeout=10).json()["data"][0]["id"]
+
+        def gen():
+            t0 = time.time()
+            r = requests.post(base + "/v1/completions", timeout=180, json={
+                "model": mid, "prompt": "List the first 30 prime numbers, comma-separated.",
+                "max_tokens": max_tokens, "temperature": 0.0, "seed": 0})
+            r.raise_for_status()
+            d = r.json()
+            return d["choices"][0]["text"], d.get("usage", {}).get("completion_tokens", max_tokens), time.time() - t0
+
+        t1, n1, dt1 = gen()
+        t2, _, _ = gen()
+        return (t1 == t2), (n1 / dt1 if dt1 > 0 else None)
+    except Exception:
+        return None, None
+
+
+def collect_measurements(index: int, uuid: Optional[str] = None,
+                         endpoint: Optional[str] = None) -> Optional[Measurements]:  # pragma: no cover - needs a GPU
     """Gather the NO-ROOT advisory signals for GPU `index`.
 
-    No root, no vLLM: NVML telemetry (power, power-limit, core temp, throttle) + the bw_verify
-    kernel (peak GB/s + mismatch_count, scoped by UUID). NOT collected here (need a running vLLM
-    under VLLM_BATCH_INVARIANT=1 -> left None): achieved_gbs (DECODE bw), decode_toks, golden_ok.
-    advise() handles None honestly. Returns None if NVML is unavailable.
+    No root: NVML telemetry + the bw_verify kernel (peak GB/s + mismatch, UUID-scoped). If
+    `endpoint` (a running vLLM) is given, also: golden_ok (stock correctness) + decode_toks.
+    advise() handles None fields honestly. Returns None if NVML is unavailable.
     """
     from ..preflight import _nvml
     nv = _nvml.nvml()
@@ -349,13 +358,16 @@ def collect_measurements(index: int, uuid: Optional[str] = None) -> Optional[Mea
                 if bit and (int(mask) & int(bit)):
                     reasons.append(label)
         peak, mm = _run_bw_verify(uuid if uuid else str(index))
+        golden_ok, decode_toks = (None, None)
+        if endpoint:
+            golden_ok, decode_toks = _probe_endpoint(endpoint)
         return Measurements(
-            achieved_gbs=None, peak_gbs=peak, decode_toks=None,
+            achieved_gbs=None, peak_gbs=peak, decode_toks=decode_toks,
             power_w=(power / 1000.0 if power is not None else None),
             power_limit_w=(limit / 1000.0 if limit is not None else None),
             core_temp_c=(float(temp) if temp is not None else None),
             throttle_reasons=reasons,
-            golden_ok=None, mismatch_count=mm)
+            golden_ok=golden_ok, mismatch_count=mm)
 
 
 def _peak_gbs(name: Optional[str], mem_type: str) -> float:
@@ -371,8 +383,9 @@ def _peak_gbs(name: Optional[str], mem_type: str) -> float:
     return 936.0
 
 
-def run_advisory(matrix) -> int:
-    """No-root HALF-B entry: per advisory-capable GPU, measure (or fall back to static) + advise."""
+def run_advisory(matrix, endpoint: Optional[str] = None) -> int:
+    """No-root HALF-B entry: per advisory-capable GPU, measure (or fall back to static) + advise.
+    `endpoint` (a running vLLM) unlocks the stock golden + decode-tok/s -> real headroom projection."""
     print("ampere-autotune: no OC-write privilege -> HALF-B ADVISORY (recommend-only).\n")
     any_gpu = False
     for g in matrix.gpus:
@@ -384,8 +397,9 @@ def run_advisory(matrix) -> int:
         skuinfo = SkuInfo(s.get("sku_class", ""), s.get("mem_type", ""), s.get("offset_support", ""))
         roof = Roofline(sku_peak_gbs=_peak_gbs(s.get("name"), skuinfo.mem_type))
         try:
-            # bw_verify scoped by full UUID (CUDA_VISIBLE_DEVICES); NVML telemetry by index
-            m = collect_measurements(g.index, uuid=full_uuid or None)
+            # bw_verify scoped by full UUID (CUDA_VISIBLE_DEVICES); NVML telemetry by index;
+            # endpoint (if given) adds the stock golden + decode-tok/s
+            m = collect_measurements(g.index, uuid=full_uuid or None, endpoint=endpoint)
         except Exception as e:                   # never let a telemetry hiccup break the advisory
             print(f"GPU {g.index} {s.get('name')}: telemetry collect failed ({e}); static guidance only.\n")
             m = None

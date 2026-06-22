@@ -49,6 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
     tune.add_argument("--dry-run", action="store_true",
                       help="MANDATORY before any real --hw write")
     tune.add_argument("--profile", help="per-GPU profile path (default ~/.config/ampere-autotune/<uuid>.json)")
+    tune.add_argument("--endpoint", default=None,
+                      help="running vLLM base URL; the no-root advisory uses it for the stock "
+                           "golden + decode-tok/s (-> real headroom projection)")
 
     mon = sub.add_parser("monitor", help="HALF-B: monitor-only watchdog (revert/derate only)")
     _add_common(mon)
@@ -97,7 +100,7 @@ def main(argv=None) -> int:
         advisory_capable = bool(matrix.gpus) and any(g.advisory_capable for g in matrix.gpus)
         if args.cmd == "tune" and advisory_capable:
             from .half_b import advise
-            return advise.run_advisory(matrix)
+            return advise.run_advisory(matrix, endpoint=getattr(args, "endpoint", None))
         print("HALF-B REFUSED by preflight (need host root for OC writes). "
               "Run `ampere-autotune preflight --hw` for details:", file=sys.stderr)
         print(preflight.render(matrix), file=sys.stderr)
