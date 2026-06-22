@@ -3,7 +3,7 @@ import pytest
 
 from ampere_autotune.half_a.cotune import (
     parse_sweep, expand_grid, config_flags, score, render, make_restart_fn, SweepPoint,
-    auto_tune, auto_tune_lowc, Trial,
+    auto_tune, auto_tune_lowc, render_curve, Trial,
 )
 
 
@@ -98,6 +98,13 @@ def test_auto_lowc_picks_cudagraph_over_enforce_eager():
     best, hist = auto_tune_lowc(fake, log=_quiet)
     assert best.score == 85.0 and "--enforce-eager" not in best.config
     assert len(hist) == 2                                       # 2 configs only — no max-num-seqs climb
+
+
+def test_render_curve_shows_per_session_and_tpot():
+    out = render_curve([(1, 85.0, 85.0), (128, 3060.0, 23.9)])
+    assert "per-session" in out and "TPOT" in out
+    assert "85" in out and "3060" in out and "11.8" in out      # TPOT@85 tok/s ~ 11.8 ms
+    assert "SLA" in out                                          # the operating-point guidance
 
 
 def test_auto_lowc_none_when_server_wont_come_up():

@@ -355,6 +355,31 @@ def render_lowc(best: Optional[Trial], history: List[Trial], c: int) -> str:
     return "\n".join(lines)
 
 
+def batch_curve(endpoint: str, levels, max_tokens: int = 128):  # pragma: no cover - needs a server
+    """Profile the RUNNING server (no restart) across offered concurrency -> per-batch aggregate AND
+    per-session tok/s. Shows the throughput<->latency tradeoff so you pick the operating batch."""
+    try:
+        mid, _ = measure.model_info(endpoint)
+    except Exception:
+        return []
+    sweep = measure.concurrency_sweep(endpoint, mid, tuple(levels), max_tokens)
+    return [(c, agg, (agg / c if c else 0.0)) for (c, agg) in sweep]
+
+
+def render_curve(rows) -> str:
+    if not rows:
+        return "batch-curve: endpoint unreachable."
+    lines = ["ampere-autotune — batch (concurrency) curve: aggregate throughput <-> per-session speed\n",
+             "  batch | aggregate tok/s | per-session tok/s | per-session TPOT ms"]
+    for c, agg, ps in rows:
+        tpot = (1000.0 / ps) if ps > 0 else 0.0
+        lines.append(f"  {c:>5} | {agg:>15.0f} | {ps:>17.0f} | {tpot:>17.1f}")
+    lines.append("\nPer-session tok/s falls as batch grows (the same weight read is shared by more streams).")
+    lines.append("Pick the LARGEST batch whose per-session tok/s still meets your latency SLA -> that is the")
+    lines.append("max-num-seqs that maximizes aggregate throughput within the per-user speed you require.")
+    return "\n".join(lines)
+
+
 def render_auto(best: Optional[Trial], history: List[Trial], objective: str) -> str:
     lines = [f"ampere-autotune — HALF-A AUTO-tune (adaptive search), objective={objective}\n",
              "search path:"]
@@ -373,6 +398,16 @@ def render_auto(best: Optional[Trial], history: List[Trial], objective: str) -> 
 def run(args) -> int:  # pragma: no cover - drives a server
     endpoint = (getattr(args, "endpoint", None) or "http://localhost:8000").rstrip("/")
     obj = getattr(args, "objective", "throughput")
+
+    if getattr(args, "batch_curve", False):         # no restart — profile the running server as-is
+        levels = [int(x) for x in str(getattr(args, "levels", "1,2,4,8,16,32,64,128")).split(",") if x.strip()]
+        print(f"[cotune] batch curve (no restart) over concurrency {levels}")
+        print("\n" + render_curve(batch_curve(endpoint, levels)))
+        return 0
+
+    if not getattr(args, "restart_cmd", None):
+        print("[cotune] --sweep/--auto need --restart-cmd \"...{flags}...\" (or use --batch-curve, no restart).")
+        return 2
     restart = make_restart_fn(args.restart_cmd, endpoint, getattr(args, "ready_timeout", 600))
 
     if getattr(args, "auto", False):

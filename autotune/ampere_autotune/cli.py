@@ -45,8 +45,13 @@ def build_parser() -> argparse.ArgumentParser:
     ct = sub.add_parser("cotune", help="HALF-A: MEASURED co-tuning sweep (restart per config, find best)")
     _add_common(ct)
     ct.add_argument("--endpoint", default="http://localhost:8000", help="vLLM base URL")
-    ct.add_argument("--restart-cmd", required=True,
-                    help="shell template that (re)launches the server; MUST contain {flags}")
+    ct.add_argument("--restart-cmd", default=None,
+                    help="shell template that (re)launches the server; MUST contain {flags} "
+                         "(required for --sweep/--auto; not needed for --batch-curve)")
+    ct.add_argument("--batch-curve", action="store_true",
+                    help="profile the RUNNING server across concurrency (NO restart): aggregate + "
+                         "per-session tok/s + TPOT per batch -> pick the operating batch")
+    ct.add_argument("--levels", default="1,2,4,8,16,32,64,128", help="(--batch-curve) concurrency levels")
     ct.add_argument("--sweep", default=None,
                     help='MANUAL grid, e.g. "--max-num-seqs=32,64,96;--kv-cache-dtype=auto,fp8"')
     ct.add_argument("--auto", action="store_true",
