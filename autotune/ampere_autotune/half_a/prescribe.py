@@ -21,7 +21,12 @@ def render(recs, endpoint: str) -> str:
         if r.reason:
             lines.append(f"  why: {r.reason}")
         lines.append("")
-        merged.update(r.flags)
+        # Only LITERAL flag values join the copy-paste restart command; pointer/placeholder
+        # values (e.g. "(MTP if...)", "<your true p99 context>") stay in their per-rule suggest only.
+        for k, v in r.flags.items():
+            sv = str(v)
+            if "(" not in sv and "<" not in sv and " " not in sv:
+                merged[k] = v
     if merged:
         flagstr = " ".join(f"{k} {v}" for k, v in merged.items())
         lines.append("To apply (engine flags are startup-baked -> RESTART the server, drained):")
