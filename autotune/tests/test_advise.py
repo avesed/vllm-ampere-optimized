@@ -139,6 +139,22 @@ def test_headroom_needs_clean_golden():
     assert "A-HEADROOM-mem-oc-projection" not in _names(advise(m, GEFORCE_GDDR6X, ROOF))
 
 
+def test_bw_peak_measured_rec():
+    # bw_verify peak + integrity (no root, no vLLM): real peak-BW rec, % of spec, no bare offset
+    m = Measurements(golden_ok=None, peak_gbs=768.0, mismatch_count=0,
+                     power_w=300.0, power_limit_w=350.0, core_temp_c=60.0)
+    r = next(x for x in advise(m, GEFORCE_GDDR6X, ROOF) if x.name == "A-BW-PEAK-measured")
+    assert "82%" in r.message and "768 GB/s" in r.message     # 768/936 ≈ 82%
+    assert "sub-proportional" in r.message and "gated sweep" in r.message
+    assert not _BARE_OFFSET.search(r.message)
+
+
+def test_bw_verify_mismatch_at_stock_is_fail():
+    # bw_verify mismatch>0 at stock = silent VRAM corruption -> suppress silicon section
+    recs = advise(Measurements(golden_ok=None, peak_gbs=768.0, mismatch_count=5), GEFORCE_GDDR6X, ROOF)
+    assert _names(recs) == {"A-CORRECTNESS-stock-FAIL"}
+
+
 def test_bare_offset_regex_catches_real_offsets():
     # guard the guard: the regex must actually catch the things we forbid
     assert _BARE_OFFSET.search("set +1000 MHz")

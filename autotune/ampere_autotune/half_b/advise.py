@@ -16,9 +16,13 @@ SAFETY (load-bearing, from the adversarial review):
 """
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
 from dataclasses import dataclass, field, asdict
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 from ..preflight import sku as _sku
 
@@ -37,7 +41,8 @@ _BARE_OFFSET = re.compile(r"[+-]?\d+\s*(MHz|Gbps|MT/s)", re.IGNORECASE)
 
 @dataclass
 class Measurements:
-    achieved_gbs: Optional[float] = None       # bw_verify under a decode workload
+    achieved_gbs: Optional[float] = None       # DECODE achieved bandwidth (needs /metrics; how bw-bound decode is)
+    peak_gbs: Optional[float] = None           # bw_verify saturating PEAK GB/s (real achievable roofline, no root)
     decode_toks: Optional[float] = None        # 1000/TPOT from vLLM /metrics
     prefill_toks: Optional[float] = None
     power_w: Optional[float] = None
@@ -163,6 +168,19 @@ def advise(m: Optional[Measurements], sku: SkuInfo, roof: Roofline) -> List[Reco
             "Run on the serving host with the model loaded for the golden + bandwidth analysis.",
             root_needed=False, trigger_fired="golden_unchecked"))
 
+    # --- A-BW-PEAK: real measured peak bandwidth + VRAM integrity (bw_verify, no root). ---
+    if m.peak_gbs is not None and roof.sku_peak_gbs > 0:
+        pct = m.peak_gbs / roof.sku_peak_gbs
+        recs.append(Recommendation(
+            "A-BW-PEAK-measured", INFO,
+            f"Measured peak bandwidth {m.peak_gbs:.0f} GB/s = {pct:.0%} of the {roof.sku_peak_gbs:.0f} GB/s "
+            f"spec roofline; VRAM integrity clean (mismatch_count==0). Decode is weight-bandwidth-bound on "
+            f"Ampere, so raising the mem clock raises this ceiling — a gated mem-OC is worth characterizing "
+            f"(the sweep also establishes the golden baseline). The realized decode gain is sub-proportional "
+            f"and unmeasured; it is confirmed only by the gated sweep, never by this peak number.",
+            "Get root and run the gated characterize (below) to turn this into a measured decode gain.",
+            root_needed=True, trigger_fired="bw_peak_measured"))
+
     bw_fraction = None
     if m.achieved_gbs is not None and roof.sku_peak_gbs > 0:
         bw_fraction = m.achieved_gbs / roof.sku_peak_gbs
@@ -277,14 +295,33 @@ _THROTTLE_BITS = (
 )
 
 
-def collect_measurements(index: int) -> Optional[Measurements]:  # pragma: no cover - needs a GPU
+_BW_VERIFY_BIN = Path(__file__).resolve().parents[2] / "instruments" / "bw_verify" / "bw_verify"
+
+
+def _run_bw_verify(scope: str, size_gb: float = 2.0, iters: int = 5) -> Tuple[Optional[float], int]:  # pragma: no cover - needs a GPU
+    """Run the compiled bw_verify kernel scoped to one GPU (CUDA_VISIBLE_DEVICES=scope, a UUID or
+    index). Returns (peak_read_GB_s, mismatch_count). (None, 0) if the binary is absent or fails."""
+    if not _BW_VERIFY_BIN.exists():
+        return None, 0
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(scope))
+    try:
+        out = subprocess.run([str(_BW_VERIFY_BIN), str(size_gb), str(iters)],
+                             capture_output=True, text=True, timeout=120, env=env)
+        data = json.loads(out.stdout.strip().splitlines()[-1])
+        if "error" in data:
+            return None, 0
+        return float(data["read_GB_s"]), int(data.get("mismatch_count", 0))
+    except (subprocess.SubprocessError, ValueError, KeyError, IndexError, OSError):
+        return None, 0
+
+
+def collect_measurements(index: int, uuid: Optional[str] = None) -> Optional[Measurements]:  # pragma: no cover - needs a GPU
     """Gather the NO-ROOT advisory signals for GPU `index`.
 
-    Implemented now (no root, no CUDA build): NVML telemetry — power, power-limit, core temp,
-    throttle reasons. NOT yet collected (need the bw_verify CUDA kernel + a running vLLM under
-    VLLM_BATCH_INVARIANT=1 -> left None): achieved_gbs, decode_toks, golden_ok. advise()
-    handles None honestly (golden_ok None = "not checked"; achieved_gbs None = no projection).
-    Returns None if NVML is unavailable.
+    No root, no vLLM: NVML telemetry (power, power-limit, core temp, throttle) + the bw_verify
+    kernel (peak GB/s + mismatch_count, scoped by UUID). NOT collected here (need a running vLLM
+    under VLLM_BATCH_INVARIANT=1 -> left None): achieved_gbs (DECODE bw), decode_toks, golden_ok.
+    advise() handles None honestly. Returns None if NVML is unavailable.
     """
     from ..preflight import _nvml
     nv = _nvml.nvml()
@@ -311,13 +348,14 @@ def collect_measurements(index: int) -> Optional[Measurements]:  # pragma: no co
                 bit = getattr(nv, const, 0)
                 if bit and (int(mask) & int(bit)):
                     reasons.append(label)
+        peak, mm = _run_bw_verify(uuid if uuid else str(index))
         return Measurements(
-            achieved_gbs=None, decode_toks=None,
+            achieved_gbs=None, peak_gbs=peak, decode_toks=None,
             power_w=(power / 1000.0 if power is not None else None),
             power_limit_w=(limit / 1000.0 if limit is not None else None),
             core_temp_c=(float(temp) if temp is not None else None),
             throttle_reasons=reasons,
-            golden_ok=None, mismatch_count=0)
+            golden_ok=None, mismatch_count=mm)
 
 
 def _peak_gbs(name: Optional[str], mem_type: str) -> float:
@@ -342,15 +380,16 @@ def run_advisory(matrix) -> int:
             continue
         any_gpu = True
         s = g.sku  # dict from preflight.sku.SkuResult
-        uuid = (g.driver_state.get("uuid") or "")[:20]
+        full_uuid = g.driver_state.get("uuid") or ""
         skuinfo = SkuInfo(s.get("sku_class", ""), s.get("mem_type", ""), s.get("offset_support", ""))
         roof = Roofline(sku_peak_gbs=_peak_gbs(s.get("name"), skuinfo.mem_type))
         try:
-            m = collect_measurements(g.index)   # no-root NVML telemetry (None if unavailable)
+            # bw_verify scoped by full UUID (CUDA_VISIBLE_DEVICES); NVML telemetry by index
+            m = collect_measurements(g.index, uuid=full_uuid or None)
         except Exception as e:                   # never let a telemetry hiccup break the advisory
             print(f"GPU {g.index} {s.get('name')}: telemetry collect failed ({e}); static guidance only.\n")
             m = None
-        print(f"=== GPU {g.index} {s.get('name')} [{uuid}] ===")
+        print(f"=== GPU {g.index} {s.get('name')} [{full_uuid[:20]}] ===")
         print(render(advise(m, skuinfo, roof)))
     if not any_gpu:
         print("No advisory-capable GPU (need NVML read access).")
