@@ -3,8 +3,15 @@ import pytest
 
 from ampere_autotune.half_a.cotune import (
     parse_sweep, expand_grid, config_flags, score, render, make_restart_fn, SweepPoint,
-    auto_tune, auto_tune_lowc, render_curve, Trial,
+    auto_tune, auto_tune_lowc, render_curve, banned_in, Trial,
 )
+
+
+def test_banned_flags_detected_with_replacements():
+    bad = banned_in({"--max-num-seqs": ["64"], "--swap-space": ["4"], "--num-scheduler-steps": ["8"],
+                     "--cuda-graph-sizes": ["1,2"]})
+    assert set(bad) == {"--swap-space", "--num-scheduler-steps", "--cuda-graph-sizes"}   # not max-num-seqs
+    assert bad["--cuda-graph-sizes"] == "--cudagraph-capture-sizes"                       # points to the real name
 
 
 def _quiet(*a, **k):

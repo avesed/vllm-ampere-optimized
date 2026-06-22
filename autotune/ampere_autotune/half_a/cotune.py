@@ -21,6 +21,23 @@ _DEFAULTY = {"auto", "default", "", "-", "false", "off", "no", "0"}
 # values meaning "enable this store_true toggle" -> emit the bare flag (no value)
 _TRUEY = {"true", "on", "yes", "1"}
 
+# Flags that DO NOT EXIST / are inert in vLLM v0.23 (verified against source, see autotune/PARAMS.md)
+# -> emitting any of these makes a BROKEN restart command. Maps the bad flag to its replacement.
+BANNED_FLAGS = {
+    "--cuda-graph-sizes": "--cudagraph-capture-sizes",
+    "--max-seq-len-to-capture": "--max-cudagraph-capture-size",
+    "--swap-space": "--kv-offloading-size",
+    "--num-scheduler-steps": "(removed in V1 — single-step only)",
+    "--num-lookahead-slots": "(removed in V1)",
+    "--preemption-mode": "(removed in V1 — recompute only)",
+    "--max-parallel-loading-workers": "(inert in V1 — ignored)",
+}
+
+
+def banned_in(flags) -> Dict[str, str]:
+    """Subset of `flags` that are removed/renamed/inert in v0.23 -> {bad: replacement}."""
+    return {f: BANNED_FLAGS[f] for f in flags if f in BANNED_FLAGS}
+
 
 @dataclass
 class SweepPoint:
@@ -427,7 +444,13 @@ def run(args) -> int:  # pragma: no cover - drives a server
     if not getattr(args, "sweep", None):
         print("[cotune] need --sweep <grid> (manual) or --auto (adaptive search).")
         return 2
-    grid = expand_grid(parse_sweep(args.sweep))
+    spec = parse_sweep(args.sweep)
+    bad = banned_in(spec)
+    if bad:                                          # refuse a sweep that would build a broken restart
+        for f, repl in bad.items():
+            print(f"[cotune] REFUSED: {f} does not exist / is inert in vLLM v0.23 -> use {repl} (see autotune/PARAMS.md)")
+        return 2
+    grid = expand_grid(spec)
     print(f"[cotune] grid = {len(grid)} configs; each restarts the server (~minutes). objective={obj}")
     points = run_sweep(grid, restart, endpoint, obj)
     print("\n" + render(points, obj))
