@@ -53,7 +53,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="ADAPTIVE search instead of a manual grid (picks knobs/values itself)")
     ct.add_argument("--seed", type=int, default=32, help="(--auto) starting max-num-seqs")
     ct.add_argument("--seqs-ceiling", type=int, default=256, help="(--auto) max max-num-seqs to probe")
-    ct.add_argument("--objective", default="throughput", choices=["throughput", "latency"])
+    ct.add_argument("--objective", default="throughput", choices=["throughput", "latency"],
+                    help="throughput=aggregate @ high concurrency; latency=single/few-session max throughput")
+    ct.add_argument("--concurrency", type=int, default=1,
+                    help="(--auto --objective latency) sessions to optimize for (1=single, e.g. 4=few)")
     ct.add_argument("--ready-timeout", type=int, default=600, help="seconds to wait for /health per config")
 
     tune = sub.add_parser("tune", help="HALF-B: characterize a stable clock profile (host root)")

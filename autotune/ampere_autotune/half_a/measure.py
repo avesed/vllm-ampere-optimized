@@ -75,6 +75,20 @@ def concurrency_sweep(endpoint: str, mid: str, levels=(1, 8, 32, 64),
     return results
 
 
+def lowc_throughput(endpoint: str, c: int = 1, max_tokens: int = 128, reps: int = 2) -> Optional[float]:  # pragma: no cover - needs a server
+    """Decode tok/s at a fixed LOW concurrency (c=1 single-session, or a few). Median of reps after
+    a warm-up. This is the objective for single/few-session max throughput (per-stream regime)."""
+    try:
+        mid, _ = model_info(endpoint)
+    except Exception:
+        return None
+    vals = [sw[0][1] for sw in (concurrency_sweep(endpoint, mid, (c,), max_tokens) for _ in range(reps)) if sw]
+    if not vals:
+        return None
+    vals.sort()
+    return vals[len(vals) // 2]
+
+
 def _burst_and_scrape(endpoint: str, mid: str, concurrency: int, max_tokens: int = 256,
                       poll_s: float = 8.0) -> Dict[str, float]:  # pragma: no cover - needs a server
     """Hold `concurrency` long generations IN FLIGHT and scrape /metrics WHILE they run (not after),

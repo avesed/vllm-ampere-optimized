@@ -299,6 +299,62 @@ def _live_trial(restart_fn, endpoint: str, objective: str):  # pragma: no cover 
     return trial
 
 
+def auto_tune_lowc(trial_fn: Callable[[Dict[str, str]], Trial], log=print):
+    """Single/few-session MAX THROUGHPUT (per-stream regime). max-num-seqs / kv-dtype / max-model-len
+    are IRRELEVANT here (the batch is load-determined, not flag-determined), so we do NOT climb them.
+    The only flag lever is cudagraph (must stay ON) -> verify on vs enforce-eager and pick the winner;
+    spec-decode/MTP is the real per-stream lever (a checkpoint feature, reported as a pointer)."""
+    history: List[Trial] = []
+
+    def T(cfg):
+        t = trial_fn(cfg)
+        history.append(t)
+        log(f"  try {config_flags(cfg) or '(default: cudagraph on)'} -> {t.score:.0f} tok/s"
+            f"{'' if t.feasible else ' (' + t.note + ')'}")
+        return t
+
+    base = T({})                                    # cudagraph on (default)
+    eager = T({"--enforce-eager": "true"})          # cudagraph off
+    cands = [t for t in (base, eager) if _valid(t)]
+    if not cands:
+        return None, history
+    return max(cands, key=lambda t: t.score), history
+
+
+def _live_trial_lowc(restart_fn, endpoint: str, c: int):  # pragma: no cover - drives a server
+    def trial(cfg: Dict[str, str]) -> Trial:
+        try:
+            up = restart_fn(cfg)
+        except Exception as e:
+            return Trial(cfg, float("-inf"), False, note=f"restart error: {e}")
+        if not up:
+            return Trial(cfg, float("-inf"), False, note="not ready (OOM?)")
+        tps = measure.lowc_throughput(endpoint, c=c)
+        if tps is None:
+            return Trial(cfg, float("-inf"), False, note="measure failed")
+        return Trial(cfg, tps, True, 0.0, 0.0)
+    return trial
+
+
+def render_lowc(best: Optional[Trial], history: List[Trial], c: int) -> str:
+    lines = [f"ampere-autotune — single/few-session ({c}-concurrency) MAX THROUGHPUT (per-stream regime)\n",
+             "measured:"]
+    for t in history:
+        lines.append(f"  {config_flags(t.config) or 'cudagraph on (default)'} -> "
+                     + (f"{t.score:.0f} tok/s" if t.feasible else t.note))
+    on = next((t for t in history if "--enforce-eager" not in t.config and _valid(t)), None)
+    off = next((t for t in history if t.config.get("--enforce-eager") == "true" and _valid(t)), None)
+    if on and off and off.score > 0:
+        lines.append(f"\ncudagraph is worth ~{(on.score / off.score - 1) * 100:.0f}% here "
+                     f"(on {on.score:.0f} vs enforce-eager {off.score:.0f} tok/s) -> NEVER enforce-eager.")
+    lines.append("max-num-seqs / kv-cache-dtype / max-model-len do NOT change per-stream speed (capacity knobs).")
+    lines.append("The real lever beyond flags is spec-decode / MTP (one forward -> k tokens) if the "
+                 "checkpoint ships an mtp head (Qwen3.5/3.6 do).")
+    if best:
+        lines.append(f"\nBEST: {config_flags(best.config) or 'defaults (cudagraph on)'} -> {best.score:.0f} tok/s @ {c}-conc.")
+    return "\n".join(lines)
+
+
 def render_auto(best: Optional[Trial], history: List[Trial], objective: str) -> str:
     lines = [f"ampere-autotune — HALF-A AUTO-tune (adaptive search), objective={objective}\n",
              "search path:"]
@@ -320,6 +376,12 @@ def run(args) -> int:  # pragma: no cover - drives a server
     restart = make_restart_fn(args.restart_cmd, endpoint, getattr(args, "ready_timeout", 600))
 
     if getattr(args, "auto", False):
+        if obj == "latency":                        # single/few-session max throughput (per-stream)
+            c = getattr(args, "concurrency", 1)
+            print(f"[cotune] AUTO single/few-session ({c}-conc) max throughput; lever = cudagraph (+ spec-decode pointer).")
+            best, history = auto_tune_lowc(_live_trial_lowc(restart, endpoint, c))
+            print("\n" + render_lowc(best, history, c))
+            return 0
         print(f"[cotune] AUTO adaptive search (no manual grid). objective={obj}")
         best, history = auto_tune(_live_trial(restart, endpoint, obj),
                                   seed_seqs=getattr(args, "seed", 32),

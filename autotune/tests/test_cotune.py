@@ -3,7 +3,7 @@ import pytest
 
 from ampere_autotune.half_a.cotune import (
     parse_sweep, expand_grid, config_flags, score, render, make_restart_fn, SweepPoint,
-    auto_tune, Trial,
+    auto_tune, auto_tune_lowc, Trial,
 )
 
 
@@ -88,6 +88,21 @@ def test_auto_patience_passes_a_noisy_flat_rung():
 
     best, hist = auto_tune(fake, seed_seqs=32, seqs_ceiling=512, log=_quiet)
     assert best.config["--max-num-seqs"] == "512"
+
+
+def test_auto_lowc_picks_cudagraph_over_enforce_eager():
+    # single-session: only cudagraph matters; pick it over enforce-eager (the 9B 85 vs 22 reality)
+    def fake(cfg):
+        eager = cfg.get("--enforce-eager") == "true"
+        return Trial(cfg, 22.0 if eager else 85.0, True, 0.0, 0.0)
+    best, hist = auto_tune_lowc(fake, log=_quiet)
+    assert best.score == 85.0 and "--enforce-eager" not in best.config
+    assert len(hist) == 2                                       # 2 configs only — no max-num-seqs climb
+
+
+def test_auto_lowc_none_when_server_wont_come_up():
+    best, hist = auto_tune_lowc(lambda cfg: Trial(cfg, float("-inf"), False, note="OOM"), log=_quiet)
+    assert best is None
 
 
 def test_auto_probe_halves_down_when_seed_ooms():
