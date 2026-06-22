@@ -56,17 +56,21 @@ class FlagRec:
 def classify(s: ServerState, hw: HwSpec, achieved_bw_gbs: Optional[float] = None) -> List[FlagRec]:
     """Apply R1-R5. Returns ordered recommendations (recommend-only; flags are SUGGESTIONS)."""
     recs: List[FlagRec] = []
+    # SINGLE-STREAM decode ceiling = bandwidth / weight-bytes (1 token reads all weights once).
+    # Batched aggregate tok/s legitimately EXCEEDS this (the weight read is amortized across the
+    # batch), so efficiency is single-stream/ceiling — NOT batch-peak/ceiling.
     ceiling = hw.decode_ceiling_tps(achieved_bw_gbs)
-    eff = (s.decode_tps_max_c / ceiling) if ceiling > 0 else 0.0
+    eff = (s.decode_tps_single / ceiling) if ceiling > 0 else 0.0
     saturated = (s.num_running >= 0.95 * s.max_num_seqs)
     queue_ratio = (s.num_waiting / s.max_num_seqs) if s.max_num_seqs else 0.0
 
     # context: roofline placement (not a rule; informs the others)
     recs.append(FlagRec(
         "R0-roofline", INFO,
-        f"decode ceiling ~{ceiling:.0f} tok/s (bandwidth-bound); single-stream {s.decode_tps_single:.0f}, "
-        f"batch-peak {s.decode_tps_max_c:.0f} tok/s = {eff:.0%} of ceiling. KV peak {s.kv_cache_usage:.0%}, "
-        f"running {s.num_running:.0f}/{s.max_num_seqs}, waiting {s.num_waiting:.0f}, preempt {s.preempt_per_s:.2f}/s.",
+        f"single-stream decode {s.decode_tps_single:.0f} tok/s = {eff:.0%} of the ~{ceiling:.0f} tok/s "
+        f"bandwidth ceiling; batched aggregate peaks at {s.decode_tps_max_c:.0f} tok/s (weight read "
+        f"amortized over the batch). Under load: KV {s.kv_cache_usage:.0%}, running {s.num_running:.0f}/"
+        f"{s.max_num_seqs}, waiting {s.num_waiting:.0f}, preempt {s.preempt_per_s:.2f}/s.",
         reason="roofline + observed load"))
 
     # R2 — KV pressure (check before R5 raise, so we don't recommend raising into OOM)

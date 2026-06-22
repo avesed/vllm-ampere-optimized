@@ -66,35 +66,60 @@ def concurrency_sweep(endpoint: str, mid: str, levels=(1, 8, 32, 64),
     return results
 
 
-def build_state(endpoint: str, levels=(1, 8, 32, 64)) -> Optional[ServerState]:  # pragma: no cover - needs a server
-    """Drive the sweep + scrape metrics -> ServerState for classify(). None if unreachable."""
+def _burst_and_scrape(endpoint: str, mid: str, concurrency: int, max_tokens: int = 256,
+                      poll_s: float = 8.0) -> Dict[str, float]:  # pragma: no cover - needs a server
+    """Hold `concurrency` long generations IN FLIGHT and scrape /metrics WHILE they run (not after),
+    so running/KV/waiting are the real under-load peaks. Returns peak signals + preempt rate."""
+    prompt = "Write an exhaustive essay on the history of computing; keep going in great detail."
+    pre = scrape_metrics(endpoint)
+    pre_preempt = _sum(pre, "vllm:num_preemptions_total")
+    peak = {"running": 0.0, "waiting": 0.0, "kv": 0.0}
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futs = [ex.submit(_one_completion, endpoint, mid, prompt, max_tokens) for _ in range(concurrency)]
+        while time.time() - t0 < poll_s and any(not f.done() for f in futs):
+            d = scrape_metrics(endpoint)
+            peak["running"] = max(peak["running"], _max(d, "vllm:num_requests_running"))
+            peak["waiting"] = max(peak["waiting"], _max(d, "vllm:num_requests_waiting"))
+            peak["kv"] = max(peak["kv"],
+                             _max(d, "vllm:gpu_cache_usage_perc") or _max(d, "vllm:kv_cache_usage_perc"))
+            time.sleep(0.5)
+        for f in futs:
+            try:
+                f.result(timeout=120)
+            except Exception:
+                pass
+    dt = max(1e-3, time.time() - t0)
+    post = scrape_metrics(endpoint)
+    peak["preempt_per_s"] = max(0.0, (_sum(post, "vllm:num_preemptions_total") - pre_preempt) / dt)
+    peak["prefix_hit"] = _prefix_hit(post) if _prefix_hit(post) is not None else -1.0
+    return peak
+
+
+def build_state(endpoint: str, levels=(1, 8, 32), burst_c: int = 48) -> Optional[ServerState]:  # pragma: no cover - needs a server
+    """Throughput from a concurrency sweep + load state from an under-load burst -> ServerState."""
     try:
         mid = model_id(endpoint)
     except Exception:
         return None
-    pre = scrape_metrics(endpoint)
-    pre_preempt = _sum(pre, "vllm:num_preemptions_total")
-    t0 = time.time()
     sweep = concurrency_sweep(endpoint, mid, levels)
-    dt = max(1e-3, time.time() - t0)
-    post = scrape_metrics(endpoint)
-
     tps = [s for _, s in sweep]
     single = next((s for c, s in sweep if c == 1), tps[0] if tps else 0.0)
-    peak = max(tps) if tps else 0.0
+    peak_tps = max(tps) if tps else 0.0
     rising = len(tps) >= 2 and tps[-1] > tps[-2] * 1.05
-    # max_num_seqs inferred as the running plateau when pushed past the cap
-    running_peak = _max(post, "vllm:num_requests_running") or float(max(levels))
+    load = _burst_and_scrape(endpoint, mid, concurrency=burst_c)
+    running_peak = load["running"] or float(burst_c)
+    hit = load.get("prefix_hit", -1.0)
     return ServerState(
-        max_num_seqs=int(round(running_peak)) or max(levels),
-        kv_cache_usage=_max(post, "vllm:gpu_cache_usage_perc") or _max(post, "vllm:kv_cache_usage_perc"),
-        num_running=_max(post, "vllm:num_requests_running"),
-        num_waiting=_max(post, "vllm:num_requests_waiting"),
-        preempt_per_s=max(0.0, (_sum(post, "vllm:num_preemptions_total") - pre_preempt) / dt),
+        max_num_seqs=int(round(running_peak)),         # plateau under an over-subscribed burst ~= the cap
+        kv_cache_usage=load["kv"],
+        num_running=load["running"],
+        num_waiting=load["waiting"],
+        preempt_per_s=load["preempt_per_s"],
         decode_tps_single=single,
-        decode_tps_max_c=peak,
+        decode_tps_max_c=peak_tps,
         throughput_still_rising=rising,
-        prefix_hit_rate=_prefix_hit(post),
+        prefix_hit_rate=(None if hit < 0 else hit),
         mean_prompt_toks=0.0,
         qps=0.0,
     )
