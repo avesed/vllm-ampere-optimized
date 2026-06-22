@@ -62,6 +62,10 @@ def concurrency_sweep(endpoint: str, mid: str, levels=(1, 8, 32, 64),
     """For each concurrency C, fire C identical completions and return (C, aggregate_decode_tok/s)."""
     prompt = "Write a detailed paragraph about the history of computing, then continue at length."
     results: List[Tuple[int, float]] = []
+    try:                                  # warm-up: the first post-restart request is cold (caches),
+        _one_completion(endpoint, mid, prompt, 8)   # which would tank the c=1 single-stream number
+    except Exception:
+        pass
     for c in levels:
         t0 = time.time()
         with ThreadPoolExecutor(max_workers=c) as ex:
