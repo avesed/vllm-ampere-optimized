@@ -46,8 +46,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(ct)
     ct.add_argument("--endpoint", default="http://localhost:8000", help="vLLM base URL")
     ct.add_argument("--restart-cmd", default=None,
-                    help="shell template that (re)launches the server; MUST contain {flags} "
-                         "(required for --sweep/--auto; not needed for --batch-curve)")
+                    help="advanced: shell template that (re)launches the server; MUST contain {flags}")
+    ct.add_argument("--model", default=None,
+                    help="BUILT-IN launcher: model path/HF-id to serve; the tool builds the restart "
+                         "command itself (no --restart-cmd needed)")
+    ct.add_argument("--launcher", choices=["docker", "vllm"], default="docker",
+                    help="(--model) how to launch: docker (default) or bare `vllm serve`")
+    ct.add_argument("--image", default="vllm/vllm-openai:latest",
+                    help="(--model --launcher docker) image (pass the Ampere fork image for W4A8)")
+    ct.add_argument("--gpus", default="all", help="(--model --launcher docker) docker --gpus spec")
+    ct.add_argument("--port", type=int, default=8000, help="(--model) server port (endpoint follows it)")
+    ct.add_argument("--tp", type=int, default=None, help="(--model) tensor-parallel-size for the launched server")
+    ct.add_argument("--serve-extra", default=None, help="(--model) extra fixed serve flags appended verbatim")
     ct.add_argument("--batch-curve", action="store_true",
                     help="profile the RUNNING server across concurrency (NO restart): aggregate + "
                          "per-session tok/s + TPOT per batch -> pick the operating batch")

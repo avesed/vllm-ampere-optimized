@@ -4,8 +4,34 @@ import pytest
 from ampere_autotune.half_a.cotune import (
     parse_sweep, expand_grid, config_flags, score, render, make_restart_fn, SweepPoint,
     auto_tune, render_curve, render_lowc_advice, render_mtp, banned_in, Trial,
-    _clamp_wait, MAX_WAIT_S,
+    _clamp_wait, MAX_WAIT_S, build_restart_cmd,
 )
+import types
+
+
+def test_build_restart_cmd_explicit_wins():
+    a = types.SimpleNamespace(restart_cmd="docker ... {flags}", model="/m")
+    assert build_restart_cmd(a) == "docker ... {flags}"
+
+
+def test_build_restart_cmd_docker_from_abs_model():
+    a = types.SimpleNamespace(restart_cmd=None, model="/models/Qwen", launcher="docker",
+                              image="img:tag", gpus="all", port=8000, tp=2, serve_extra=None)
+    cmd = build_restart_cmd(a)
+    assert "docker run -d" in cmd and "{flags}" in cmd and "img:tag" in cmd
+    assert "-v /models:/models:ro" in cmd and "--model /models/Qwen" in cmd   # abs -> parent-mount
+    assert "--tensor-parallel-size 2" in cmd
+
+
+def test_build_restart_cmd_vllm_launcher_and_hf_id():
+    a = types.SimpleNamespace(restart_cmd=None, model="Qwen/Q", launcher="vllm",
+                              port=8001, tp=None, serve_extra="--x 1")
+    cmd = build_restart_cmd(a)
+    assert "vllm serve Qwen/Q" in cmd and "--port 8001" in cmd and "{flags}" in cmd and "--x 1" in cmd
+
+
+def test_build_restart_cmd_none_without_model():
+    assert build_restart_cmd(types.SimpleNamespace(restart_cmd=None, model=None)) is None
 
 
 def test_scenario_presets_and_prompt_resolution(tmp_path):

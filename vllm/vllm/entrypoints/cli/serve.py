@@ -52,6 +52,13 @@ class ServeSubcommand(CLISubcommand):
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
+        # Ampere fork (patch 0007): `vllm serve <args> --autotune` reuses THESE serve args and runs
+        # the autotuner instead of serving (docker-friendly: same command shape, one extra flag).
+        if getattr(args, "autotune", False):
+            from ampere_autotune.serve_autotune import run as _autotune_run
+
+            raise SystemExit(_autotune_run(args))
+
         if getattr(args, "grpc", False):
             from vllm.entrypoints.grpc_server import serve_grpc
 
@@ -162,6 +169,14 @@ class ServeSubcommand(CLISubcommand):
         )
 
         serve_parser = make_arg_parser(serve_parser)
+        # Ampere fork (patch 0007): expose `--autotune*` flags on serve (no-op import if the
+        # ampere_autotune package isn't installed -> normal serve is unaffected).
+        try:
+            from ampere_autotune.serve_autotune import add_autotune_args
+
+            add_autotune_args(serve_parser)
+        except Exception:
+            pass
         serve_parser.epilog = VLLM_SUBCMD_PARSER_EPILOG.format(subcmd=self.name)
         return serve_parser
 

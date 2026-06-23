@@ -9,12 +9,59 @@ the empirical best. NO privilege. The pure helpers (grid/parse/score/flags) are 
 from __future__ import annotations
 
 import itertools
+import os
 import subprocess
 import time
 from dataclasses import dataclass, asdict
 from typing import Callable, Dict, List, Optional
 
 from . import measure
+
+
+# ------------------------------------------------------------------------------------------------
+# Built-in launcher — `ampere-autotune cotune --model X ...` auto-builds the restart-cmd so the user
+# never hand-writes a docker/serve template. Explicit --restart-cmd always wins (escape hatch).
+# ------------------------------------------------------------------------------------------------
+_LAUNCH_NAME = "ampere-autotune-vllm"
+
+
+def build_restart_cmd(args) -> Optional[str]:
+    """Return the {flags}-templated restart command. Priority: explicit --restart-cmd > --model
+    (auto-built) > None. The auto path supports launcher=docker (default) or vllm (bare)."""
+    rc = getattr(args, "restart_cmd", None)
+    if rc:
+        return rc
+    model = getattr(args, "model", None)
+    if not model:
+        return None
+    port = getattr(args, "port", 8000) or 8000
+    tp = getattr(args, "tp", None)
+    extra = getattr(args, "serve_extra", None) or ""
+    serve = f"--port {port}"
+    if tp:
+        serve += f" --tensor-parallel-size {tp}"
+    if extra:
+        serve += f" {extra}"
+    launcher = getattr(args, "launcher", "docker") or "docker"
+
+    if launcher == "vllm":                                  # bare process (vllm must be on PATH)
+        return (f"pkill -f 'vllm serve' >/dev/null 2>&1 || true; sleep 2; "
+                f"nohup vllm serve {model} {serve} {{flags}} > /tmp/{_LAUNCH_NAME}.log 2>&1 &")
+
+    # docker (default). Absolute path -> mount its PARENT as /models (so sibling-relative symlinks
+    # resolve) and serve /models/<base>; otherwise pass the model straight through (HF id / in-image).
+    image = getattr(args, "image", None) or "vllm/vllm-openai:latest"
+    gpus = getattr(args, "gpus", None) or "all"
+    if os.path.isabs(model):
+        parent, base = os.path.split(model.rstrip("/"))
+        mount = f"-v {parent}:/models:ro "
+        model_arg = f"/models/{base}"
+    else:
+        mount = ""
+        model_arg = model
+    return (f"docker rm -f {_LAUNCH_NAME} >/dev/null 2>&1; "
+            f"docker run -d --name {_LAUNCH_NAME} --gpus {gpus} --shm-size=8g {mount}"
+            f"-p {port}:8000 {image} --model {model_arg} {serve} {{flags}}")
 
 # values meaning "use the server default / disabled toggle" -> omit the flag entirely
 _DEFAULTY = {"auto", "default", "", "-", "false", "off", "no", "0"}
@@ -462,6 +509,8 @@ def resolve_prompt(args):
 
 def run(args) -> int:  # pragma: no cover - drives a server
     endpoint = (getattr(args, "endpoint", None) or "http://localhost:8000").rstrip("/")
+    if getattr(args, "model", None):                # built-in launcher -> endpoint follows --port
+        endpoint = f"http://localhost:{getattr(args, 'port', 8000) or 8000}"
     obj = getattr(args, "objective", "throughput")
     prompt = resolve_prompt(args)
     temp = getattr(args, "temperature", None)          # None -> don't send -> vLLM model default (never temp=0)
@@ -481,10 +530,12 @@ def run(args) -> int:  # pragma: no cover - drives a server
         print("\n" + render_lowc_advice(tps, c))
         return 0
 
-    if not getattr(args, "restart_cmd", None):
-        print("[cotune] --sweep/--auto need --restart-cmd \"...{flags}...\" (or --batch-curve / --objective latency, no restart).")
+    rc = build_restart_cmd(args)                    # --restart-cmd > --model (auto-built) > None
+    if not rc:
+        print("[cotune] --sweep/--auto need a server to (re)launch: pass --model (built-in launcher) "
+              "or --restart-cmd \"...{flags}...\" (--batch-curve / --objective latency need neither).")
         return 2
-    restart = make_restart_fn(args.restart_cmd, endpoint, getattr(args, "ready_timeout", 600))
+    restart = make_restart_fn(rc, endpoint, getattr(args, "ready_timeout", 600))
 
     if getattr(args, "mtp_sweep", False):
         ks = tuple(int(x) for x in str(getattr(args, "mtp_ks", "0,1,2,3")).split(",") if x.strip())
