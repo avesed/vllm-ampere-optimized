@@ -390,7 +390,6 @@ def render_lowc_advice(tps, c: int) -> str:
             f"(TPOT ~{1000.0 / tps:.1f} ms)" if tps > 0 else "single/few-session: no throughput measured")
     return "\n".join([head, "",
         "Nothing to auto-sweep here: per-stream decode is bandwidth-bound and accuracy-neutral flags don't move it.",
-        "Settled (not a tuning dimension): cudagraph stays ON — enforce-eager loses ~3-4x on hybrid-GDN.",
         "EXTRA levers (opt-in, NOT auto-swept — they touch accuracy or the checkpoint):",
         "  - MTP / spec-decode K=2 — THE per-stream lever; needs an mtp head + an accept-rate/quality check.",
         "  - long-ctx only: --kv-cache-dtype fp8 / --mamba-cache-dtype (the GDN-state analogue) — trade a little",

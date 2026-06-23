@@ -160,10 +160,10 @@ def test_render_curve_shows_per_session_and_tpot():
     assert "SLA" in out                                          # the operating-point guidance
 
 
-def test_render_lowc_advice_recommends_mtp_keeps_cudagraph_no_sweep():
+def test_render_lowc_advice_recommends_mtp_no_sweep():
     out = render_lowc_advice(85.0, 1)
     assert "85" in out and "TPOT" in out
-    assert "MTP" in out and "enforce-eager" in out              # opt-in MTP lever + cudagraph guardrail
+    assert "MTP" in out                                         # opt-in per-stream lever
     assert "auto-sweep" in out.lower() or "opt-in" in out.lower()
 
 
