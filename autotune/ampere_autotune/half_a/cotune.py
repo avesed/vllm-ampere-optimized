@@ -418,7 +418,8 @@ def mtp_sweep(restart_fn, endpoint: str, ks=(0, 1, 2, 3), method: str = "qwen3_5
             results.append((k, None, None, "not ready (OOM / bad spec config?)"))
             log(f"  K={k}: not ready")
             continue
-        tps = measure.lowc_throughput(endpoint, c=c, prompt=prompt, temperature=temperature)
+        # more reps + longer gens than the default: spec tok/s + accept-len are noisy under sampling
+        tps = measure.lowc_throughput(endpoint, c=c, max_tokens=256, reps=4, prompt=prompt, temperature=temperature)
         acc = measure.spec_accept_len(endpoint) if k > 0 else None
         results.append((k, tps, acc, ""))
         log(f"  K={k}: {tps:.0f} tok/s" + (f", accept-len {acc:.2f}" if acc is not None else ""))
