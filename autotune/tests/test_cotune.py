@@ -60,11 +60,11 @@ def test_ready_wait_guard_caps_at_600():
 
 
 def test_render_mtp_picks_best_and_warns_workload_dependent():
-    results = [(0, 85.0, None, ""), (1, 105.0, 0.55, ""), (2, 130.0, 0.62, ""), (3, 124.0, 0.40, "")]
+    results = [(0, 85.0, None, ""), (1, 105.0, 1.45, ""), (2, 130.0, 1.70, ""), (3, 124.0, 1.60, "")]
     out = render_mtp(results, 1)
     assert "BEST on THIS prompt: K=2" in out
     assert "+53% vs K=0" in out                  # 130/85-1 ~ +53%
-    assert "62%" in out                          # accept-rate surfaced
+    assert "accept-len" in out and "1.70" in out  # acceptance LENGTH (not the crude %)
     assert "WORKLOAD-DEPENDENT" in out and ("real traffic" in out or "--scenario" in out)
 
 

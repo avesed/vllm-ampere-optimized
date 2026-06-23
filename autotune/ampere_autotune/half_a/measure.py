@@ -181,15 +181,14 @@ def build_state(endpoint: str, levels=(1, 8, 32), burst_c: int = 48,
     )
 
 
-def spec_accept_rate(endpoint: str) -> Optional[float]:  # pragma: no cover - needs a server
-    """Spec-decode acceptance = accepted/draft tokens from /metrics (best-effort; counter names vary).
-    None if no spec metrics (spec off or unsupported)."""
+def spec_accept_len(endpoint: str) -> Optional[float]:  # pragma: no cover - needs a server
+    """Mean ACCEPTANCE LENGTH = 1 + accepted_tokens / num_drafts (vLLM's own metric: tokens emitted
+    per draft step; 1.0 = spec gives nothing, higher = better). This is the meaningful spec number —
+    NOT accepted/draft-tokens (that's the per-position rate, misleadingly low at high K)."""
     d = scrape_metrics(endpoint)
-    acc = (_sum(d, "vllm:spec_decode_num_accepted_tokens_total")
-           or _sum(d, "vllm:spec_decode_num_accepted_tokens"))
-    draft = (_sum(d, "vllm:spec_decode_num_draft_tokens_total")
-             or _sum(d, "vllm:spec_decode_num_draft_tokens"))
-    return (acc / draft) if draft > 0 else None
+    acc = _sum(d, "vllm:spec_decode_num_accepted_tokens_total")
+    drafts = _sum(d, "vllm:spec_decode_num_drafts_total")
+    return (1.0 + acc / drafts) if drafts > 0 else None
 
 
 def _prefix_hit(d: Dict[str, List[float]]) -> Optional[float]:

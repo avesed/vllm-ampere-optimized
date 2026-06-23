@@ -419,15 +419,15 @@ def mtp_sweep(restart_fn, endpoint: str, ks=(0, 1, 2, 3), method: str = "qwen3_5
             log(f"  K={k}: not ready")
             continue
         tps = measure.lowc_throughput(endpoint, c=c, prompt=prompt, temperature=temperature)
-        acc = measure.spec_accept_rate(endpoint) if k > 0 else None
+        acc = measure.spec_accept_len(endpoint) if k > 0 else None
         results.append((k, tps, acc, ""))
-        log(f"  K={k}: {tps:.0f} tok/s" + (f", accept {acc:.0%}" if acc is not None else ""))
+        log(f"  K={k}: {tps:.0f} tok/s" + (f", accept-len {acc:.2f}" if acc is not None else ""))
     return results
 
 
 def render_mtp(results, c: int) -> str:
     lines = [f"ampere-autotune — MTP/spec-decode K-sweep (single-stream c={c}; decode tok/s)\n",
-             "  K | decode tok/s | accept-rate | note"]
+             "  K | decode tok/s | accept-len | note"]
     base = next((t for (k, t, _, _) in results if k == 0 and t is not None), None)
     feasible = [(k, t, a) for (k, t, a, _) in results if t is not None]
     for k, tps, acc, note in results:
@@ -435,8 +435,8 @@ def render_mtp(results, c: int) -> str:
             lines.append(f"  {k} | (failed: {note})")
             continue
         gain = f" ({(tps / base - 1) * 100:+.0f}% vs K=0)" if base and k != 0 else ""
-        accs = f"{acc * 100:.0f}%" if acc is not None else "n/a"
-        lines.append(f"  {k} | {tps:>11.0f}{gain} | {accs:>11}")
+        accs = f"{acc:.2f}" if acc is not None else "n/a"
+        lines.append(f"  {k} | {tps:>11.0f}{gain} | {accs:>10}")
     if feasible:
         bk, bt, _ = max(feasible, key=lambda r: r[1])
         lines.append(f"\nBEST on THIS prompt: K={bk} -> {bt:.0f} tok/s single-stream.")
