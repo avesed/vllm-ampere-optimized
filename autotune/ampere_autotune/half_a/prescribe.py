@@ -30,7 +30,9 @@ def render(recs, plans, endpoint: str) -> str:
 
     merged: Dict[str, object] = {}
     for r in recs:
-        lines.append(f"[{r.severity}] {r.rule}\n  {r.finding}")
+        conf = getattr(r, "confidence", "high")
+        ctag = "" if conf == "high" else f" [confidence:{conf}]"
+        lines.append(f"[{r.severity}] {r.rule}{ctag}\n  {r.finding}")
         if r.flags:
             lines.append("  suggest: " + " ".join(f"{k}={v}" for k, v in r.flags.items()))
         if r.reason:

@@ -41,6 +41,15 @@ class ServerState:
     qps: float = 0.0
     max_model_len: Optional[int] = None       # from /v1/models (for the R10 capacity trim)
     has_mtp_head: Optional[bool] = None        # None = unknown (can't tell from the endpoint)
+    # multi-window confidence: fraction of under-load samples where the condition held (1.0 = single
+    # window / no multi-window data). Kills false positives from a transient one-scrape spike.
+    kv_window_frac: float = 1.0               # frac of windows with KV >= 0.88
+    sat_window_frac: float = 1.0              # frac of windows with running >= 0.95*max_num_seqs
+
+
+# multi-window confidence thresholds (borrowed from jungledesh/profile's "seen in X% of windows")
+def _conf(frac: float) -> str:
+    return "high" if frac >= 0.75 else ("med" if frac >= 0.5 else "low")
 
 
 @dataclass
@@ -50,6 +59,7 @@ class FlagRec:
     finding: str
     flags: Dict[str, object] = field(default_factory=dict)   # suggested launch flags (empty = client-side / no flag)
     reason: str = ""
+    confidence: str = "high"                                 # high/med/low from multi-window evidence
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -92,26 +102,30 @@ def classify(s: ServerState, hw: HwSpec, achieved_bw_gbs: Optional[float] = None
     # R2 — KV pressure (check before R5 raise, so we don't recommend raising into OOM)
     kv_pressure = s.kv_cache_usage >= 0.88 and (s.preempt_per_s > 0.02 or s.num_waiting > 2)
     if kv_pressure:
+        seen = f" (KV-pressured in {s.kv_window_frac:.0%} of load windows)" if s.kv_window_frac < 1.0 else ""
         recs.append(FlagRec(
             "R2-kv-pressure", WARN,
-            f"KV cache at {s.kv_cache_usage:.0%} with preemption/queueing -> thrashing.",
+            f"KV cache at {s.kv_cache_usage:.0%} with preemption/queueing -> thrashing.{seen}",
             {"--kv-cache-dtype": "fp8", "--max-num-seqs": max(1, int(s.max_num_seqs * 0.75))},
-            reason="lower concurrency or halve KV bytes (fp8) to stop preemption; or raise gpu-mem-util if headroom"))
+            reason="lower concurrency or halve KV bytes (fp8) to stop preemption; or raise gpu-mem-util if headroom",
+            confidence=_conf(s.kv_window_frac)))
 
     # R5 — concurrency saturation (only raise if KV is NOT pressured)
     if saturated and queue_ratio >= 0.30 and not kv_pressure:
+        seen = f" (saturated in {s.sat_window_frac:.0%} of load windows)" if s.sat_window_frac < 1.0 else ""
         if s.kv_cache_usage < 0.80:
             recs.append(FlagRec(
                 "R5-saturation", WARN,
                 f"running==max_num_seqs ({s.num_running:.0f}/{s.max_num_seqs}) with a queue and KV only "
-                f"{s.kv_cache_usage:.0%} -> under-provisioned concurrency.",
+                f"{s.kv_cache_usage:.0%} -> under-provisioned concurrency.{seen}",
                 {"--max-num-seqs": int(s.max_num_seqs * 1.5)},
-                reason="raise max-num-seqs; KV has headroom"))
+                reason="raise max-num-seqs; KV has headroom", confidence=_conf(s.sat_window_frac)))
         else:
             recs.append(FlagRec(
                 "R5-saturation-kv-bound", WARN,
-                f"saturated AND KV {s.kv_cache_usage:.0%} -> can't raise concurrency on this card.",
-                {}, reason="add a replica / scale out (KV-bound, not a single-box flag)"))
+                f"saturated AND KV {s.kv_cache_usage:.0%} -> can't raise concurrency on this card.{seen}",
+                {}, reason="add a replica / scale out (KV-bound, not a single-box flag)",
+                confidence=_conf(s.sat_window_frac)))
 
     # R1 — under-batching (server starved): throughput still rising + low queue
     if s.throughput_still_rising and s.num_waiting < 2 and not saturated:

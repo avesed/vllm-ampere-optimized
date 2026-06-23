@@ -72,6 +72,25 @@ def test_r3_skipped_without_volume():
     assert "R3-prefix-cache" not in _rules(recs)
 
 
+def test_r2_confidence_low_when_pressure_is_transient():
+    # KV pressured but only in 40% of load windows -> low confidence + the "seen in X%" note
+    s = _base(kv_cache_usage=0.92, preempt_per_s=0.1, num_waiting=5, kv_window_frac=0.4)
+    r = next(x for x in classify(s, HW) if x.rule == "R2-kv-pressure")
+    assert r.confidence == "low" and "40%" in r.finding
+
+
+def test_r2_confidence_high_and_no_note_by_default():
+    r = next(x for x in classify(_base(kv_cache_usage=0.92, preempt_per_s=0.1, num_waiting=5), HW)
+             if x.rule == "R2-kv-pressure")           # kv_window_frac defaults to 1.0
+    assert r.confidence == "high" and "windows" not in r.finding
+
+
+def test_r5_confidence_from_sat_windows():
+    s = _base(num_running=64, num_waiting=30, kv_cache_usage=0.50, sat_window_frac=0.6)
+    r = next(x for x in classify(s, HW) if x.rule == "R5-saturation")
+    assert r.confidence == "med" and "60%" in r.finding
+
+
 def test_r6_spec_decode_pointer_below_ceiling():
     recs = classify(_base(decode_tps_single=85.0), HW)   # eff 85/208 = 0.41 < 0.6
     r = next(x for x in recs if x.rule == "R6-spec-decode-pointer")
