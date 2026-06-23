@@ -66,7 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="sweep MTP/spec-decode K (num_speculative_tokens); needs an mtp-head checkpoint")
     ct.add_argument("--mtp-ks", default="0,1,2,3", help="(--mtp-sweep) K values to try; 0 = baseline (no spec)")
     ct.add_argument("--spec-method", default="qwen3_5_mtp", help="(--mtp-sweep) speculative method name")
-    ct.add_argument("--ready-timeout", type=int, default=600, help="seconds to wait for /health per config")
+    ct.add_argument("--ready-timeout", type=int, default=600,
+                    help="GUARD: max seconds to wait for /health per vLLM bring-up (hard-capped at 600)")
 
     tune = sub.add_parser("tune", help="HALF-B: characterize a stable clock profile (host root)")
     _add_common(tune)

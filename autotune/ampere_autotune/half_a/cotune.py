@@ -98,11 +98,27 @@ def score(p: SweepPoint, objective: str = "throughput") -> float:
     return p.decode_tps_max_c
 
 
-def make_restart_fn(template: str, endpoint: str, ready_timeout: int = 600,
+# GUARD: every vLLM bring-up waits AT MOST this many seconds for /health, then gives up (so a
+# broken config / crash-loop never hangs the sweep). Hard cap — a larger --ready-timeout is clamped.
+MAX_WAIT_S = 600
+
+
+def _clamp_wait(t) -> int:
+    """Bound any requested readiness wait to (0, MAX_WAIT_S]; missing/0 -> MAX_WAIT_S."""
+    try:
+        t = int(t)
+    except (TypeError, ValueError):
+        t = MAX_WAIT_S
+    return max(1, min(t if t > 0 else MAX_WAIT_S, MAX_WAIT_S))
+
+
+def make_restart_fn(template: str, endpoint: str, ready_timeout: int = MAX_WAIT_S,
                     settle_s: float = 3.0) -> Callable[[Dict[str, str]], bool]:  # pragma: no cover - drives a server
-    """Build a restart hook from a shell template: substitute {flags}, run it, wait for /health."""
+    """Build a restart hook from a shell template: substitute {flags}, run it, wait for /health
+    (bounded by the MAX_WAIT_S guard so a bad config never hangs the run)."""
     if "{flags}" not in template:
         raise ValueError("--restart-cmd must contain the {flags} placeholder")
+    ready_timeout = _clamp_wait(ready_timeout)
 
     def restart(cfg: Dict[str, str]) -> bool:
         cmd = template.replace("{flags}", config_flags(cfg))
@@ -112,10 +128,10 @@ def make_restart_fn(template: str, endpoint: str, ready_timeout: int = 600,
     return restart
 
 
-def _wait_ready(endpoint: str, timeout: int) -> bool:  # pragma: no cover - needs a server
+def _wait_ready(endpoint: str, timeout: int = MAX_WAIT_S) -> bool:  # pragma: no cover - needs a server
     import requests
     base = endpoint.rstrip("/")
-    deadline = time.time() + timeout
+    deadline = time.time() + _clamp_wait(timeout)
     while time.time() < deadline:
         try:
             if requests.get(base + "/health", timeout=5).status_code == 200:

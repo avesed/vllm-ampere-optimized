@@ -4,7 +4,18 @@ import pytest
 from ampere_autotune.half_a.cotune import (
     parse_sweep, expand_grid, config_flags, score, render, make_restart_fn, SweepPoint,
     auto_tune, render_curve, render_lowc_advice, render_mtp, banned_in, Trial,
+    _clamp_wait, MAX_WAIT_S,
 )
+
+
+def test_ready_wait_guard_caps_at_600():
+    assert MAX_WAIT_S == 600
+    assert _clamp_wait(9999) == 600          # over-cap -> clamped
+    assert _clamp_wait(0) == 600             # 0/unset -> the guard default
+    assert _clamp_wait(None) == 600
+    assert _clamp_wait(-5) == 600            # nonsense -> guard
+    assert _clamp_wait(120) == 120           # sane value passes through
+    assert _clamp_wait("bad") == 600         # non-int -> guard
 
 
 def test_render_mtp_picks_best_and_warns_workload_dependent():
