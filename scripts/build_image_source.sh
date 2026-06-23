@@ -19,7 +19,9 @@ cd "$REPO_ROOT"
 
 : "${OWNER:?set OWNER}"
 CUDA_VERSION="${CUDA_VERSION:-13.0.2}"
-TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0 8.6}"
+# RELEASE = full multi-arch (matches upstream vLLM's Dockerfile default) so the published image runs
+# on Turing..Blackwell, not just Ampere. For fast Ampere-only iteration use scripts/build_image_dev.sh.
+TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-7.5 8.0 8.6 8.9 9.0 10.0 11.0 12.0+PTX}"
 VLLM_TAG="${VLLM_TAG:-$(cat UPSTREAM_VLLM_VERSION)}"   # the pinned vendored vLLM version
 IMAGE="ghcr.io/${OWNER,,}/vllm-ampere-optimized"       # ghcr path must be lowercase
 CU="cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')"
@@ -32,6 +34,12 @@ GHA_CACHE=""; [ -n "${GITHUB_ACTIONS:-}" ] && GHA_CACHE="--cache-from type=gha -
 # PUSH=1 (default) pushes the final image to ghcr; PUSH=0 builds it into the LOCAL docker (--load) for
 # testing without publishing. Stage-1 is always --load (intermediate base for stage-2).
 PUSH="${PUSH:-1}"; [ "$PUSH" = 1 ] && PUSH_FLAG="--push" || PUSH_FLAG="--load"
+# Use the docker-driver "default" builder: the 2-stage build does stage-1 `--load` (into the local
+# docker image store) then stage-2 `FROM` it — but a docker-CONTAINER-driver builder resolves FROM
+# from the REGISTRY, so it can't see the local intermediate and stage-2 fails ("...vllm-cu130: not
+# found"). The docker driver reads the local store + supports --load/--push for single-platform.
+# CI (GHA cache) needs the container driver, so leave BUILDER empty there.
+BUILDER="${BUILDER:---builder default}"; [ -n "${GITHUB_ACTIONS:-}" ] && BUILDER=""
 
 [ -f vllm/docker/Dockerfile ] || { echo "::error::vendored vllm/ source missing (vllm/docker/Dockerfile)"; exit 1; }
 [ -f flashinfer/include/flashinfer/mma.cuh ] || { echo "::error::vendored flashinfer/ source missing"; exit 1; }
@@ -60,7 +68,7 @@ else
 fi
 
 echo "== stage 1/2: build vLLM from vendored fork source (sm_80+sm_86) =="
-docker buildx build vllm \
+docker buildx build vllm $BUILDER \
   --file vllm/docker/Dockerfile \
   --target vllm-openai \
   --platform linux/amd64 \
@@ -76,7 +84,7 @@ docker buildx build vllm \
   --tag "$VLLM_IMG" --load
 
 echo "== stage 2/2: overlay vendored int8-QK flashinfer ($([ "$PUSH" = 1 ] && echo 'push to ghcr' || echo 'load locally')) =="
-docker buildx build . \
+docker buildx build . $BUILDER \
   --file docker/Dockerfile.flashinfer-int8 \
   --build-arg BASE="$VLLM_IMG" \
   --platform linux/amd64 \

@@ -1,8 +1,8 @@
 # Diffusion LLM 研究汇总：AR→Diffusion 转换 · Qwen3.5-9B 方案 · int8 量化
 
 > **范围**：三轮独立调研的合并归档——(1) 能否把普通自回归(AR)模型权重转成 diffusion LM；(2) 把 Qwen3.5-9B 具体转成 dLLM 的可行性与 PoC 计划；(3) dLLM 能否适配 int8（尤其在 Ampere / 2×3090）。
-> **生成方式**：3 个多智能体 ultracode 工作流（共 ~72 个 subagent、~290 万 token、~1350 次 web 工具调用、对抗式核实）。
-> **日期**：2026-06-16。
+> **生成方式**：5 个多智能体 ultracode 工作流（共 ~110 个 subagent、~480 万 token、对抗式核实）。
+> **日期**：2026-06-16 初版（Part 1–4）· 2026-06-21 增补（Part 5 状态更新 + Part 6 Transformer Lab int8 DiT 深挖）。
 > **⚠️ 重要诚实声明**：知识截止为 2026-01，本文大量结论建立在 2025–2026 的实时检索（含 post-cutoff 的 arXiv 号如 `2508.x` `2510.x` `2604.x` `2606.x` 和 DiffusionGemma 发布）之上。这些**无法用训练知识背书，落地前请亲自点开核对**（尤其 §1.1 DiffusionGemma、§2.3 SANA/WeDLM、§3 的 DLLMQuant/CoDA/3090-DiT 几篇）。
 > **硬件语境**：2×RTX 3090（24GB，无 NVLink，Ampere sm_86），已有 patched Marlin 跑 AR 模型的 **W4A8（int4 权重 + int8 激活）**；主力是 ~27B Qwen3.6 W4A8 serving 栈 + Qwen3.5-9B 迁移评估中。
 
@@ -236,6 +236,79 @@ W4A16 GPTQ 已近乎无损（LLaDA-8B -0.3%，Dream-7B -0.8%）；CoDA-1.7B 8-bi
 5. **【$400–5k，仅前面信号强才做】**：租 8×H100 做 9B 小规模适配（§2.6 阶段 2）。
 
 **一句话**：量化（Part 3）是近路且独有 edge，先做；转换（Part 1/2）是远路且烧钱，当 R&D 慢推；两条都别让它们挡住"bf16+Fast-dLLM 今天就能拿到的吞吐"这个 baseline。
+
+---
+
+# Part 5 — dLLM 支持状态更新（2026-06-21）
+
+复查相对 06-16 baseline 的变化（DELTA），并修正两点。
+
+**仍未变（核心）**：全领域**仍无已部署的真 int8-激活 text-dLLM kernel**（非 fake-quant）；vLLM dLLM 路径**仍不吃 int8**（只 FP8-dynamic / NVFP4）；用户 W4A8/W8A8 Marlin **今天接不进任何 shipping vLLM dLLM**。
+
+**🔺 DELTA**：
+- vLLM 原生 dLLM = **DiffusionGemma**(PR #45163, 06-12 merged)只 FP8/NVFP4；新增第二条 `dllm-plugin`(LLaDA2.0, bf16, A100 验证, pin vllm0.20.x+fork)。
+- **DiffusionGemma 已能单张 3090 跑 NVFP4 ~200 tok/s**(dequant-emulated 非 int8；**TP=2 死/PP 未实现 → 只能单卡**，需 `--max-num-seqs 4`/`canvas_length=256`，配错静默掉回 bf16~25 tok/s)。
+- **STaR-Quant**(2606.04945, 06-08)首给 text-dLLM 真 W4A4 加速且在 **A40 sm_86**(证 W4A4 在 Ampere 不崩、W8A8 near-lossless)，但借 QuaRot generic int4 kernel、**无 W4A8**、不进 vLLM。
+- **正面 surface**：DiffusionGemma 走标准 `Gemma4Model` + `quant_config` 全程透传 → 标准 `LinearMethodBase`/compressed-tensors 就是 dLLM quant 路，**用户 Marlin method 理论上被自动选中**；LLM Compressor day-0 支持 → 可自出 int8 ckpt；plugin 用 `vllm.general_plugins` entry-point = 用户 int8qk patch 0004 同机制。
+
+**🔧 两条修正**：
+- **(A) MoE int8 garbage 雷已拆**（用户 06-19/20 修好 patch 0005/0006，v0.1 released，coherent + GSM8K 95.83%/MMLU-Pro 80.5%）→ **DiffusionGemma(MoE) 重回 int8 可行目标**；剩余障碍只是官方劝退 4-bit(expert dim 704，故走 W8A8 不 W4A8) + dLLM-specific 校准。
+- **(B) "compute-bound → int8 更有用"被部分修正**：vLLM/NVIDIA 称 DiffusionGemma **low-batch 是 memory-bound**（学界 FOCUS 称 compute-bound，**batch/canvas size 是关键变量**）→ 单流 regime 下 activation-int8 收益被削弱、weight-only/NVFP4 更香。这与 06-16 Part 3 的乐观判断相左，取决于单流还是大 batch。
+
+**修订后第一步**：别先碰 MoE 细节；用 **LLM Compressor 出 W8A8 weight-only DiffusionGemma** compressed-tensors ckpt，单卡 3090 验证 load+coherent(先 sha256 校验 ckpt)，确认 denoise 路真选中 Marlin method。盯紧 **SGLang `w8a8_int8` × LLaDA2.0**（各自已存在、从未组合；一旦组合则"无 int8 dLLM"结论翻）。
+
+---
+
+# Part 6 — Transformer Lab Ideogram int8 DiT 深挖（蓝本提炼，2026-06-21）
+
+来源：arXiv 2606.14598(kernel)/2606.12280(recipe) + HF `transformerlab/ideogram-4-int8-fused` + lab.cloud 博客，逐行对照用户本地 Marlin。
+
+**它是什么**：消费级 3090 上对 9.3B image DiT 做 W8A8(per-channel-W + per-token-dynamic-A + SmoothQuant α=0.5 + ~17 层 bf16) + 真吃 mma.s8/int32 累加/dequant 折 epilogue 的 fused Triton GEMM → int8 翻成单卡最快(1024px 156.5s 打过 2卡FP8/单卡NF4)。per-GEMM 2.8–4.2×，**e2e 仅 1.1×**(DiT linear 只占 forward ~12%)。**A100 慢 1.38×、B200 慢 3.49×**。
+
+**对用户的定位 = "方向验证 + 一个缺失的方法工件"，不是 fork kernel**：
+- **kernel 别 fork**：用户 Marlin 在 W8A8 GEMM 数学上等价且更强(多 int4/MoE/cudagraph/permute/split-K/hd256-int8-QK)；TL 是 tutorial 级通用 Triton GEMM + non-commercial 许可。
+- 论文"W4A8 kernels 假设 static act scale"对**用户 Marlin 是 strawman**（用户 `per_token_quant_int8` 在线算、epilogue 逐 row 乘 int32 累加器，`int8_utils.py:106-155`/`marlin_template.h:1986/1999`）。
+- **⭐ A100/B200 也输 = 用户 06-20 实测(同 9B+patch 3090 +46% vs A100 +0.09%)的独立第三方复现**——共同收窄结论：int8-act 是 **slow-bf16 消费级 Ampere(GA102 半速 fp16)** 的 lever，非整条 Ampere 线。
+
+**唯一最该抄的设计点 = denoising-trajectory activation-fragility profiler**（用户尚无）：hook 每 linear 沿去噪步记 max-abs/std/kurtosis + Spearman 早/晚步稳定性(0.930) + 取 top-~8% 进 bf16。**FFN down-proj(w2) 主导**(非 AdaLN，纠正先验)；**protection ≫ smoothing(占 78–92% 质量恢复)**；**sharp knee at N=17**。loader 按 ckpt key 存在性 data-driven 分派(`.wq` vs `.weight`)。
+
+**迁移 text-dLLM**：共享=每步 prefill-shaped compute-bound GEMM + per-token-dynamic int8 + 消费级 Ampere edge；DiT 特有(跳过)=连续 latent/VAE/AdaLN/cross-attn/dual-branch CFG/flow-matching。fragile 映射：`down_proj`(强先验)+`lm_head`/embeddings+**router/self-conditioning(离散特有需独立 sweep)**。**DiffusionGemma(MoE) 鉴于 MoE int8 已修=重回可行**，但风险:per-expert 小-M grouped GEMM 可能落 0.64× 危险形状(需 roofline)、无 diffusion-MoE int8 先例、无 shipping dLLM 路吃 int8-act ckpt。**e2e 天花板外推 1.3–1.8×**(text-dLLM linear 占比高于 DiT 12%，但仍被 fp16 softmax + 带宽 cap)；**ROI 决定量 = 单步 GEMM 占比，移植前先 profile**(论文不答)。
+
+**蓝本清单**：直接复用=W8A8 数学契约(已有)+验证 bar(exact-token-id under VLLM_BATCH_INVARIANT)。需适配=① fragility profiler(最高价值)② per-model dLLM ignore 集 ③(可选)act-quant fuse 进 Marlin prologue(ROI 低个位数%)④ MoE 小-M 形状校验。跳过=port Triton kernel / dual-branch loader / 为 A100 期待。
+
+**新来源**：arXiv 2606.14598v1 / 2606.12280v2 · HF transformerlab/ideogram-4-int8-fused(`triton_int8_gemm.py`/`fused_int8.py`) · lab.cloud/blog/quantizing-ideogram-4 · vLLM dLLM blog 2026-06-10 / PR#45163 / dllm-plugin。
+
+---
+
+# Part 7 — "W4A16 ckpt + 运行时 int8-act(=W4A8)" 给 dLLM 用（cyankiwi-aligned，2026-06-21）
+
+用户提案：参考 cyankiwi 出 **W4A16** ckpt，serve 时 `VLLM_MARLIN_INPUT_DTYPE=int8`（=运行时 W4A8），同其 AR moe_wna16 路。本节基于读本地 `quantize/` 源码 + 上游 vLLM 源码 + 对抗核实。
+
+**判定 = 分流**：
+- **DENSE dLLM(Dream-7B/LLaDA-8B)：成立且优于 W8A8** —— W4 砍权重带宽救 low-batch memory-bound（Part 5 修正 B）+ int8-act 提 prefill 算力 = **双 lever 都吃**；文献背书 dense dLLM W4 权重 near-lossless（LLaDA -0.3% / Dream -0.8%），塌的是 W4**A4** 不是 A8。
+- **MoE DiffusionGemma：走 int8 weight-only(W8A8) 不是 W4A8** —— 704-dim experts 4-bit 官方劝退（`recipes/Google/Gemma4.md`："excessive quality loss with 4-bit"），int8-act 救不了权重侧。
+
+**三个关卡**：
+1. **对称 uint4b8**：**DENSE 需要**（`mixed_precision/marlin.py:73-75` 硬断言；cyankiwi 两变体均 AWQ-asymmetric 会报 "W4A8-INT8 marlin only supports uint4b8 or int4 weights"，commit `64030fb` 已对称化）；**MoE 不需要（⚠️ 更正 Part 5 的暗示）** —— `csrc/moe/marlin_moe_wna16/ops.cu:799-811` kernel gate 显式允许 asym uint4(kU4)+int8-act，patch 0005 的 `test_fused_marlin_moe_int8_heterogeneous_experts` 用 `b_type=uint4 + input_dtype=int8` 验证。验法：看 `config.json` `format` = `int-quantized`(对称，有 int8-act 通道) vs `pack-quantized`(weight-only)。
+2. **vLLM dLLM codepath**：✅ 已证实通（`diffusion_gemma.py`→`Gemma4Model`→`gemma4.py:348 FusedMoE`→`CompressedTensorsWNA16MarlinMoEMethod` 读 `get_marlin_input_dtype`；去噪 loop 只改 attention 模式 + self-conditioning，不旁路 quant Linear；不 hardwire FP8/NVFP4，W4A16 ct ckpt 自动加载）。**但两个硬 serving blocker**：(a) DiffusionGemma PR #45163 晚于 pin 的 `v0.23.0` → 本地无 `diffusion_gemma.py`，需 re-vendor + rebase 0005/0006；(b) **dense dLLM(LLaDA/Dream) 根本不在 vLLM registry** → 今天不能经 vLLM Marlin serve（要么 dllm-plugin 吃 ct+Marlin[未验证]，要么先 offline fake-quant）。
+3. **704-dim 4-bit 风险**：主源（Gemma4.md）证实劝退，但 DiffusionGemma 专页未重复（两源冲突）→ 当作待实测一阶风险（自测 GSM8K/MMLU-Pro）。激活侧 int8 安全，危险在权重侧。
+
+**recipe 要点**：dLLM 上 **GPTQ > AWQ**（激活离群比 AR 弱，AWQ 优势失效，dense 也试纯对称 GPTQ）；ignore 加 `re:.*self_conditioning.*`、**不要** `re:.*mtp.*`（dLLM 无 MTP）；fragile 保护 FFN `down_proj/ff_out`（结合 Part 6 profiler）；MoE 必 **MoE-aware target fused 3D experts**（否则 silently skip ~91% 参数）。
+
+**先后**：**先 DENSE（Dream-7B 优先）** —— W4 安全、dense Marlin 直接适用、双 lever；blocker=不在 registry → 第一步走 offline fake-quant。**后 MoE DiffusionGemma** —— 走 W8A8，需 re-vendor，差异化价值=Ampere 上 int8-act MoE dLLM 是独有 edge（patch 0005 per-expert 重建因子 stock 没有）。
+
+**分阶段验证**：0 fake-quant 闸门（Dream-7B W4A16+int8-act GSM8K 误差平坦→否则 NO-GO）→ 1 出 ckpt（先 sha256，验 `format:int-quantized`）→ 2 单卡 load+coherent → 3 `--marlin-input-dtype int8`（显式 flag）确认 int8-act 被选中（多卡 `-pp2 -tp1`）→ 4 A/B 精度（GSM8K+MMLU-Pro，dense W4A8≈bf16）→ 5 A/B 吞吐（cudagraph 开，必测 capture-safe）。
+
+**第一步**：transformers 里对 **Dream-7B** offline fake-quant（对称 W4A16 + per-token int8-act）跑 GSM8K，确认 int8 误差曲线平坦——零 kernel/零 serving 依赖的最便宜 go/no-go。
+
+## Part 7 附 — Stage-0 实测结果（2026-06-21，沙盒 2×3090 单卡）
+
+工具 `benchmarks/dllm_int8_fakequant.py`（error-curve / accuracy / profile 三模式；对称 int4-g32 权重 + per-token int8 激活 fake-quant，196 linears，lm_head/embed 保 fp）。模型 `Dream-org/Dream-v0-Instruct-7B`，env uv torch2.5.1+cu124 / transformers4.46.2。
+- **GOTCHA（已在脚本修）**：Dream forward `is_causal=False` 硬编码、不把 2D mask 转 4D（diffusion_generate 才转）→ 直接喂 2D long mask 撞 SDPA dtype check；无 padding canvas 传 `attention_mask=None` = 全双向。
+- **误差全 FLAT，无几何累积**（隔离）：A8 int8-激活单独 rel-L2 0.151 / late-over-early **0.86×** / cos 0.990；W4 单独 0.129 / 1.66×；W4+A8 合并 0.178 / 1.40× / cos 0.974 → **非 W4A4 式塌**。
+- **GSM8K A/B 无掉点**：bf16 0.400 vs W4A8 0.467（n=30, steps=128, 0-shot）= delta +0.067（噪声内）。
+- **caveat**：绝对 40% 偏低=快测设置（steps128 vs 作者256、n30、朴素 prompt）非量化；信号是"差距≈0"；n30 噪声大（10/30 翻转），钉死需 n≥100/steps256；这是 fake-quant（测误差非真 kernel 速度）。
+- **净 = Stage-0 GO**：int8 激活在 dense dLLM 既不跨步累积也不掉精度 → 投真 Marlin kernel/serving 有据。**下一瓶颈在 serving 通路（Dream 不在 vLLM registry），非量化质量。**
 
 ---
 
