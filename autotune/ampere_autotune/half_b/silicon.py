@@ -69,15 +69,39 @@ def _handle(lib, uuid: str):  # pragma: no cover - needs a GPU
     return h
 
 
-def mem_free_bytes(uuid: str) -> Optional[int]:  # pragma: no cover - needs a GPU
-    class _Mem(ctypes.Structure):
-        _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong),
-                    ("used", ctypes.c_ulonglong)]
+class _Mem(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong),
+                ("used", ctypes.c_ulonglong)]
+
+
+def mem_info(uuid: str) -> Optional[_Mem]:  # pragma: no cover - needs a GPU
     lib = _nvml()
     mi = _Mem()
     if lib.nvmlDeviceGetMemoryInfo(_handle(lib, uuid), ctypes.byref(mi)) != 0:
         return None
-    return int(mi.free)
+    return mi
+
+
+def mem_free_bytes(uuid: str) -> Optional[int]:  # pragma: no cover - needs a GPU
+    mi = mem_info(uuid)
+    return int(mi.free) if mi else None
+
+
+def mem_used_mib(uuid: str) -> Optional[float]:  # pragma: no cover - needs a GPU
+    mi = mem_info(uuid)
+    return (int(mi.used) / (1024 * 1024)) if mi else None
+
+
+def running_proc_count(uuid: str) -> int:  # pragma: no cover - needs a GPU
+    """Best-effort count of OTHER compute processes on the card (for the in-use consent prompt)."""
+    lib = _nvml()
+    try:
+        c = ctypes.c_uint(0)
+        # NVML sets the required count even when passed a null buffer (INSUFFICIENT_SIZE/SUCCESS).
+        lib.nvmlDeviceGetComputeRunningProcesses_v3(_handle(lib, uuid), ctypes.byref(c), None)
+        return int(c.value)
+    except Exception:
+        return 0
 
 
 def mem_offset_range_mhz(uuid: str) -> Tuple[Optional[int], Optional[int]]:  # pragma: no cover - GPU

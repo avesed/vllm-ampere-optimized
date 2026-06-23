@@ -65,18 +65,25 @@ def soak_failures(results: Dict[str, SoakResult]) -> List[SoakResult]:
 
 
 def _soak_one(uuid: str, offset: int, *, deadline: float, stop: "threading.Event",
-              set_fn, free_fn, bw_fn, junction_fn=None, junction_abort_c: float = 95.0
-              ) -> SoakResult:  # pragma: no cover - GPU-bound
+              set_fn, free_fn, bw_fn, junction_fn=None, junction_abort_c: float = 95.0,
+              reporter=None) -> SoakResult:  # pragma: no cover - GPU-bound
     rc, _ = set_fn(uuid, offset)
     if rc != 0:
         stop.set()
         return SoakResult(uuid, offset, None, 0, False, f"set offset rc={rc}")
     size = silicon.fill_gib(free_fn(uuid))           # FILL this card's VRAM (back chips)
     samples: List[tuple] = []
+    running_mm = 0
     while time.time() < deadline and not stop.is_set():   # cross-card fail-fast (C5)
         read, mm = bw_fn(uuid, size)
         samples.append((read, mm))
         jt = junction_fn(uuid) if junction_fn else None
+        if mm and mm > 0:
+            running_mm += mm
+        if reporter is not None:                      # live progress for the TUI
+            left = max(0, int(deadline - time.time()))
+            reporter.update(uuid, phase=f"soak {left}s", offset=offset, read=read,
+                            mismatch=running_mm, temp=jt, status="" if running_mm == 0 else "FAIL")
         if jt is not None and jt >= junction_abort_c:
             stop.set()
             return SoakResult(uuid, offset, (read or None), 0, False,
@@ -89,7 +96,8 @@ def _soak_one(uuid: str, offset: int, *, deadline: float, stop: "threading.Event
 
 def concurrent_soak(offset_by_uuid: Dict[str, int], *, duration_s: int = 480, iters: int = 200,
                     bw_bin: str = _gate.DEFAULT_BW_BIN, junction_fn=None, junction_abort_c: float = 95.0,
-                    set_fn=None, free_fn=None, bw_fn=None) -> Dict[str, SoakResult]:  # pragma: no cover - GPU
+                    reporter=None, set_fn=None, free_fn=None, bw_fn=None
+                    ) -> Dict[str, SoakResult]:  # pragma: no cover - GPU
     """Apply ALL offsets + soak ALL gpus SIMULTANEOUSLY for duration_s (the realistic both-cards-
     hot thermal case the per-card characterize misses). Each card fills its OWN VRAM. ANY card's
     corruption/junction-abort sets a shared stop so the whole box leaves the bad state at once
@@ -103,7 +111,7 @@ def concurrent_soak(offset_by_uuid: Dict[str, int], *, duration_s: int = 480, it
     try:
         with ThreadPoolExecutor(max_workers=max(1, len(uuids))) as ex:
             futs = {u: ex.submit(_soak_one, u, offset_by_uuid[u], deadline=deadline, stop=stop,
-                                 set_fn=set_fn, free_fn=free_fn, bw_fn=bw_fn,
+                                 set_fn=set_fn, free_fn=free_fn, bw_fn=bw_fn, reporter=reporter,
                                  junction_fn=junction_fn, junction_abort_c=junction_abort_c)
                     for u in uuids}
             return {u: f.result() for u, f in futs.items()}

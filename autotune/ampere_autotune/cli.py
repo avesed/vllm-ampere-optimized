@@ -26,6 +26,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.add_argument("-v", "--verbose", action="count", default=0)
     p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("--yes", action="store_true",
+                   help="(--hw) skip the hardware-damage + card-in-use confirmation prompts "
+                        "(non-interactive; you accept the risk)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -156,6 +159,22 @@ def main(argv=None) -> int:
         return 3
 
     if args.cmd in ("tune", "monitor"):
+        # Launch-time consent for the real OC-write path (skip on a no-op --dry-run preview).
+        real_write = not (args.cmd == "tune" and getattr(args, "dry_run", False))
+        if real_write:
+            from .half_b import safety, silicon
+            if not safety.confirm_oc_damage_warning(force=getattr(args, "yes", False)):
+                print("Aborted: hardware-damage warning not accepted.", file=sys.stderr)
+                return 5
+            for g in (matrix.gpus or []):                 # per-target-card 'in use?' consent
+                uuid = silicon._gpu_uuid(g)
+                if not uuid:
+                    continue
+                if not safety.confirm_vram_in_use(silicon.mem_used_mib(uuid),
+                                                  silicon.running_proc_count(uuid),
+                                                  force=getattr(args, "yes", False)):
+                    print(f"Aborted: card {uuid[:20]} is in use, not confirmed.", file=sys.stderr)
+                    return 5
         if args.cmd == "tune" and getattr(args, "mode", "") == "characterize" and not args.dry_run:
             print("Refusing: `tune --hw --mode characterize` requires a prior `--dry-run`.", file=sys.stderr)
             return 4
