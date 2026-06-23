@@ -10,17 +10,19 @@ import re
 import time
 from typing import Dict, Optional
 
-_DIR = os.path.join(os.path.expanduser("~"), ".cache", "ampere-autotune")
+def _dir() -> str:
+    from .results import state_dir
+    return os.path.join(state_dir(), "delta")
 
 
 def _path(key: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", key)[:180]
-    return os.path.join(_DIR, safe + ".json")
+    return os.path.join(_dir(), safe + ".json")
 
 
 def save_result(key: str, metrics: Dict[str, float]) -> None:  # pragma: no cover - filesystem
     try:
-        os.makedirs(_DIR, exist_ok=True)
+        os.makedirs(_dir(), exist_ok=True)
         json.dump({"ts": time.time(), "metrics": metrics}, open(_path(key), "w"))
     except OSError:
         pass

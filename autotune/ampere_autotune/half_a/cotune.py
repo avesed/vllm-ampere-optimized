@@ -507,6 +507,7 @@ def resolve_prompt(args):
 
 
 def run(args) -> int:  # pragma: no cover - drives a server
+    from .results import emit
     endpoint = (getattr(args, "endpoint", None) or "http://localhost:8000").rstrip("/")
     if getattr(args, "model", None):                # built-in launcher -> endpoint follows --port
         endpoint = f"http://localhost:{getattr(args, 'port', 8000) or 8000}"
@@ -519,14 +520,14 @@ def run(args) -> int:  # pragma: no cover - drives a server
     if getattr(args, "batch_curve", False):         # no restart — profile the running server as-is
         levels = [int(x) for x in str(getattr(args, "levels", "1,2,4,8,16,32,64,128")).split(",") if x.strip()]
         print(f"[cotune] batch curve (no restart) over concurrency {levels}{pnote}")
-        print("\n" + render_curve(batch_curve(endpoint, levels, prompt=prompt, temperature=temp)))
+        emit("\n" + render_curve(batch_curve(endpoint, levels, prompt=prompt, temperature=temp)), "batch-curve", args)
         return 0
 
     if obj == "latency":                            # single/few-session: measure + recommend, NO restart/sweep
         c = getattr(args, "concurrency", 1)
         print(f"[cotune] single/few-session ({c}-conc): measure + recommend{pnote}.")
         tps = measure.lowc_throughput(endpoint, c=c, prompt=prompt, temperature=temp)
-        print("\n" + render_lowc_advice(tps, c))
+        report = render_lowc_advice(tps, c)
         if tps:                                     # closed-loop delta: before->after vs the last run
             from . import delta
             try:
@@ -536,9 +537,10 @@ def run(args) -> int:  # pragma: no cover - drives a server
             key = f"{endpoint}|{mid}|latency-c{c}"
             prev = delta.load_result(key)
             if prev:
-                print("\n" + delta.render_delta(prev.get("metrics", {}), {"single_tps": round(tps, 1)},
-                                                prev.get("ts")))
+                report += "\n\n" + delta.render_delta(prev.get("metrics", {}), {"single_tps": round(tps, 1)},
+                                                      prev.get("ts"))
             delta.save_result(key, {"single_tps": round(tps, 1)})
+        emit("\n" + report, "latency", args, data={"single_tps": tps, "concurrency": c})
         return 0
 
     rc = build_restart_cmd(args)                    # --restart-cmd > --model (auto-built) > None
@@ -553,7 +555,9 @@ def run(args) -> int:  # pragma: no cover - drives a server
         method = getattr(args, "spec_method", "qwen3_5_mtp")
         c = getattr(args, "concurrency", 1)
         print(f"[cotune] MTP/spec-decode K-sweep {ks} (method={method}, c={c}){pnote}; each K restarts.")
-        print("\n" + render_mtp(mtp_sweep(restart, endpoint, ks, method, c, prompt=prompt, temperature=temp), c))
+        res = mtp_sweep(restart, endpoint, ks, method, c, prompt=prompt, temperature=temp)
+        emit("\n" + render_mtp(res, c), "mtp-sweep", args,
+             data={"k": [r[0] for r in res], "tok_s": [r[1] for r in res], "accept": [r[2] for r in res]})
         return 0
 
     if getattr(args, "auto", False):
@@ -561,7 +565,8 @@ def run(args) -> int:  # pragma: no cover - drives a server
         best, history, recs = auto_tune(_live_trial(restart, endpoint, obj, temperature=temp),
                                         seed_seqs=getattr(args, "seed", 32),
                                         seqs_ceiling=getattr(args, "seqs_ceiling", 256))
-        print("\n" + render_auto(best, history, recs, obj))
+        emit("\n" + render_auto(best, history, recs, obj), "auto", args,
+             data={"best": best.config if best else None})
         return 0
 
     if not getattr(args, "sweep", None):
@@ -576,5 +581,5 @@ def run(args) -> int:  # pragma: no cover - drives a server
     grid = expand_grid(spec)
     print(f"[cotune] grid = {len(grid)} configs; each restarts the server (~minutes). objective={obj}")
     points = run_sweep(grid, restart, endpoint, obj)
-    print("\n" + render(points, obj))
+    emit("\n" + render(points, obj), "sweep", args, data={"points": [p.to_dict() for p in points]})
     return 0

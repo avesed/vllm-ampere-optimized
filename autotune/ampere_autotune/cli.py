@@ -83,6 +83,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="sampling temperature; OMIT to use the model's default (tests never force temp=0)")
     ct.add_argument("--ready-timeout", type=int, default=600,
                     help="GUARD: max seconds to wait for /health per vLLM bring-up (hard-capped at 600)")
+    ct.add_argument("--output", "-o", default=None,
+                    help="save the result here (file or dir); default ~/.local/state/ampere-autotune/results/ "
+                         "(in docker, mount a volume + point here — the default is ephemeral). Always also printed.")
 
     tune = sub.add_parser("tune", help="HALF-B: characterize a stable clock profile (host root)")
     _add_common(tune)
