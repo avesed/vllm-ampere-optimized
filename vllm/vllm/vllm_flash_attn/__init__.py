@@ -24,6 +24,7 @@ from vllm.vllm_flash_attn.flash_attn_interface import (  # noqa: E402
     FA2_AVAILABLE,
     FA3_AVAILABLE,
     fa_version_unsupported_reason,
+    flash_attn_kvcache_verify,
     flash_attn_varlen_func,
     get_scheduler_metadata,
     is_fa_version_supported,
@@ -37,6 +38,7 @@ if not (FA2_AVAILABLE or FA3_AVAILABLE):
 
 __all__ = [
     "fa_version_unsupported_reason",
+    "flash_attn_kvcache_verify",
     "flash_attn_varlen_func",
     "get_scheduler_metadata",
     "is_fa_version_supported",

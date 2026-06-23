@@ -1,0 +1,190 @@
+diff --git a/vllm/vllm/envs.py b/vllm/vllm/envs.py
+index bea9280..2f36f8b 100755
+--- a/vllm/vllm/envs.py
++++ b/vllm/vllm/envs.py
+@@ -85,6 +85,7 @@ if TYPE_CHECKING:
+     VLLM_MAIN_CUDA_VERSION: str = "13.0"
+     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
+     VLLM_BATCH_INVARIANT: bool = False
++    VLLM_FA2_KVCACHE_VERIFY: bool = True
+     VLLM_TRITON_ATTN_USE_TD: bool | None = None
+     MAX_JOBS: str | None = None
+     NVCC_THREADS: str | None = None
+@@ -596,6 +597,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # Enable batch-invariant mode: deterministic results regardless of
+     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
+     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
++    # [Ampere fork] Route the MTP spec-decode verify (uniform q=1+K) attention through the
++    # compiled FA2 fwd_kvcache (FlashDecoding split-KV) instead of flash_attn_varlen_func, which
++    # on FA2 runs splitkv with only batch*Hkv tiles (occupancy-starved at low Hkv / head_dim=256,
++    # cost grows with KV length -> MTP net-negative beyond ~10k ctx). Default on; opt out with "0".
++    "VLLM_FA2_KVCACHE_VERIFY": lambda: bool(
++        int(os.getenv("VLLM_FA2_KVCACHE_VERIFY", "1"))
++    ),
+     # [Ampere fork] Opt in to the int8-QK prefill attention backend (patch 0004): when "1",
+     # the `vllm.general_plugins` entry-point `register_int8qk` overrides the FLASH_ATTN backend
+     # with the int8-QK + fp16-PV prefill path for hd256 full-attn layers (everything else
+diff --git a/vllm/vllm/v1/attention/backends/fa_utils.py b/vllm/vllm/v1/attention/backends/fa_utils.py
+index 0d6a3d2..3bd95e0 100644
+--- a/vllm/vllm/v1/attention/backends/fa_utils.py
++++ b/vllm/vllm/v1/attention/backends/fa_utils.py
+@@ -18,6 +18,7 @@ _ROCM_FLASH_ATTN_AVAILABLE = False
+ if current_platform.is_cuda():
+     from vllm._custom_ops import reshape_and_cache_flash
+     from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
++        flash_attn_kvcache_verify,
+         flash_attn_varlen_func,
+         get_scheduler_metadata,
+     )
+diff --git a/vllm/vllm/v1/attention/backends/flash_attn.py b/vllm/vllm/v1/attention/backends/flash_attn.py
+index c56c4ee..d92ee4e 100755
+--- a/vllm/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/vllm/v1/attention/backends/flash_attn.py
+@@ -35,6 +35,7 @@ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ if is_flash_attn_varlen_func_available():
+     from vllm.v1.attention.backends.fa_utils import (
++        flash_attn_kvcache_verify,
+         flash_attn_supports_sinks,
+         flash_attn_varlen_func,
+         get_scheduler_metadata,
+@@ -793,6 +794,42 @@ class FlashAttentionImpl(AttentionImpl):
+                     if self.sliding_window is not None
+                     else None
+                 )
++                # [Ampere fork] MTP spec-decode verify (uniform q=1+K over a long
++                # paged KV) -> FA2 fwd_kvcache (FlashDecoding split-KV). FA2 varlen
++                # with q>1 does not KV-split (occupancy-starved at low num_kv_heads /
++                # head_dim=256, cost grows with KV length); fwd_kvcache is captured
++                # into the FULL cudagraph (proven capturable at num_splits=0) and
++                # recovers MTP from net-negative to net-positive at long context
++                # (9B: +54% @16k, +76% @32k decode). Every AND-term below falls back
++                # to the unchanged varlen call, so prefill / chunked-prefill / mixed
++                # batches / fp8-KV / SWA / alibi / softcap / sinks are untouched.
++                q_len = max_seqlen_q
++                num_reqs = seqused_k.shape[0]
++                if (
++                    envs.VLLM_FA2_KVCACHE_VERIFY
++                    and self.vllm_flash_attn_version == 2
++                    and q_len > 1
++                    and num_actual_tokens == num_reqs * q_len
++                    and self.sliding_window == (-1, -1)
++                    and self.alibi_slopes is None
++                    and self.logits_soft_cap == 0
++                    and self.sinks is None
++                    and not is_quantized_kv_cache(self.kv_cache_dtype)
++                    and not envs.VLLM_BATCH_INVARIANT
++                ):
++                    flash_attn_kvcache_verify(
++                        q=query[:num_actual_tokens],
++                        k_cache=key_cache,
++                        v_cache=value_cache,
++                        out=output[:num_actual_tokens],
++                        seqlens_k=seqused_k,
++                        block_table=block_table,
++                        num_reqs=num_reqs,
++                        q_len=q_len,
++                        softmax_scale=self.scale,
++                        causal=attn_metadata.causal,
++                    )
++                    return output
+                 flash_attn_varlen_func(
+                     q=query[:num_actual_tokens],
+                     k=key_cache,
+diff --git a/vllm/vllm/vllm_flash_attn/__init__.py b/vllm/vllm/vllm_flash_attn/__init__.py
+index 7dea1f6..82cf264 100644
+--- a/vllm/vllm/vllm_flash_attn/__init__.py
++++ b/vllm/vllm/vllm_flash_attn/__init__.py
+@@ -24,6 +24,7 @@ from vllm.vllm_flash_attn.flash_attn_interface import (  # noqa: E402
+     FA2_AVAILABLE,
+     FA3_AVAILABLE,
+     fa_version_unsupported_reason,
++    flash_attn_kvcache_verify,
+     flash_attn_varlen_func,
+     get_scheduler_metadata,
+     is_fa_version_supported,
+@@ -37,6 +38,7 @@ if not (FA2_AVAILABLE or FA3_AVAILABLE):
+ 
+ __all__ = [
+     "fa_version_unsupported_reason",
++    "flash_attn_kvcache_verify",
+     "flash_attn_varlen_func",
+     "get_scheduler_metadata",
+     "is_fa_version_supported",
+diff --git a/vllm/vllm/vllm_flash_attn/flash_attn_interface.py b/vllm/vllm/vllm_flash_attn/flash_attn_interface.py
+index 33955bb..8f496a1 100644
+--- a/vllm/vllm/vllm_flash_attn/flash_attn_interface.py
++++ b/vllm/vllm/vllm_flash_attn/flash_attn_interface.py
+@@ -394,6 +394,72 @@ def flash_attn_varlen_func(
+     return (out, softmax_lse) if return_softmax_lse else out
+ 
+ 
++_FWD_KVCACHE_ARITY_OK = False
++
++
++def flash_attn_kvcache_verify(
++    q,
++    k_cache,
++    v_cache,
++    out,
++    seqlens_k,
++    block_table,
++    num_reqs,
++    q_len,
++    softmax_scale,
++    causal=True,
++):
++    """FlashDecoding split-KV path for uniform q=1+K MTP spec-verify batches.
++
++    FA2 ``flash_attn_varlen_func`` with q>1 runs splitkv with only batch*Hkv
++    tiles (occupancy-starved at low num_kv_heads / head_dim=256, cost grows with
++    KV length). ``fwd_kvcache`` adds the split-combine kernel so it actually
++    splits over KV (~4.3x at 32k ctx). The verify tokens are already in the paged
++    cache (written by reshape_and_cache before attention), so k/v are None and
++    ``seqlens_k`` is the full per-request length. Reshapes the flat
++    [num_actual_tokens, H, D] query to [num_reqs, q_len, H, D] (free view on the
++    contiguous slice) and writes ``out`` in place.
++    """
++    global _FWD_KVCACHE_ARITY_OK
++    if not _FWD_KVCACHE_ARITY_OK:
++        n_args = len(torch.ops._vllm_fa2_C.fwd_kvcache.default._schema.arguments)
++        assert n_args == 20, (
++            f"_vllm_fa2_C.fwd_kvcache schema arity {n_args} != 20; "
++            "flash_attn_kvcache_verify positional args need review"
++        )
++        _FWD_KVCACHE_ARITY_OK = True
++    h, d = q.shape[-2], q.shape[-1]
++    q4 = q.view(num_reqs, q_len, h, d)
++    out4 = out.view(num_reqs, q_len, h, d)
++    # positional order == _vllm_fa2_C.fwd_kvcache schema:
++    # (q, kcache, vcache, k, v, seqlens_k, rotary_cos, rotary_sin, cache_batch_idx,
++    #  leftpad_k, block_table, alibi_slopes, out, softmax_scale, is_causal,
++    #  window_size_left, window_size_right, softcap, is_rotary_interleaved, num_splits)
++    torch.ops._vllm_fa2_C.fwd_kvcache(
++        q4,
++        k_cache,
++        v_cache,
++        None,  # k: verify tokens already written to cache
++        None,  # v
++        seqlens_k,
++        None,  # rotary_cos
++        None,  # rotary_sin
++        None,  # cache_batch_idx
++        None,  # leftpad_k
++        block_table,
++        None,  # alibi_slopes
++        out4,  # written in place; shares storage with `out`
++        softmax_scale,
++        causal,
++        -1,  # window_size_left (full context)
++        -1,  # window_size_right
++        0.0,  # softcap off
++        False,  # is_rotary_interleaved
++        0,  # num_splits = 0 -> kernel auto-splits over KV
++    )
++    return out
++
++
+ def sparse_attn_func(
+     q,
+     k,
