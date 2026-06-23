@@ -48,41 +48,61 @@ def model_id(endpoint: str) -> str:  # pragma: no cover - needs a server
     return model_info(endpoint)[0]
 
 
-def _one_completion(endpoint: str, mid: str, prompt: str, max_tokens: int) -> int:  # pragma: no cover
+# Preset scenario prompts — accept-rate / optimal MTP-K is workload-dependent, so let the user
+# benchmark on the content shape that matches their traffic.
+DEFAULT_PROMPT = "Write a detailed paragraph about the history of computing, then continue at length."
+SCENARIO_PROMPTS = {
+    "general": DEFAULT_PROMPT,
+    "code": "Implement a thread-safe LRU cache in Python with O(1) get/put, full type hints and "
+            "docstrings, then write pytest unit tests for it:",
+    "writing": "Write a detailed, engaging essay on how cities shaped human civilization, with "
+               "vivid concrete examples and smooth transitions:",
+    "chat": "I'm planning a two-week spring trip to Japan. Plan a day-by-day itinerary across Tokyo, "
+            "Kyoto and Osaka with food recommendations and travel tips:",
+    "reasoning": "Solve step by step, showing all work: a train leaves A at 60 mph and another leaves "
+                 "B 90 miles away at 40 mph toward it; when do they meet? Then prove sqrt(2) is irrational.",
+}
+
+
+def _one_completion(endpoint: str, mid: str, prompt: str, max_tokens: int,
+                    temperature=None) -> int:  # pragma: no cover
     import requests
-    r = requests.post(endpoint.rstrip("/") + "/v1/completions", timeout=300,
-                      json={"model": mid, "prompt": prompt, "max_tokens": max_tokens,
-                            "temperature": 0.0, "ignore_eos": True})
+    body = {"model": mid, "prompt": prompt, "max_tokens": max_tokens, "ignore_eos": True}
+    if temperature is not None:                       # else: let vLLM use the model's default sampling
+        body["temperature"] = temperature
+    r = requests.post(endpoint.rstrip("/") + "/v1/completions", timeout=300, json=body)
     r.raise_for_status()
     return int(r.json().get("usage", {}).get("completion_tokens", max_tokens))
 
 
-def concurrency_sweep(endpoint: str, mid: str, levels=(1, 8, 32, 64),
-                      max_tokens: int = 128) -> List[Tuple[int, float]]:  # pragma: no cover - needs a server
+def concurrency_sweep(endpoint: str, mid: str, levels=(1, 8, 32, 64), max_tokens: int = 128,
+                      prompt=None, temperature=None) -> List[Tuple[int, float]]:  # pragma: no cover - needs a server
     """For each concurrency C, fire C identical completions and return (C, aggregate_decode_tok/s)."""
-    prompt = "Write a detailed paragraph about the history of computing, then continue at length."
+    prompt = prompt or DEFAULT_PROMPT
     results: List[Tuple[int, float]] = []
     try:                                  # warm-up: the first post-restart request is cold (caches),
-        _one_completion(endpoint, mid, prompt, 8)   # which would tank the c=1 single-stream number
+        _one_completion(endpoint, mid, prompt, 8, temperature)   # which would tank the c=1 number
     except Exception:
         pass
     for c in levels:
         t0 = time.time()
         with ThreadPoolExecutor(max_workers=c) as ex:
-            toks = list(ex.map(lambda _: _one_completion(endpoint, mid, prompt, max_tokens), range(c)))
+            toks = list(ex.map(lambda _: _one_completion(endpoint, mid, prompt, max_tokens, temperature), range(c)))
         dt = time.time() - t0
         results.append((c, (sum(toks) / dt) if dt > 0 else 0.0))
     return results
 
 
-def lowc_throughput(endpoint: str, c: int = 1, max_tokens: int = 128, reps: int = 2) -> Optional[float]:  # pragma: no cover - needs a server
+def lowc_throughput(endpoint: str, c: int = 1, max_tokens: int = 128, reps: int = 2,
+                    prompt=None, temperature=None) -> Optional[float]:  # pragma: no cover - needs a server
     """Decode tok/s at a fixed LOW concurrency (c=1 single-session, or a few). Median of reps after
     a warm-up. This is the objective for single/few-session max throughput (per-stream regime)."""
     try:
         mid, _ = model_info(endpoint)
     except Exception:
         return None
-    vals = [sw[0][1] for sw in (concurrency_sweep(endpoint, mid, (c,), max_tokens) for _ in range(reps)) if sw]
+    vals = [sw[0][1] for sw in (concurrency_sweep(endpoint, mid, (c,), max_tokens, prompt, temperature)
+                                for _ in range(reps)) if sw]
     if not vals:
         return None
     vals.sort()
@@ -90,7 +110,7 @@ def lowc_throughput(endpoint: str, c: int = 1, max_tokens: int = 128, reps: int 
 
 
 def _burst_and_scrape(endpoint: str, mid: str, concurrency: int, max_tokens: int = 256,
-                      poll_s: float = 8.0) -> dict:  # pragma: no cover - needs a server
+                      poll_s: float = 8.0, temperature=None) -> dict:  # pragma: no cover - needs a server
     """Hold `concurrency` long generations IN FLIGHT and scrape /metrics WHILE they run (not after),
     so running/KV/waiting are the real under-load peaks. Returns peak signals + preempt rate."""
     prompt = "Write an exhaustive essay on the history of computing; keep going in great detail."
@@ -100,7 +120,7 @@ def _burst_and_scrape(endpoint: str, mid: str, concurrency: int, max_tokens: int
     samples = []                                          # per-poll (running, kv) for multi-window confidence
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futs = [ex.submit(_one_completion, endpoint, mid, prompt, max_tokens) for _ in range(concurrency)]
+        futs = [ex.submit(_one_completion, endpoint, mid, prompt, max_tokens, temperature) for _ in range(concurrency)]
         while time.time() - t0 < poll_s and any(not f.done() for f in futs):
             d = scrape_metrics(endpoint)
             run_now = _max(d, "vllm:num_requests_running")
@@ -124,18 +144,19 @@ def _burst_and_scrape(endpoint: str, mid: str, concurrency: int, max_tokens: int
     return peak
 
 
-def build_state(endpoint: str, levels=(1, 8, 32), burst_c: int = 48) -> Optional[ServerState]:  # pragma: no cover - needs a server
+def build_state(endpoint: str, levels=(1, 8, 32), burst_c: int = 48,
+                temperature=None) -> Optional[ServerState]:  # pragma: no cover - needs a server
     """Throughput from a concurrency sweep + load state from an under-load burst -> ServerState."""
     try:
         mid, max_len = model_info(endpoint)
     except Exception:
         return None
-    sweep = concurrency_sweep(endpoint, mid, levels)
+    sweep = concurrency_sweep(endpoint, mid, levels, temperature=temperature)
     tps = [s for _, s in sweep]
     single = next((s for c, s in sweep if c == 1), tps[0] if tps else 0.0)
     peak_tps = max(tps) if tps else 0.0
     rising = len(tps) >= 2 and tps[-1] > tps[-2] * 1.05
-    load = _burst_and_scrape(endpoint, mid, concurrency=burst_c)
+    load = _burst_and_scrape(endpoint, mid, concurrency=burst_c, temperature=temperature)
     running_peak = load["running"] or float(burst_c)
     hit = load.get("prefix_hit", -1.0)
     samples = load.get("_samples", [])                   # multi-window confidence fractions

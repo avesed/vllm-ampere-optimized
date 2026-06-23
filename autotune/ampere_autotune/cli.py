@@ -66,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="sweep MTP/spec-decode K (num_speculative_tokens); needs an mtp-head checkpoint")
     ct.add_argument("--mtp-ks", default="0,1,2,3", help="(--mtp-sweep) K values to try; 0 = baseline (no spec)")
     ct.add_argument("--spec-method", default="qwen3_5_mtp", help="(--mtp-sweep) speculative method name")
+    ct.add_argument("--scenario", default=None, choices=["general", "code", "writing", "chat", "reasoning"],
+                    help="preset benchmark prompt (workload shape — accept-rate / optimal K depend on it)")
+    ct.add_argument("--prompt-file", default=None, help="benchmark on YOUR prompt (overrides --scenario)")
+    ct.add_argument("--temperature", type=float, default=None,
+                    help="sampling temperature; OMIT to use the model's default (tests never force temp=0)")
     ct.add_argument("--ready-timeout", type=int, default=600,
                     help="GUARD: max seconds to wait for /health per vLLM bring-up (hard-capped at 600)")
 

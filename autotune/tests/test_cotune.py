@@ -8,6 +8,21 @@ from ampere_autotune.half_a.cotune import (
 )
 
 
+def test_scenario_presets_and_prompt_resolution(tmp_path):
+    import types
+    from ampere_autotune.half_a.cotune import resolve_prompt
+    from ampere_autotune.half_a.measure import SCENARIO_PROMPTS
+    assert {"general", "code", "writing", "chat", "reasoning"} <= set(SCENARIO_PROMPTS)
+    # preset by name
+    assert resolve_prompt(types.SimpleNamespace(scenario="code", prompt_file=None)) == SCENARIO_PROMPTS["code"]
+    # no selection -> None (let the measurement use its default)
+    assert resolve_prompt(types.SimpleNamespace(scenario=None, prompt_file=None)) is None
+    # a prompt file overrides the scenario
+    f = tmp_path / "p.txt"
+    f.write_text("MY CUSTOM PROMPT\n")
+    assert resolve_prompt(types.SimpleNamespace(scenario="code", prompt_file=str(f))) == "MY CUSTOM PROMPT"
+
+
 def test_ready_wait_guard_caps_at_600():
     assert MAX_WAIT_S == 600
     assert _clamp_wait(9999) == 600          # over-cap -> clamped
@@ -24,7 +39,7 @@ def test_render_mtp_picks_best_and_warns_workload_dependent():
     assert "BEST on THIS prompt: K=2" in out
     assert "+53% vs K=0" in out                  # 130/85-1 ~ +53%
     assert "62%" in out                          # accept-rate surfaced
-    assert "WORKLOAD-DEPENDENT" in out and "representative" in out
+    assert "WORKLOAD-DEPENDENT" in out and ("real traffic" in out or "--scenario" in out)
 
 
 def test_render_mtp_handles_failed_k_and_baseline_best():

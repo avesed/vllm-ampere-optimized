@@ -317,7 +317,7 @@ def auto_tune(trial_fn: Callable[[Dict[str, str]], Trial],
     return (best if _valid(best) else None, history, recs)
 
 
-def _live_trial(restart_fn, endpoint: str, objective: str):  # pragma: no cover - drives a server
+def _live_trial(restart_fn, endpoint: str, objective: str, temperature=None):  # pragma: no cover - drives a server
     def trial(cfg: Dict[str, str]) -> Trial:
         try:
             up = restart_fn(cfg)
@@ -325,7 +325,7 @@ def _live_trial(restart_fn, endpoint: str, objective: str):  # pragma: no cover 
             return Trial(cfg, float("-inf"), False, note=f"restart error: {e}")
         if not up:
             return Trial(cfg, float("-inf"), False, note="not ready (OOM?)")
-        st = measure.build_state(endpoint, levels=(1, 32, 128), burst_c=160)
+        st = measure.build_state(endpoint, levels=(1, 32, 128), burst_c=160, temperature=temperature)
         if st is None:
             return Trial(cfg, float("-inf"), False, note="measure failed")
         sp = SweepPoint(cfg, True, st.decode_tps_max_c, st.decode_tps_single,
@@ -352,10 +352,10 @@ def render_lowc_advice(tps, c: int) -> str:
 
 
 def mtp_sweep(restart_fn, endpoint: str, ks=(0, 1, 2, 3), method: str = "qwen3_5_mtp",
-              c: int = 1, log=print):  # pragma: no cover - needs a server
+              c: int = 1, prompt=None, temperature=None, log=print):  # pragma: no cover - needs a server
     """RESTART-class sweep of MTP/spec-decode K (num_speculative_tokens). For each K: restart with
     the spec config (K=0 = baseline, no spec), measure single-stream decode tok/s + accept-rate.
-    ACCEPT-RATE (hence optimal K) is WORKLOAD-DEPENDENT — measured on the probe prompt only."""
+    ACCEPT-RATE (hence optimal K) is WORKLOAD-DEPENDENT — measured on the given prompt only."""
     results = []
     for k in ks:
         if k == 0:
@@ -372,7 +372,7 @@ def mtp_sweep(restart_fn, endpoint: str, ks=(0, 1, 2, 3), method: str = "qwen3_5
             results.append((k, None, None, "not ready (OOM / bad spec config?)"))
             log(f"  K={k}: not ready")
             continue
-        tps = measure.lowc_throughput(endpoint, c=c)
+        tps = measure.lowc_throughput(endpoint, c=c, prompt=prompt, temperature=temperature)
         acc = measure.spec_accept_rate(endpoint) if k > 0 else None
         results.append((k, tps, acc, ""))
         log(f"  K={k}: {tps:.0f} tok/s" + (f", accept {acc:.0%}" if acc is not None else ""))
@@ -396,20 +396,21 @@ def render_mtp(results, c: int) -> str:
         lines.append(f"\nBEST on THIS prompt: K={bk} -> {bt:.0f} tok/s single-stream.")
     lines.append("\nWORKLOAD-DEPENDENT — the crux: accept-rate (so the optimal K) varies by content. Structured /")
     lines.append("code / repetitive text accepts MORE (higher K pays); creative / high-entropy accepts LESS")
-    lines.append("(K=1, or spec off). This sweep used a generic prose prompt -> RE-RUN on representative traffic")
-    lines.append("before fixing K. Also: MTP helps LOW concurrency only (spec compute hurts aggregate at high")
-    lines.append("batch, and v0.23 has no auto-disable-by-batch-size) -> gate spec on/off per QPS regime at startup.")
+    lines.append("(K=1, or spec off). This sweep used the GIVEN prompt -> run with --scenario/--prompt-file")
+    lines.append("matching your real traffic before fixing K. Also: MTP helps LOW concurrency only (spec compute")
+    lines.append("hurts aggregate at high batch, no v0.23 auto-disable) -> gate spec on/off per QPS regime at startup.")
     return "\n".join(lines)
 
 
-def batch_curve(endpoint: str, levels, max_tokens: int = 128):  # pragma: no cover - needs a server
+def batch_curve(endpoint: str, levels, max_tokens: int = 128,
+                prompt=None, temperature=None):  # pragma: no cover - needs a server
     """Profile the RUNNING server (no restart) across offered concurrency -> per-batch aggregate AND
     per-session tok/s. Shows the throughput<->latency tradeoff so you pick the operating batch."""
     try:
         mid, _ = measure.model_info(endpoint)
     except Exception:
         return []
-    sweep = measure.concurrency_sweep(endpoint, mid, tuple(levels), max_tokens)
+    sweep = measure.concurrency_sweep(endpoint, mid, tuple(levels), max_tokens, prompt, temperature)
     return [(c, agg, (agg / c if c else 0.0)) for (c, agg) in sweep]
 
 
@@ -446,20 +447,38 @@ def render_auto(best: Optional[Trial], history: List[Trial], recs, objective: st
     return "\n".join(lines)
 
 
+def resolve_prompt(args):
+    """--prompt-file (custom) > --scenario (preset) > None (default prose). Returns the prompt string."""
+    pf = getattr(args, "prompt_file", None)
+    if pf:
+        with open(pf, "r") as f:
+            return f.read().strip()
+    scen = getattr(args, "scenario", None)
+    if scen:
+        from .measure import SCENARIO_PROMPTS
+        return SCENARIO_PROMPTS.get(scen, SCENARIO_PROMPTS["general"])
+    return None
+
+
 def run(args) -> int:  # pragma: no cover - drives a server
     endpoint = (getattr(args, "endpoint", None) or "http://localhost:8000").rstrip("/")
     obj = getattr(args, "objective", "throughput")
+    prompt = resolve_prompt(args)
+    temp = getattr(args, "temperature", None)          # None -> don't send -> vLLM model default (never temp=0)
+    pnote = (f" [prompt={getattr(args, 'scenario', None) or 'file' if getattr(args, 'prompt_file', None) else 'default'}"
+             f", temp={'default' if temp is None else temp}]")
 
     if getattr(args, "batch_curve", False):         # no restart — profile the running server as-is
         levels = [int(x) for x in str(getattr(args, "levels", "1,2,4,8,16,32,64,128")).split(",") if x.strip()]
-        print(f"[cotune] batch curve (no restart) over concurrency {levels}")
-        print("\n" + render_curve(batch_curve(endpoint, levels)))
+        print(f"[cotune] batch curve (no restart) over concurrency {levels}{pnote}")
+        print("\n" + render_curve(batch_curve(endpoint, levels, prompt=prompt, temperature=temp)))
         return 0
 
     if obj == "latency":                            # single/few-session: measure + recommend, NO restart/sweep
         c = getattr(args, "concurrency", 1)
-        print(f"[cotune] single/few-session ({c}-conc): measure + recommend (nothing accuracy-neutral to sweep).")
-        print("\n" + render_lowc_advice(measure.lowc_throughput(endpoint, c=c), c))
+        print(f"[cotune] single/few-session ({c}-conc): measure + recommend{pnote}.")
+        tps = measure.lowc_throughput(endpoint, c=c, prompt=prompt, temperature=temp)
+        print("\n" + render_lowc_advice(tps, c))
         return 0
 
     if not getattr(args, "restart_cmd", None):
@@ -471,13 +490,13 @@ def run(args) -> int:  # pragma: no cover - drives a server
         ks = tuple(int(x) for x in str(getattr(args, "mtp_ks", "0,1,2,3")).split(",") if x.strip())
         method = getattr(args, "spec_method", "qwen3_5_mtp")
         c = getattr(args, "concurrency", 1)
-        print(f"[cotune] MTP/spec-decode K-sweep {ks} (method={method}, c={c}); each K restarts.")
-        print("\n" + render_mtp(mtp_sweep(restart, endpoint, ks, method, c), c))
+        print(f"[cotune] MTP/spec-decode K-sweep {ks} (method={method}, c={c}){pnote}; each K restarts.")
+        print("\n" + render_mtp(mtp_sweep(restart, endpoint, ks, method, c, prompt=prompt, temperature=temp), c))
         return 0
 
     if getattr(args, "auto", False):
-        print(f"[cotune] AUTO predict-then-verify (accuracy-neutral sweep). objective={obj}")
-        best, history, recs = auto_tune(_live_trial(restart, endpoint, obj),
+        print(f"[cotune] AUTO predict-then-verify (accuracy-neutral sweep). objective={obj}{pnote}")
+        best, history, recs = auto_tune(_live_trial(restart, endpoint, obj, temperature=temp),
                                         seed_seqs=getattr(args, "seed", 32),
                                         seqs_ceiling=getattr(args, "seqs_ceiling", 256))
         print("\n" + render_auto(best, history, recs, obj))
