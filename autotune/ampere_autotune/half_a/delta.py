@@ -51,6 +51,13 @@ def render_delta(prev_metrics: Dict[str, float], cur_metrics: Dict[str, float],
         hib = any(k in m for k in higher_is_better)
         improved = (b > a) if hib else (b < a)
         regressed = (b < a * (1 - regress_frac)) if hib else (b > a * (1 + regress_frac))
-        tag = "  <-- REGRESSION" if regressed else ("  (improved)" if improved else "")
+        if regressed:
+            tag = "  <-- REGRESSION"
+        elif abs(pct) < 2.0:
+            tag = "  (stable)"                       # within noise — not a real change
+        elif improved:
+            tag = "  (improved)"
+        else:
+            tag = ""
         lines.append(f"  {m}: {a:.1f} -> {b:.1f} ({pct:+.0f}%){tag}")
     return "\n".join(lines)

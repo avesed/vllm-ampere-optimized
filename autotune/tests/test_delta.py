@@ -12,5 +12,10 @@ def test_render_delta_flags_regression():
     assert "REGRESSION" in out
 
 
+def test_render_delta_stable_within_noise():
+    out = render_delta({"single_tps": 65.2}, {"single_tps": 65.3})   # +0.1% -> noise
+    assert "stable" in out and "improved" not in out
+
+
 def test_render_delta_no_comparable_prior():
     assert "no comparable" in render_delta({"x": 1.0}, {"y": 2.0})
