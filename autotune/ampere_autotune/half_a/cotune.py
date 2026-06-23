@@ -528,6 +528,18 @@ def run(args) -> int:  # pragma: no cover - drives a server
         print(f"[cotune] single/few-session ({c}-conc): measure + recommend{pnote}.")
         tps = measure.lowc_throughput(endpoint, c=c, prompt=prompt, temperature=temp)
         print("\n" + render_lowc_advice(tps, c))
+        if tps:                                     # closed-loop delta: before->after vs the last run
+            from . import delta
+            try:
+                mid = measure.model_info(endpoint)[0]
+            except Exception:
+                mid = "?"
+            key = f"{endpoint}|{mid}|latency-c{c}"
+            prev = delta.load_result(key)
+            if prev:
+                print("\n" + delta.render_delta(prev.get("metrics", {}), {"single_tps": round(tps, 1)},
+                                                prev.get("ts")))
+            delta.save_result(key, {"single_tps": round(tps, 1)})
         return 0
 
     rc = build_restart_cmd(args)                    # --restart-cmd > --model (auto-built) > None
