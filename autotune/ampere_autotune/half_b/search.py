@@ -40,6 +40,16 @@ def snap(mhz: int, tick: int = TICK) -> int:
     return int(round(mhz / tick)) * tick
 
 
+def _combine_golden(vals):
+    """WORST-of-N over tri-state golden: any explicit False -> False (a single mismatch rejects);
+    all None -> None (golden not run; never fabricate a True); otherwise True."""
+    if any(v is False for v in vals):
+        return False
+    if all(v is None for v in vals):
+        return None
+    return True
+
+
 def _combine(measure_fn: MeasureFn, off: int, samples: int) -> Measurement:
     """Probe ``off`` ``samples`` times -> a WORST-of-N Measurement (C1).
 
@@ -52,7 +62,7 @@ def _combine(measure_fn: MeasureFn, off: int, samples: int) -> Measurement:
     juncs = [m.junction_c for m in ms if m.junction_c is not None]
     return Measurement(
         offset_mhz=off,
-        golden_ok=all(m.golden_ok for m in ms),
+        golden_ok=_combine_golden([m.golden_ok for m in ms]),
         mismatch_count=max(m.mismatch_count for m in ms),
         read_gbs=(bws[len(bws) // 2] if bws else None),
         junction_c=(max(juncs) if juncs else None),

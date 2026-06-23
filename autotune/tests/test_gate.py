@@ -39,7 +39,7 @@ def test_reject_beats_knee():
 
 def test_knee_when_bw_stops_rising():
     prev = m(off=200, gbs=900.0)
-    cur = m(off=300, gbs=905.0)  # +0.55% < 1.5% -> knee
+    cur = m(off=300, gbs=901.0)  # +0.11% < 0.3% -> knee (real GDDR6X climbs ~0.5%/105MHz)
     assert evaluate(cur, prev, TH, GX).status == gate.KNEE
 
 
