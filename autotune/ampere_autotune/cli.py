@@ -61,7 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
     ct.add_argument("--objective", default="throughput", choices=["throughput", "latency"],
                     help="throughput=aggregate @ high concurrency; latency=single/few-session max throughput")
     ct.add_argument("--concurrency", type=int, default=1,
-                    help="(--auto --objective latency) sessions to optimize for (1=single, e.g. 4=few)")
+                    help="(--objective latency / --mtp-sweep) sessions to optimize for (1=single, e.g. 4=few)")
+    ct.add_argument("--mtp-sweep", action="store_true",
+                    help="sweep MTP/spec-decode K (num_speculative_tokens); needs an mtp-head checkpoint")
+    ct.add_argument("--mtp-ks", default="0,1,2,3", help="(--mtp-sweep) K values to try; 0 = baseline (no spec)")
+    ct.add_argument("--spec-method", default="qwen3_5_mtp", help="(--mtp-sweep) speculative method name")
     ct.add_argument("--ready-timeout", type=int, default=600, help="seconds to wait for /health per config")
 
     tune = sub.add_parser("tune", help="HALF-B: characterize a stable clock profile (host root)")

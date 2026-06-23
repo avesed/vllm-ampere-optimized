@@ -335,6 +335,57 @@ def render_lowc_advice(tps, c: int) -> str:
         "  - max-num-seqs / max-model-len are CAPACITY knobs — they do NOT change per-stream speed."])
 
 
+def mtp_sweep(restart_fn, endpoint: str, ks=(0, 1, 2, 3), method: str = "qwen3_5_mtp",
+              c: int = 1, log=print):  # pragma: no cover - needs a server
+    """RESTART-class sweep of MTP/spec-decode K (num_speculative_tokens). For each K: restart with
+    the spec config (K=0 = baseline, no spec), measure single-stream decode tok/s + accept-rate.
+    ACCEPT-RATE (hence optimal K) is WORKLOAD-DEPENDENT — measured on the probe prompt only."""
+    results = []
+    for k in ks:
+        if k == 0:
+            cfg = {}                                            # baseline: no speculative decoding
+        else:
+            # single-quoted JSON survives config_flags (opaque value) + the shell restart template
+            cfg = {"--speculative-config": f"'{{\"method\":\"{method}\",\"num_speculative_tokens\":{k}}}'"}
+        try:
+            up = restart_fn(cfg)
+        except Exception as e:
+            results.append((k, None, None, f"restart error: {e}"))
+            continue
+        if not up:
+            results.append((k, None, None, "not ready (OOM / bad spec config?)"))
+            log(f"  K={k}: not ready")
+            continue
+        tps = measure.lowc_throughput(endpoint, c=c)
+        acc = measure.spec_accept_rate(endpoint) if k > 0 else None
+        results.append((k, tps, acc, ""))
+        log(f"  K={k}: {tps:.0f} tok/s" + (f", accept {acc:.0%}" if acc is not None else ""))
+    return results
+
+
+def render_mtp(results, c: int) -> str:
+    lines = [f"ampere-autotune — MTP/spec-decode K-sweep (single-stream c={c}; decode tok/s)\n",
+             "  K | decode tok/s | accept-rate | note"]
+    base = next((t for (k, t, _, _) in results if k == 0 and t is not None), None)
+    feasible = [(k, t, a) for (k, t, a, _) in results if t is not None]
+    for k, tps, acc, note in results:
+        if tps is None:
+            lines.append(f"  {k} | (failed: {note})")
+            continue
+        gain = f" ({(tps / base - 1) * 100:+.0f}% vs K=0)" if base and k != 0 else ""
+        accs = f"{acc * 100:.0f}%" if acc is not None else "n/a"
+        lines.append(f"  {k} | {tps:>11.0f}{gain} | {accs:>11}")
+    if feasible:
+        bk, bt, _ = max(feasible, key=lambda r: r[1])
+        lines.append(f"\nBEST on THIS prompt: K={bk} -> {bt:.0f} tok/s single-stream.")
+    lines.append("\nWORKLOAD-DEPENDENT — the crux: accept-rate (so the optimal K) varies by content. Structured /")
+    lines.append("code / repetitive text accepts MORE (higher K pays); creative / high-entropy accepts LESS")
+    lines.append("(K=1, or spec off). This sweep used a generic prose prompt -> RE-RUN on representative traffic")
+    lines.append("before fixing K. Also: MTP helps LOW concurrency only (spec compute hurts aggregate at high")
+    lines.append("batch, and v0.23 has no auto-disable-by-batch-size) -> gate spec on/off per QPS regime at startup.")
+    return "\n".join(lines)
+
+
 def batch_curve(endpoint: str, levels, max_tokens: int = 128):  # pragma: no cover - needs a server
     """Profile the RUNNING server (no restart) across offered concurrency -> per-batch aggregate AND
     per-session tok/s. Shows the throughput<->latency tradeoff so you pick the operating batch."""
@@ -399,6 +450,14 @@ def run(args) -> int:  # pragma: no cover - drives a server
         print("[cotune] --sweep/--auto need --restart-cmd \"...{flags}...\" (or --batch-curve / --objective latency, no restart).")
         return 2
     restart = make_restart_fn(args.restart_cmd, endpoint, getattr(args, "ready_timeout", 600))
+
+    if getattr(args, "mtp_sweep", False):
+        ks = tuple(int(x) for x in str(getattr(args, "mtp_ks", "0,1,2,3")).split(",") if x.strip())
+        method = getattr(args, "spec_method", "qwen3_5_mtp")
+        c = getattr(args, "concurrency", 1)
+        print(f"[cotune] MTP/spec-decode K-sweep {ks} (method={method}, c={c}); each K restarts.")
+        print("\n" + render_mtp(mtp_sweep(restart, endpoint, ks, method, c), c))
+        return 0
 
     if getattr(args, "auto", False):
         print(f"[cotune] AUTO predict-then-verify (accuracy-neutral sweep). objective={obj}")

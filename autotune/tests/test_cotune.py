@@ -3,8 +3,22 @@ import pytest
 
 from ampere_autotune.half_a.cotune import (
     parse_sweep, expand_grid, config_flags, score, render, make_restart_fn, SweepPoint,
-    auto_tune, render_curve, render_lowc_advice, banned_in, Trial,
+    auto_tune, render_curve, render_lowc_advice, render_mtp, banned_in, Trial,
 )
+
+
+def test_render_mtp_picks_best_and_warns_workload_dependent():
+    results = [(0, 85.0, None, ""), (1, 105.0, 0.55, ""), (2, 130.0, 0.62, ""), (3, 124.0, 0.40, "")]
+    out = render_mtp(results, 1)
+    assert "BEST on THIS prompt: K=2" in out
+    assert "+53% vs K=0" in out                  # 130/85-1 ~ +53%
+    assert "62%" in out                          # accept-rate surfaced
+    assert "WORKLOAD-DEPENDENT" in out and "representative" in out
+
+
+def test_render_mtp_handles_failed_k_and_baseline_best():
+    out = render_mtp([(0, 85.0, None, ""), (2, None, None, "OOM")], 1)
+    assert "failed: OOM" in out and "BEST on THIS prompt: K=0" in out
 
 
 def test_banned_flags_detected_with_replacements():

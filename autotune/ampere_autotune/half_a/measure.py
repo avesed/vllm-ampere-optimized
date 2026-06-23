@@ -160,6 +160,17 @@ def build_state(endpoint: str, levels=(1, 8, 32), burst_c: int = 48) -> Optional
     )
 
 
+def spec_accept_rate(endpoint: str) -> Optional[float]:  # pragma: no cover - needs a server
+    """Spec-decode acceptance = accepted/draft tokens from /metrics (best-effort; counter names vary).
+    None if no spec metrics (spec off or unsupported)."""
+    d = scrape_metrics(endpoint)
+    acc = (_sum(d, "vllm:spec_decode_num_accepted_tokens_total")
+           or _sum(d, "vllm:spec_decode_num_accepted_tokens"))
+    draft = (_sum(d, "vllm:spec_decode_num_draft_tokens_total")
+             or _sum(d, "vllm:spec_decode_num_draft_tokens"))
+    return (acc / draft) if draft > 0 else None
+
+
 def _prefix_hit(d: Dict[str, List[float]]) -> Optional[float]:
     q = _sum(d, "vllm:prefix_cache_queries_total") or _sum(d, "vllm:gpu_prefix_cache_queries_total")
     h = _sum(d, "vllm:prefix_cache_hits_total") or _sum(d, "vllm:gpu_prefix_cache_hits_total")
