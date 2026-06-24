@@ -29,6 +29,21 @@ Why op +25% → e2e ~1-4%: the deployment is a **hybrid** (only 8/32 layers are 
 GatedDeltaNet + MLP), so attention is a minority of prefill — its fraction grows O(L²) with context, so
 the win grows with context. On tp2 it's ~0 (TP all-reduce ~67% of prefill). Decode = 0 (prefill-only).
 
+## Coverage tested 2026-06-24 (clean vs patched, RTX 3090 sm_86)
+
+`validate_coverage.py` (kernel cos + speedup) and `validate_needle_e2e.py` (real-model retrieval):
+
+| scenario | result |
+|---|---|
+| **bf16 hd256** | worst-cos **0.20 = GARBAGE** — CONFIRMS the half-only gating is mandatory; the unconditional apply BREAKS bf16 (f16f16f16 reads bf16 bits as fp16). Do NOT serve bf16 with this patch. |
+| **f16 hd128** | cos 0.999994, **+31.6%** (correct; even faster than hd256) |
+| **f16 hd256 PAGED batch prefill** (deployment path) | cos 0.999995, **+20.2%** (BatchPrefillWithPagedKVCache correct) |
+| **e2e needle 8k / 32k** (9B-w4a16, FLASHINFER+fp16, no-think temp=0) | patched output **byte-identical to clean**, correct retrieval both lengths — no argmax flips |
+
+Still UNTESTED: int8-Q/W4A8 perf (correct by construction — PV code is shared, DTypeProb=half identical;
+int8-QK only touches QK), full GSM8K/MMLU eval, tp2/pp2, cudagraph-captured prefill (structurally safe),
+real attention-map capture, 35B-MoE, soak.
+
 ## Hard limits (why it is NOT default-on)
 
 - **GeForce-GA10x sm_86 ONLY.** A100 (sm_80) and **pro sm_86 (A40 / A6000 / A10)** run f32-accum at FULL
@@ -58,3 +73,5 @@ the win grows with context. On tp2 it's ~0 (TP all-reduce ~67% of prefill). Deco
 - `apply_fp16pv.py` — the kernel patcher (installed-package layout; `--restore` to revert). Strict anchors.
 - `validate_accuracy.py` — the fake-quant cos gate (two-level vs pure-fp16 vs fp32).
 - `bench.py` — single-prefill perf + cos bench (run clean → patched → cmp).
+- `validate_coverage.py` — kernel cos+speedup battery: bf16 (expect garbage), hd128, hd256 paged batch.
+- `validate_needle_e2e.py` — real-model needle-in-haystack retrieval (clean vs patched, no-think temp=0).
