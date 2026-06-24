@@ -31,6 +31,12 @@ prefill (paged + ragged). Validated real RTX 3090: cos 0.9999 vs fp16 single- AN
 head_dim 128/256, GQA, causal/non-causal, paged+ragged, qo<kv append); head_dim 64 guarded unsupported
 (k64B swizzle); e2e Qwen3.5-9B-W4A8 64k +1.9% / 128k chunked +2.0% TTFT. See `flashinfer_int8/NOTES.md`.
 
+## Experimental — NOT applied to the vendored trees
+
+| dir | what it is |
+|---|---|
+| `flashinfer_fp16pv/` | **fp16-accumulate PV** for the FlashInfer prefill kernel (pure-fp16 `o_frag`). Validated RTX 3090 sm_86: **+24-26% op-level prefill**, worst-row cos 0.99998, e2e prefill TTFT +1.1/2.1/4.1% @16/32/64k single-card. **NOT wired into the build / NOT in `flashinfer/`** — GeForce-GA10x sm_86-only (zero benefit + less precise on A100/A40/A6000/A10), DTypeProb=half-only, prefill-only, accuracy is fake-quant op-level not closed W4A8 e2e. Default-on needs a runtime GeForce-SKU probe + a gated `USE_FP16_PV_REDUCTION` template flag + an autoregressive accuracy gate (see `flashinfer_fp16pv/NOTES.md` + `docs/RESEARCH-fp16-accum-pv.md`). Far smaller lever than the MTP-verify KV-split fix for the MTP deployment. |
+
 ## Re-vendor on an upstream bump
 
 `watch-upstream.yml` opens an issue when upstream releases a newer tag. To re-vendor:
