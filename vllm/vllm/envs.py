@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
+    VLLM_FA2_KVCACHE_VERIFY: bool = True
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -596,6 +597,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # [Ampere fork] Route the MTP spec-decode verify (uniform q=1+K) attention through the
+    # compiled FA2 fwd_kvcache (FlashDecoding split-KV) instead of flash_attn_varlen_func, which
+    # on FA2 runs splitkv with only batch*Hkv tiles (occupancy-starved at low Hkv / head_dim=256,
+    # cost grows with KV length -> MTP net-negative beyond ~10k ctx). Default on; opt out with "0".
+    "VLLM_FA2_KVCACHE_VERIFY": lambda: bool(
+        int(os.getenv("VLLM_FA2_KVCACHE_VERIFY", "1"))
+    ),
     # [Ampere fork] Opt in to the int8-QK prefill attention backend (patch 0004): when "1",
     # the `vllm.general_plugins` entry-point `register_int8qk` overrides the FLASH_ATTN backend
     # with the int8-QK + fp16-PV prefill path for hd256 full-attn layers (everything else

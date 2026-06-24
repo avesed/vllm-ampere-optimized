@@ -394,6 +394,72 @@ def flash_attn_varlen_func(
     return (out, softmax_lse) if return_softmax_lse else out
 
 
+_FWD_KVCACHE_ARITY_OK = False
+
+
+def flash_attn_kvcache_verify(
+    q,
+    k_cache,
+    v_cache,
+    out,
+    seqlens_k,
+    block_table,
+    num_reqs,
+    q_len,
+    softmax_scale,
+    causal=True,
+):
+    """FlashDecoding split-KV path for uniform q=1+K MTP spec-verify batches.
+
+    FA2 ``flash_attn_varlen_func`` with q>1 runs splitkv with only batch*Hkv
+    tiles (occupancy-starved at low num_kv_heads / head_dim=256, cost grows with
+    KV length). ``fwd_kvcache`` adds the split-combine kernel so it actually
+    splits over KV (~4.3x at 32k ctx). The verify tokens are already in the paged
+    cache (written by reshape_and_cache before attention), so k/v are None and
+    ``seqlens_k`` is the full per-request length. Reshapes the flat
+    [num_actual_tokens, H, D] query to [num_reqs, q_len, H, D] (free view on the
+    contiguous slice) and writes ``out`` in place.
+    """
+    global _FWD_KVCACHE_ARITY_OK
+    if not _FWD_KVCACHE_ARITY_OK:
+        n_args = len(torch.ops._vllm_fa2_C.fwd_kvcache.default._schema.arguments)
+        assert n_args == 20, (
+            f"_vllm_fa2_C.fwd_kvcache schema arity {n_args} != 20; "
+            "flash_attn_kvcache_verify positional args need review"
+        )
+        _FWD_KVCACHE_ARITY_OK = True
+    h, d = q.shape[-2], q.shape[-1]
+    q4 = q.view(num_reqs, q_len, h, d)
+    out4 = out.view(num_reqs, q_len, h, d)
+    # positional order == _vllm_fa2_C.fwd_kvcache schema:
+    # (q, kcache, vcache, k, v, seqlens_k, rotary_cos, rotary_sin, cache_batch_idx,
+    #  leftpad_k, block_table, alibi_slopes, out, softmax_scale, is_causal,
+    #  window_size_left, window_size_right, softcap, is_rotary_interleaved, num_splits)
+    torch.ops._vllm_fa2_C.fwd_kvcache(
+        q4,
+        k_cache,
+        v_cache,
+        None,  # k: verify tokens already written to cache
+        None,  # v
+        seqlens_k,
+        None,  # rotary_cos
+        None,  # rotary_sin
+        None,  # cache_batch_idx
+        None,  # leftpad_k
+        block_table,
+        None,  # alibi_slopes
+        out4,  # written in place; shares storage with `out`
+        softmax_scale,
+        causal,
+        -1,  # window_size_left (full context)
+        -1,  # window_size_right
+        0.0,  # softcap off
+        False,  # is_rotary_interleaved
+        0,  # num_splits = 0 -> kernel auto-splits over KV
+    )
+    return out
+
+
 def sparse_attn_func(
     q,
     k,
