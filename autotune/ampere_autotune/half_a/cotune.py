@@ -529,6 +529,24 @@ def run(args) -> int:  # pragma: no cover - drives a server
         print(f"[cotune] single/few-session ({c}-conc): measure + recommend{pnote}.")
         tps = measure.lowc_throughput(endpoint, c=c, prompt=prompt, temperature=temp)
         report = render_lowc_advice(tps, c)
+        bwv = getattr(args, "bw_verify", None)      # fold ACTUAL bandwidth into the decode model
+        if bwv and tps:
+            from . import hw_factors
+            import os as _os
+            bw_bin = (_os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(__file__))),
+                                    "instruments", "bw_verify", "bw_verify") if bwv == "@default" else bwv)
+            cur_bw = hw_factors.measure_bw_gbs(bw_bin)
+            if cur_bw:
+                eff_gb = cur_bw / tps               # effective GB read per decoded token (model-free)
+                report += (f"\n\nmeasured HW: actual bandwidth {cur_bw:.0f} GB/s; "
+                           f"effective ~{eff_gb:.1f} GB read per decoded token.")
+                wgb = getattr(args, "weight_gb", None)
+                if wgb:
+                    m = hw_factors.decode_from_one_point(tps, cur_bw, wgb * 1e9)
+                    report += "\n" + (hw_factors.render(m, cur_bw) if m else
+                                      f"(weight {wgb} GB/token exceeds measured TPOT — bad estimate)")
+            else:
+                report += "\n\n(bw_verify unavailable — build instruments/bw_verify to fold actual bandwidth)"
         if tps:                                     # closed-loop delta: before->after vs the last run
             from . import delta
             try:

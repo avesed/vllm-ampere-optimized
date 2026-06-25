@@ -1,0 +1,51 @@
+"""HALF-A measured-HW-factor decode model — validated against the real 9B-w4a8 mem-OC run."""
+import pytest
+
+from ampere_autotune.half_a.hw_factors import (
+    fit_decode_two_points, decode_from_one_point, memoc_decode_gain_pct, DecodeModel,
+)
+
+# the real measurement this session: single-stream 9B-w4a8, offset 0 (838 GB/s) vs +1000 (888).
+REAL = [(838.0, 85.0), (888.0, 88.2)]
+
+
+def test_two_point_fit_recovers_the_split():
+    m = fit_decode_two_points(REAL)
+    assert m is not None
+    assert m.toks(838.0) == pytest.approx(85.0, abs=0.5)
+    assert m.toks(888.0) == pytest.approx(88.2, abs=0.5)
+    # decode is ~64% bandwidth-bound at the stock clock (the rest is fixed compute)
+    assert m.bw_bound_frac(838.0) == pytest.approx(0.64, abs=0.03)
+    # even at infinite bandwidth, single-stream caps ~239 tok/s (the compute wall)
+    assert m.compute_ceiling_toks() == pytest.approx(239.0, abs=10.0)
+
+
+def test_memoc_gain_matches_measured_plus_3_8_pct():
+    m = fit_decode_two_points(REAL)
+    assert memoc_decode_gain_pct(m, 838.0, 888.0) == pytest.approx(3.8, abs=0.3)
+    # a bigger mem-OC (838->950) predicts a larger but still sub-proportional gain
+    g = memoc_decode_gain_pct(m, 838.0, 950.0)
+    assert 5.0 < g < (950 / 838 - 1) * 100   # below the proportional 13.4% (compute caps it)
+
+
+def test_one_point_split_with_weight_bytes():
+    # one point + ~6.35 GB/token weight read -> same split as the two-point fit
+    m = decode_from_one_point(85.0, 838.0, 6.35e9)
+    assert m is not None and m.toks(838.0) == pytest.approx(85.0, abs=0.5)
+    assert m.bw_bound_frac(838.0) == pytest.approx(0.64, abs=0.03)
+
+
+def test_one_point_rejects_inconsistent_bytes():
+    # 20 GB/token weight read alone would exceed the measured TPOT -> inconsistent -> None
+    assert decode_from_one_point(85.0, 838.0, 20e9) is None
+
+
+def test_fit_rejects_single_bandwidth():
+    assert fit_decode_two_points([(838.0, 85.0), (838.0, 85.1)]) is None
+
+
+def test_compute_bound_model_shows_tiny_memoc_gain():
+    # a model dominated by fixed compute (small bw_coef) -> mem-OC barely helps
+    m = DecodeModel(bw_coef=0.5, fixed_t=0.01)
+    assert m.bw_bound_frac(838.0) < 0.1
+    assert memoc_decode_gain_pct(m, 838.0, 950.0) < 1.0

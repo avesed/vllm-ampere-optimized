@@ -86,6 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="sampling temperature; OMIT to use the model's default (tests never force temp=0)")
     ct.add_argument("--ready-timeout", type=int, default=600,
                     help="GUARD: max seconds to wait for /health per vLLM bring-up (hard-capped at 600)")
+    ct.add_argument("--bw-verify", nargs="?", const="@default", default=None,
+                    help="(--objective latency) run the bw_verify kernel (NO root) to fold ACTUAL "
+                         "bandwidth into the decode model; optional path to the binary")
+    ct.add_argument("--weight-gb", type=float, default=None,
+                    help="(--bw-verify) per-token weight bytes in GB -> 1-point bandwidth/compute split "
+                         "(how bandwidth-bound decode is + how much mem-OC/fewer-bytes can move it)")
     ct.add_argument("--output", "-o", default=None,
                     help="save the result here (file or dir); default ~/.local/state/ampere-autotune/results/ "
                          "(in docker, mount a volume + point here — the default is ephemeral). Always also printed.")
