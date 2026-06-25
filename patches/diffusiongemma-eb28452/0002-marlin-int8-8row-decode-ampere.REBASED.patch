@@ -1,0 +1,335 @@
+diff --git a/csrc/libtorch_stable/quantization/marlin/generate_kernels.py b/csrc/libtorch_stable/quantization/marlin/generate_kernels.py
+index 7b31603..44a13f8 100644
+--- a/csrc/libtorch_stable/quantization/marlin/generate_kernels.py
++++ b/csrc/libtorch_stable/quantization/marlin/generate_kernels.py
+@@ -122,7 +122,7 @@ QUANT_CONFIGS = [
+         "a_type": ["kS8"],
+         "b_type": "kU4",
+         "thread_configs": THREAD_CONFIGS,
+-        "thread_m_blocks": [1, 2, 3, 4],
++        "thread_m_blocks": [0.5, 1, 2, 3, 4],
+         "group_blocks": [-1, 2, 4, 8],
+     },
+     # GPTQ-INT4 with INT8 activation
+@@ -130,7 +130,7 @@ QUANT_CONFIGS = [
+         "a_type": ["kS8"],
+         "b_type": "kU4B8",
+         "thread_configs": THREAD_CONFIGS,
+-        "thread_m_blocks": [1, 2, 3, 4],
++        "thread_m_blocks": [0.5, 1, 2, 3, 4],
+         "group_blocks": [-1, 2, 4, 8],
+     },
+     # GPTQ-INT4 with FP8 activation
+diff --git a/csrc/libtorch_stable/quantization/marlin/marlin.cu b/csrc/libtorch_stable/quantization/marlin/marlin.cu
+index 721c206..8793a26 100644
+--- a/csrc/libtorch_stable/quantization/marlin/marlin.cu
++++ b/csrc/libtorch_stable/quantization/marlin/marlin.cu
+@@ -424,7 +424,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
+     int thread_n = thread_n_init;
+ 
+     int thread_m_blocks = min(div_ceil(prob_m_split, 16), max_thread_m_blocks);
+-    int m_block_size_8 = prob_m_split <= 8 && a_type.size_bits() == 16;
++    int m_block_size_8 =
++      prob_m_split <= 8 && (a_type.size_bits() == 16 || a_type == vllm::kS8);
+ 
+     // Set thread config
+     exec_config_t exec_cfg;
+diff --git a/csrc/libtorch_stable/quantization/marlin/marlin_template.h b/csrc/libtorch_stable/quantization/marlin/marlin_template.h
+index 32b8f8b..9ad26f0 100644
+--- a/csrc/libtorch_stable/quantization/marlin/marlin_template.h
++++ b/csrc/libtorch_stable/quantization/marlin/marlin_template.h
+@@ -935,9 +935,34 @@ __global__ void Marlin(
+   auto fetch_to_registers = [&](int k, int pipe) {
+     int4* sh_a_stage = sh_a + a_sh_stage * pipe;
+   #pragma unroll
+-    for (int i = 0; i < thread_m_blocks; i++)
+-      ldsm<m_block_size_8 ? 2 : 4, a_type_id>(
+-          frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
++    for (int i = 0; i < thread_m_blocks; i++) {
++      if constexpr (is_a_8bit && m_block_size_8) {
++        // Manual int8 m16n8k32 B-operand gather (activations = B operand).
++        // m16n8k32 B layout: lane (gid=lane>>2, tg=lane&3) holds
++        //   b0 = act[row=gid][K = tg*4 .. tg*4+3]       (lower 16-K half = int4 #0)
++        //   b1 = act[row=gid][K = tg*4+16 .. tg*4+19]   (upper 16-K half = int4 #1)
++        // i.e. SAME byte offset (tg*4) in two different int4 chunks, NOT 8
++        // contiguous K. (The old code read 8 contiguous K -> correct for all-ones
++        // but wrong k-order for real activations.)
++        int lane = threadIdx.x & 31;
++        int r = lane >> 2;        // M-row (activation row), 0..7
++        int tg = lane & 3;        // thread-in-group
++        int bytecol = tg * 4;     // byte (=K) offset within the 16-byte int4
++        int warp_k = 2 * ((threadIdx.x / 32) / tb_n_warps) * b_sh_wr_iters;
++        int lin0 = a_sh_stride * r + 2 * (k % b_sh_wr_iters) + 0 + warp_k;
++        int lin1 = a_sh_stride * r + 2 * (k % b_sh_wr_iters) + 1 + warp_k;
++        const int8_t* src0 =
++            reinterpret_cast<const int8_t*>(sh_a_stage + transform_a(lin0)) + bytecol;
++        const int8_t* src1 =
++            reinterpret_cast<const int8_t*>(sh_a_stage + transform_a(lin1)) + bytecol;
++        uint32_t* fa = reinterpret_cast<uint32_t*>(&frag_a[k % 2][i]);
++        fa[0] = reinterpret_cast<const uint32_t*>(src0)[0];
++        fa[1] = reinterpret_cast<const uint32_t*>(src1)[0];
++      } else {
++        ldsm<m_block_size_8 ? 2 : 4, a_type_id>(
++            frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
++      }
++    }
+     int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+ 
+   #pragma unroll
+@@ -1320,12 +1345,29 @@ __global__ void Marlin(
+ 
+   #pragma unroll
+       for (int i = 0; i < thread_m_blocks; i++) {
+-        mma<a_type_id, false, 32>(
+-            frag_a[k2][i], frag_b[0],
+-            (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
+-        mma<a_type_id, false, 32>(
+-            frag_a[k2][i], frag_b[1],
+-            (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][1]);
++        if constexpr (m_block_size_8) {
++          // 8-row (m_block_size_8) int8/fp8 path: a single transposed
++          // m16n8k32 MMA folds BOTH N-halves into one accumulator. The
++          // weights become the instruction A(m16) operand (frag_b[0] -> output
++          // rows 0-7 = N-half 0, frag_b[1] -> output rows 8-15 = N-half 1) and
++          // the 8 activation rows become the instruction B(n8) operand. This
++          // mirrors the 16-bit `matmul` 8-row branch exactly: the combined
++          // result lives in [...][0] only and [...][1] stays unused (the
++          // reduce/writeback step j by 2 and read only [...][0] in 8-row mode).
++          // Resulting per-lane layout of the single fragment:
++          //   frag_c[i][j][0][0,1] = N-half 0 (one N-column, two M-rows)
++          //   frag_c[i][j][0][2,3] = N-half 1 (one N-column, two M-rows)
++          mma_trans<a_type_id, false, 32>(
++              frag_a[k2][i], frag_b[0], frag_b[1],
++              (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
++        } else {
++          mma<a_type_id, false, 32>(
++              frag_a[k2][i], frag_b[0],
++              (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
++          mma<a_type_id, false, 32>(
++              frag_a[k2][i], frag_b[1],
++              (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][1]);
++        }
+       }
+ 
+       if constexpr (group_blocks != -1) {
+@@ -1339,24 +1381,56 @@ __global__ void Marlin(
+                 (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[0],
+                 (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[1]};
+ 
++            if constexpr (m_block_size_8) {
++              // Combined 8-row fragment: g/2 selects the N-half
++              // (g<2 => N-half 0 = s_vals[0]; g>=2 => N-half 1 = s_vals[1]);
++              // g%2 is now an M-ROW (not an N-column), so the column scale is
++              // CONSTANT across the pair and must NOT be indexed by g%2. Each
++              // lane owns exactly one N-column per half; its single int16 group
++              // scale is selected by the canonical 8-row per-column selector
++              // idx = (threadIdx.x / 4) % 2 -- the same bit used by the 16-bit
++              // 8-row write per-column scale ((threadIdx.x % 8) / 4 at
++              // marlin_template.h ~1670) and by the channelwise-8bit 8-row
++              // frag_s collapse (~1935).
++              int gid = (threadIdx.x % 32) >> 2;
++              int src = gid >> 1;
++              int raw0 = *reinterpret_cast<int*>(&frag_s[k2][j * 2][0]);
++              int raw1 = *reinterpret_cast<int*>(&frag_s[k2][j * 2 + 1][0]);
++              int sh0 = __shfl_sync(0xffffffffu, raw0, src, 32);
++              int sh1 = __shfl_sync(0xffffffffu, raw1, src, 32);
++              int scale0 = reinterpret_cast<uint16_t*>(&sh0)[gid & 1];
++              int scale1 = reinterpret_cast<uint16_t*>(&sh1)[gid & 1];
+   #pragma unroll
+-            for (int i = 0; i < thread_m_blocks; i++) {
++              for (int i = 0; i < thread_m_blocks; i++) {
+   #pragma unroll
+-              for (int g = 0; g < 4; g++) {
+-                int scale = reinterpret_cast<int*>(&s_vals[0])[g % 2];
+-                *reinterpret_cast<int32_t*>(&frag_c[i][j][0][g]) +=
+-                    *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]) *
+-                    scale;
+-                frag_c_tmp[i][j][0][g] = 0.0f;
++                for (int g = 0; g < 4; g++) {
++                  int scale = (g < 2) ? scale0 : scale1;
++                  *reinterpret_cast<int32_t*>(&frag_c[i][j][0][g]) +=
++                      *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]) *
++                      scale;
++                  frag_c_tmp[i][j][0][g] = 0.0f;
++                }
+               }
++            } else {
++  #pragma unroll
++              for (int i = 0; i < thread_m_blocks; i++) {
++  #pragma unroll
++                for (int g = 0; g < 4; g++) {
++                  int scale = reinterpret_cast<int*>(&s_vals[0])[g % 2];
++                  *reinterpret_cast<int32_t*>(&frag_c[i][j][0][g]) +=
++                      *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]) *
++                      scale;
++                  frag_c_tmp[i][j][0][g] = 0.0f;
++                }
+ 
+   #pragma unroll
+-              for (int g = 0; g < 4; g++) {
+-                int scale = reinterpret_cast<int*>(&s_vals[1])[g % 2];
+-                *reinterpret_cast<int32_t*>(&frag_c[i][j][1][g]) +=
+-                    *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]) *
+-                    scale;
+-                frag_c_tmp[i][j][1][g] = 0.0f;
++                for (int g = 0; g < 4; g++) {
++                  int scale = reinterpret_cast<int*>(&s_vals[1])[g % 2];
++                  *reinterpret_cast<int32_t*>(&frag_c[i][j][1][g]) +=
++                      *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]) *
++                      scale;
++                  frag_c_tmp[i][j][1][g] = 0.0f;
++                }
+               }
+             }
+           } else {
+@@ -1377,20 +1451,43 @@ __global__ void Marlin(
+               s_vals_int[3] = (s_vals_e8m0 & 0xFF000000) >> 1;
+             }
+ 
++            if constexpr (m_block_size_8) {
++              // Same combined-fragment mapping as the kS8 8-row branch, for the
++              // fp8 float accumulator. NOTE: fp8 (a_type == kFE4M3fn) 8-row
++              // kernels are NOT emitted by generate_kernels.py (its kS8/kFE4M3fn
++              // INT8/FP8-activation configs use thread_m_blocks [1,2,3,4], no
++              // 0.5), and the kFE8M0fnu (MX) g-indexed expansion above assumes
++              // the non-8-row g-layout; this branch is provided for structural
++              // symmetry only and is unverified. The kS8 branch is the
++              // deliverable.
++              int idx = (threadIdx.x / 4) % 2;
++              float scale0 = reinterpret_cast<float*>(&s_vals[0])[idx];
++              float scale1 = reinterpret_cast<float*>(&s_vals[1])[idx];
+   #pragma unroll
+-            for (int i = 0; i < thread_m_blocks; i++) {
++              for (int i = 0; i < thread_m_blocks; i++) {
+   #pragma unroll
+-              for (int g = 0; g < 4; g++) {
+-                float scale = reinterpret_cast<float*>(&s_vals[0])[g % 2];
+-                frag_c[i][j][0][g] += frag_c_tmp[i][j][0][g] * scale;
+-                frag_c_tmp[i][j][0][g] = 0.0f;
++                for (int g = 0; g < 4; g++) {
++                  float scale = (g < 2) ? scale0 : scale1;
++                  frag_c[i][j][0][g] += frag_c_tmp[i][j][0][g] * scale;
++                  frag_c_tmp[i][j][0][g] = 0.0f;
++                }
+               }
++            } else {
++  #pragma unroll
++              for (int i = 0; i < thread_m_blocks; i++) {
++  #pragma unroll
++                for (int g = 0; g < 4; g++) {
++                  float scale = reinterpret_cast<float*>(&s_vals[0])[g % 2];
++                  frag_c[i][j][0][g] += frag_c_tmp[i][j][0][g] * scale;
++                  frag_c_tmp[i][j][0][g] = 0.0f;
++                }
+ 
+   #pragma unroll
+-              for (int g = 0; g < 4; g++) {
+-                float scale = reinterpret_cast<float*>(&s_vals[1])[g % 2];
+-                frag_c[i][j][1][g] += frag_c_tmp[i][j][1][g] * scale;
+-                frag_c_tmp[i][j][1][g] = 0.0f;
++                for (int g = 0; g < 4; g++) {
++                  float scale = reinterpret_cast<float*>(&s_vals[1])[g % 2];
++                  frag_c[i][j][1][g] += frag_c_tmp[i][j][1][g] * scale;
++                  frag_c_tmp[i][j][1][g] = 0.0f;
++                }
+               }
+             }
+           }
+@@ -1638,7 +1735,7 @@ __global__ void Marlin(
+     if constexpr (m_block_size_8) {
+       c_sh_wr = (8 * c_sh_stride) * ((threadIdx.x % 32) % 4 * 2) +
+                 (threadIdx.x % 32) / 4;
+-      c_sh_wr += 64 * (threadIdx.x / 32);
++      c_sh_wr += (is_a_8bit ? 32 : 64) * (threadIdx.x / 32);
+     } else {
+       c_sh_wr =
+           (4 * c_sh_stride) * ((threadIdx.x % 32) / 4) + (threadIdx.x % 32) % 4;
+@@ -1861,34 +1958,57 @@ __global__ void Marlin(
+       }
+ 
+       if constexpr (is_a_8bit) {
+-        float frag_a_s[2 * thread_m_blocks];
+-
+-        for (int i = 0; i < 2 * thread_m_blocks; i++)
+-          frag_a_s[i] = sh_a_s[i * 8 + (threadIdx.x % 32) / 4];
+-
+-  #pragma unroll
+-        for (int j = 0; j < 2; j++) {
++        if constexpr (m_block_size_8) {
++          // 8-row transposed m16n8k32: frag_c[0][j][0][g] holds the combined
++          // fragment with g%2 = M-row offset (M-row = (threadIdx.x % 4) * 2 +
++          // g % 2) and g/2 = N-half (irrelevant to the per-ROW activation
++          // scale). Only the [0] slot is populated; [1] is unused and must be
++          // skipped (uninitialized -> __int2float_rn yields garbage ~1e33).
++          // The per-row activation scale lives in sh_a_s by absolute M-row.
++          float a_s_pair[2];
++          a_s_pair[0] = sh_a_s[(threadIdx.x % 4) * 2 + 0];
++          a_s_pair[1] = sh_a_s[(threadIdx.x % 4) * 2 + 1];
+   #pragma unroll
+-          for (int i = 0; i < thread_m_blocks; i++) {
++          for (int j = 0; j < 2; j++) {
+   #pragma unroll
+             for (int g = 0; g < 4; g++) {
+-              float c_val = frag_c[i][j][0][g];
+-
++              float c_val = frag_c[0][j][0][g];
+               if constexpr (a_type == vllm::kS8) {
+                 c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
+               }
+-              float s_val = frag_a_s[i * 2 + g / 2];
+-              frag_c[i][j][0][g] = c_val * s_val;
++              frag_c[0][j][0][g] = c_val * a_s_pair[g % 2];
+             }
++          }
++        } else {
++          float frag_a_s[2 * thread_m_blocks];
++
++          for (int i = 0; i < 2 * thread_m_blocks; i++)
++            frag_a_s[i] = sh_a_s[i * 8 + (threadIdx.x % 32) / 4];
++
+   #pragma unroll
+-            for (int g = 0; g < 4; g++) {
+-              float c_val = frag_c[i][j][1][g];
++          for (int j = 0; j < 2; j++) {
++  #pragma unroll
++            for (int i = 0; i < thread_m_blocks; i++) {
++  #pragma unroll
++              for (int g = 0; g < 4; g++) {
++                float c_val = frag_c[i][j][0][g];
+ 
+-              if constexpr (a_type == vllm::kS8) {
+-                c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
++                if constexpr (a_type == vllm::kS8) {
++                  c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
++                }
++                float s_val = frag_a_s[i * 2 + g / 2];
++                frag_c[i][j][0][g] = c_val * s_val;
++              }
++  #pragma unroll
++              for (int g = 0; g < 4; g++) {
++                float c_val = frag_c[i][j][1][g];
++
++                if constexpr (a_type == vllm::kS8) {
++                  c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
++                }
++                float s_val = frag_a_s[i * 2 + g / 2];
++                frag_c[i][j][1][g] = c_val * s_val;
+               }
+-              float s_val = frag_a_s[i * 2 + g / 2];
+-              frag_c[i][j][1][g] = c_val * s_val;
+             }
+           }
+         }
+@@ -1948,6 +2068,12 @@ __global__ void Marlin(
+       // For 8-bit channelwise, we apply the scale before the global reduction
+       // that converts the fp32 results to fp16 (so that we avoid possible
+       // overflow in fp16)
++      // NOTE: int8 8-row (m_block_size_8) is only validated for the GROUPED
++      // (group_blocks != -1) path. The per-channel (group_blocks == -1) 8-row
++      // case below is NOT 8-row-transposed-aware and is left unsupported; if
++      // per-channel int8 with small batch (M<=8) is needed, fix this block to
++      // mirror the grouped-fold transposed scale, or gate int8 8-row to grouped
++      // configs at the marlin.cu m_block_size_8 selector.
+       if constexpr (!has_act_order && group_blocks == -1 && is_a_8bit) {
+   #pragma unroll
+         for (int j = 0; j < 2; j++) {
