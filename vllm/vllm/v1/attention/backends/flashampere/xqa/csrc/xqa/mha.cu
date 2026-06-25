@@ -2007,7 +2007,9 @@ CUBIN_EXPORT __global__
         constexpr uint32_t nbPartsPerKHead = exactDiv(headElems, elemsPerKHeadPart);
         // the accumulator
         WarpAcc acc{};
-        constexpr uint32_t nbUnroll = (cacheElemSize == 2 ? nbPartsPerKHead : 1);
+        // famp: cap K-part unroll on sm86 (nbPartsPerKHead=8 -> 4) to trade a little long-ctx
+        // prefetch overlap for less per-iteration loop overhead at short ctx.
+        constexpr uint32_t nbUnroll = (cacheElemSize == 2 ? mha::min(nbPartsPerKHead, 4u) : 1);
 #pragma unroll(nbUnroll)
         for (uint32_t p = 0; p < nbPartsPerKHead; p++) {
           constexpr bool syncKTileEarly =
