@@ -459,6 +459,15 @@ __device__ inline void smemRotateInplace(Warp const& Warp, Array2D<LdGrain, rows
 
 using WarpAcc = WarpAccT<warpTile.y, warpTile.x>;
 
+// famp fp16-PV: the gemm1 (PV) accumulator goes half ONLY when FP16_PV is set (a build flag, gated
+// to GeForce-GA10x by the Python wrapper). Half = 2 regs/tile vs 4 -> relieves the verify kernel's
+// register spill (measured REG:231 STACK:64). gemm0 QK keeps the fp32 WarpAcc for softmax precision.
+#ifndef FP16_PV
+#define FP16_PV 0
+#endif
+using WarpAccF16 = WarpAccF16T<warpTile.y, warpTile.x>;
+using Gemm1Acc = mha::conditional_t<(FP16_PV != 0), WarpAccF16, WarpAcc>;
+
 #if SPEC_DEC
 #define MMAS_N_PER_MASK 2
 
@@ -589,6 +598,29 @@ __device__ inline GemmOutRegTile toFp16(WarpAcc const& acc) {
   }
   return dst;
 }
+
+#if FP16_PV && INPUT_FP16
+// famp fp16-PV: repack the half gemm1 accumulator into the half2 output tile (the elements are
+// already half, so this is just a pairwise pack, no float round-trip).
+__device__ inline GemmOutRegTile toFp16(WarpAccF16 const& acc) {
+  GemmOutRegTile dst;
+#pragma unroll
+  for (uint32_t m = 0; m < acc.rows; m++) {
+#pragma unroll
+    for (uint32_t i = 0; i < InstAccF16::rows; i++) {
+#pragma unroll
+      for (uint32_t n = 0; n < acc.cols; n++) {
+#pragma unroll
+        for (uint32_t j = 0; j < InstAccF16::cols; j += 2) {
+          dst(m * InstAccF16::rows + i, (n * InstAccF16::cols + j) / 2) =
+              __halves2half2(acc(m, n)(i, j), acc(m, n)(i, j + 1));
+        }
+      }
+    }
+  }
+  return dst;
+}
+#endif
 
 __device__ inline WarpAcc toWarpAcc(GemmOutRegTile const& outTile) {
   WarpAcc acc;
@@ -1116,7 +1148,7 @@ __device__ inline void smemQKPartGemm(Warp const& warp, WarpAcc& acc,
 // acc is used as both input and output
 // v needs transpose
 template <typename VElemType>
-__device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipXRowRescale,
+__device__ inline void smemXVPartGemm(Warp const& warp, Gemm1Acc& acc, bool skipXRowRescale,
                                       UniformRescaleMask xRowNeedRescaleMask,
                                       ThrdRegRowMax xRowScales, SharedMem::XSmemBuffer const& x,
                                       uint32_t idxVTilePerXTile, SharedMem::VSmemBuffer const& vt,
@@ -1339,8 +1371,10 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
         auto const& vInMat = vSlice(j, 0);
 #pragma unroll
         for (uint32_t n = 0; n < mnExV; n++) {
-          mma<InputElem>(acc(i, j * mnExV + n).data, xSlice(i, 0).data,
-                         reinterpret_cast<uint32_t const(&)[2][1]>(vInMat.data[n]));
+          // famp fp16-PV: dispatch by acc elem type (f32 -> mma, half -> mma_f16acc); the half acc
+          // halves the gemm1 PV accumulator registers, relieving the verify kernel's spill.
+          mma_acc<InputElem>(acc(i, j * mnExV + n).data, xSlice(i, 0).data,
+                             reinterpret_cast<uint32_t const(&)[2][1]>(vInMat.data[n]));
         }
       }
     }
@@ -1370,6 +1404,51 @@ __device__ inline void pickAccRowsForBeamSearch(Warp const& warp, WarpAcc& dst, 
     }
   }
 }
+
+#if FP16_PV && INPUT_FP16
+// famp fp16-PV: half-accumulator rescaleAcc overloads (the online-softmax corrections). The scale
+// is applied in FLOAT precision (load half -> float -> *scale -> store half) so the rescale keeps
+// fp32 precision even though the accumulator is half — same approach as patch 0007 (cos ~0.9999).
+__device__ inline void rescaleAcc(Warp const& warp, WarpAccF16& acc,
+                                  UniformRescaleMask const& rescaleMask,
+                                  ThrdRegRowMax const& rowScales) {
+#pragma unroll
+  for (uint32_t m = 0; m < WarpAccF16::rows; m++) {
+#pragma unroll
+    for (uint32_t i = 0; i < InstAccF16::rows; i++) {
+      uint32_t const r = m * InstAccF16::rows + i;
+      bool const skip = enableMicroFastPath && ((rescaleMask[r / 4] & (0xFFU << 8 * r)) == 0);
+      if (skip) {
+        continue;
+      }
+      float const scale = replicateValForQuad(warp, rowScales, r);
+#pragma unroll
+      for (uint32_t n = 0; n < WarpAccF16::cols; n++) {
+#pragma unroll
+        for (uint32_t j = 0; j < InstAccF16::cols; j++) {
+          acc(m, n)(i, j) = __float2half(__half2float(acc(m, n)(i, j)) * scale);
+        }
+      }
+    }
+  }
+}
+
+__device__ inline void rescaleAcc(Warp const& warp, WarpAccF16& acc, float scale) {
+#pragma unroll
+  for (uint32_t m = 0; m < acc.rows; m++) {
+#pragma unroll
+    for (uint32_t i = 0; i < InstAccF16::rows; i++) {
+#pragma unroll
+      for (uint32_t n = 0; n < acc.cols; n++) {
+#pragma unroll
+        for (uint32_t j = 0; j < InstAccF16::cols; j++) {
+          acc(m, n)(i, j) = __float2half(__half2float(acc(m, n)(i, j)) * scale);
+        }
+      }
+    }
+  }
+}
+#endif
 
 __device__ inline void rescaleAcc(Warp const& warp, WarpAcc& acc,
                                   UniformRescaleMask const& rescaleMask,
@@ -2315,8 +2394,8 @@ CUBIN_EXPORT __global__
     globalRowMax.fill(safeInitRowMax);
     ThrdRegRowMax globalRowSum;
     globalRowSum.fill(0);
-    // the accumulator
-    WarpAcc acc{};
+    // the accumulator (famp fp16-PV: half when FP16_PV, for the gemm1 PV spill relief)
+    Gemm1Acc acc{};
     if (grpLoadV) {
       unused(pWarpGrpBar->arrive());
     }

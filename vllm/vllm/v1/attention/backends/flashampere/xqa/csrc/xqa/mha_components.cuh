@@ -7,6 +7,14 @@ using InstAcc = Array2D<float, 2, 2>;
 template <uint32_t m, uint32_t n>
 using WarpAccT = Array2D<InstAcc, exactDiv(m, 16), exactDiv(n, 8)>;
 
+// famp fp16-PV: half-element accumulator tile (4 half = 2 half2 = 2 regs vs InstAcc's 4 float = 4
+// regs). Same (i,j) addressing. Used ONLY for the gemm1 PV accumulator (the spill-relief lever);
+// gemm0 QK keeps the fp32 InstAcc for softmax precision.
+using InstAccF16 = Array2D<__half, 2, 2>;
+
+template <uint32_t m, uint32_t n>
+using WarpAccF16T = Array2D<InstAccF16, exactDiv(m, 16), exactDiv(n, 8)>;
+
 template <uint32_t accRows, uint32_t accCols>
 __device__ inline void applyMask(Warp const& warp, Array2D<InstAcc, accRows, accCols>& acc,
                                  uint32_t validColBeg, uint32_t validColEnd) {
