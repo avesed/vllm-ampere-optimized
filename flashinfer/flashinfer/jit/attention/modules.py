@@ -326,6 +326,7 @@ def get_single_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_fp16_pv_reduction: bool = False,
 ) -> str:
     return (
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -336,7 +337,9 @@ def get_single_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + (f"_f16pv_{use_fp16_pv_reduction}" if use_fp16_pv_reduction else "")
+        + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -498,6 +501,7 @@ def gen_single_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_fp16_pv_reduction: bool = False,
 ) -> JitSpec:
     uri = get_single_prefill_uri(
         backend,
@@ -510,6 +514,7 @@ def gen_single_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_fp16_pv_reduction,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -589,6 +594,7 @@ def gen_single_prefill_module(
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
+        use_fp16_pv_reduction=use_fp16_pv_reduction,
         fp8_enabled=fp8_enabled,
     )
 
@@ -1313,6 +1319,7 @@ def gen_customize_single_prefill_module(
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
+    use_fp16_pv_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> JitSpec:
     kwargs = {
@@ -1387,7 +1394,11 @@ def gen_customize_single_prefill_module(
         generated_config_path = gen_directory / "single_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
 
-        return gen_jit_spec(uri, source_paths)
+        return gen_jit_spec(
+            uri,
+            source_paths,
+            extra_cuda_cflags=(["-DFA_USE_FP16_PV=1"] if use_fp16_pv_reduction else None),
+        )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
 
@@ -1558,6 +1569,7 @@ def gen_customize_batch_prefill_module(
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
+    use_fp16_pv_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> JitSpec:
     kwargs = {

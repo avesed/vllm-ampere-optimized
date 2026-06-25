@@ -46,9 +46,11 @@ vllm = "vllm.entrypoints.cli.main:main"
 [project.entry-points."vllm.general_plugins"]
 lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
 lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
-# Ampere fork (patch 0004): int8-QK prefill attention backend override, loaded in EVERY process
-# (engine core + each TP/PP worker) so it fires under multi-GPU. Opt-in via VLLM_INT8QK=1.
-int8qk = "vllm.v1.attention.backends.int8qk_backend:register_int8qk"
+# Ampere fork (patch 0008): flashampere — the unified Ampere attention backend (fp16-PV prefill,
+# fp16-served + bf16-served, + inherited MTP-verify fix in one Backend.CUSTOM impl). Loaded in EVERY
+# process so CUSTOM is registered in each TP/PP worker before backend selection. Opt-in via
+# VLLM_FLASHAMPERE=1. (The old patch-0004 int8qk standalone was removed: int8-QK is net-negative.)
+flashampere = "vllm.v1.attention.backends.flashampere.backend:register_flashampere"
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm

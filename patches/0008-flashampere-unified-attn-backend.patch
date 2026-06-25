@@ -1,0 +1,1054 @@
+diff --git a/vllm/pyproject.toml b/vllm/pyproject.toml
+index e831b53..e1e1c6f 100644
+--- a/vllm/pyproject.toml
++++ b/vllm/pyproject.toml
+@@ -46,9 +46,11 @@ vllm = "vllm.entrypoints.cli.main:main"
+ [project.entry-points."vllm.general_plugins"]
+ lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
+ lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
+-# Ampere fork (patch 0004): int8-QK prefill attention backend override, loaded in EVERY process
+-# (engine core + each TP/PP worker) so it fires under multi-GPU. Opt-in via VLLM_INT8QK=1.
+-int8qk = "vllm.v1.attention.backends.int8qk_backend:register_int8qk"
++# Ampere fork (patch 0008): flashampere — the unified Ampere attention backend (fp16-PV prefill,
++# fp16-served + bf16-served, + inherited MTP-verify fix in one Backend.CUSTOM impl). Loaded in EVERY
++# process so CUSTOM is registered in each TP/PP worker before backend selection. Opt-in via
++# VLLM_FLASHAMPERE=1. (The old patch-0004 int8qk standalone was removed: int8-QK is net-negative.)
++flashampere = "vllm.v1.attention.backends.flashampere.backend:register_flashampere"
+ 
+ [tool.setuptools_scm]
+ # no extra settings needed, presence enables setuptools-scm
+diff --git a/vllm/vllm/envs.py b/vllm/vllm/envs.py
+index 2f36f8b..0556c43 100755
+--- a/vllm/vllm/envs.py
++++ b/vllm/vllm/envs.py
+@@ -86,6 +86,10 @@ if TYPE_CHECKING:
+     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
+     VLLM_BATCH_INVARIANT: bool = False
+     VLLM_FA2_KVCACHE_VERIFY: bool = True
++    VLLM_FLASHAMPERE: bool = False
++    VLLM_FLASHAMPERE_PV_FP16: bool = True
++    VLLM_FLASHAMPERE_BF16CVT: bool = True
++    VLLM_FLASHAMPERE_SAGE: bool = False
+     VLLM_TRITON_ATTN_USE_TD: bool | None = None
+     MAX_JOBS: str | None = None
+     NVCC_THREADS: str | None = None
+@@ -604,11 +608,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_FA2_KVCACHE_VERIFY": lambda: bool(
+         int(os.getenv("VLLM_FA2_KVCACHE_VERIFY", "1"))
+     ),
+-    # [Ampere fork] Opt in to the int8-QK prefill attention backend (patch 0004): when "1",
+-    # the `vllm.general_plugins` entry-point `register_int8qk` overrides the FLASH_ATTN backend
+-    # with the int8-QK + fp16-PV prefill path for hd256 full-attn layers (everything else
+-    # FA-falls-back). Default off so a plain image swap doesn't change attention for every model.
+-    "VLLM_INT8QK": lambda: bool(int(os.getenv("VLLM_INT8QK", "0"))),
++    # [Ampere fork] flashampere — the unified Ampere attention backend (patch 0008). Master gate:
++    # when "1", the `vllm.general_plugins` entry-point register_flashampere installs
++    # FlashAmpereBackend into Backend.CUSTOM and the CUDA platform auto-selects it for Ampere
++    # full-attn layers. forward() dispatches per call (fp16-PV prefill: fp16pv fp16-served /
++    # bf16cvt bf16-served) and sinks everything else (decode, MTP-verify, encoder, fp8-KV,
++    # non-Ampere) to stock FlashAttention. Default off so a plain image swap doesn't change
++    # attention for every model. (int8-QK was removed: net-negative in every measured scenario.)
++    "VLLM_FLASHAMPERE": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE", "0"))),
++    # Per-leg sub-toggles (only meaningful when VLLM_FLASHAMPERE=1). The fp16-PV legs are the
++    # primary Ampere prefill win -> default ON; they are GeForce-GA10x-gated (forced off on
++    # AMPERE_SERVER/OTHER) so default-on is a no-op on pro Ampere. PV_FP16 = fp16-served;
++    # BF16CVT = bf16-served via runtime bf16->fp16 upcast. SageAttn is research-grade + needs the
++    # sageattention package -> default off.
++    "VLLM_FLASHAMPERE_PV_FP16": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE_PV_FP16", "1"))),
++    "VLLM_FLASHAMPERE_BF16CVT": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE_BF16CVT", "1"))),
++    "VLLM_FLASHAMPERE_SAGE": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE_SAGE", "0"))),
+     # Use tensor descriptors for Q/K/V loads and output stores in the
+     # Triton unified-attention kernel.  Enables HW 2D block reads on
+     # Intel Xe2/Xe3; the non-TD branch is dead-code-eliminated at Triton
+diff --git a/vllm/vllm/platforms/cuda.py b/vllm/vllm/platforms/cuda.py
+index 57814d2..a2bc793 100644
+--- a/vllm/vllm/platforms/cuda.py
++++ b/vllm/vllm/platforms/cuda.py
+@@ -138,13 +138,26 @@ def _get_backend_priorities(
+                 AttentionBackendEnum.TURBOQUANT,
+             ]
+         else:
+-            return [
++            backends = [
+                 AttentionBackendEnum.FLASH_ATTN,
+                 AttentionBackendEnum.FLASHINFER,
+                 AttentionBackendEnum.TRITON_ATTN,
+                 AttentionBackendEnum.FLEX_ATTENTION,
+                 AttentionBackendEnum.TURBOQUANT,
+             ]
++            # [flashampere] Prepend the unified Ampere backend when registered (its
++            # vllm.general_plugins entry-point ran with VLLM_FLASHAMPERE=1) on Ampere (sm_8x).
++            # CUSTOM self-fences via validate_configuration (supports_compute_capability
++            # major==8 + FA's supports_kv_cache_dtype), so non-Ampere / fp8-KV / encoder layers
++            # are skipped and fall through to FLASH_ATTN. Guard on is_overridden() so an
++            # unregistered CUSTOM never reaches get_path() (raises ValueError, which
++            # get_valid_backends does NOT catch — only ImportError).
++            if (
++                device_capability.major == 8
++                and AttentionBackendEnum.CUSTOM.is_overridden()
++            ):
++                backends.insert(0, AttentionBackendEnum.CUSTOM)
++            return backends
+ 
+ 
+ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+diff --git a/vllm/tests/v1/attention/test_flashampere_dispatch.py b/vllm/tests/v1/attention/test_flashampere_dispatch.py
+new file mode 100644
+index 0000000..9e97032
+--- /dev/null
++++ b/vllm/tests/v1/attention/test_flashampere_dispatch.py
+@@ -0,0 +1,181 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU unit tests for the flashampere dispatch + capability policy (no GPU, no vllm runtime).
++
++These assert the STRUCTURAL routing table and the per-card/per-toggle gating that decide which
++Ampere kernel (if any) a call uses. They are the cheap guardrail that the 4-kernel composition
++stays correct across vLLM rebases. Runnable directly (`python test_flashampere_dispatch.py`) or
++under pytest — both import only flashampere.{dispatch,capability}, which are torch/CUDA-free.
++"""
++from __future__ import annotations
++
++import itertools
++import pathlib
++import sys
++
++# Bootstrap: import flashampere.{dispatch,capability} WITHOUT importing the heavy vllm package.
++# Walk up to the repo's `vllm/vllm/v1/attention/backends` dir and put it on sys.path so the
++# `flashampere` package imports as a top-level package (its __init__ is import-light).
++_here = pathlib.Path(__file__).resolve()
++for _p in _here.parents:
++    _backends = _p / "vllm" / "v1" / "attention" / "backends"
++    if (_backends / "flashampere" / "dispatch.py").exists():
++        sys.path.insert(0, str(_backends))
++        break
++
++from flashampere import capability as cap_mod  # noqa: E402
++from flashampere import dispatch as d  # noqa: E402
++from flashampere.dispatch import Cap, DispatchKey, Phase, QSrc  # noqa: E402
++
++HEADS = (64, 96, 128, 256, 576)
++PHASES = (Phase.PREFILL, Phase.DECODE, Phase.VERIFY, Phase.OTHER)
++CAPS = (Cap.GEFORCE_GA10X, Cap.AMPERE_SERVER, Cap.OTHER)
++
++
++def _key(phase, head_dim, *, q_src=QSrc.HALF, kv_quantized=False,
++         cap=Cap.GEFORCE_GA10X, plain_decoder=True):
++    return DispatchKey(phase, head_dim, q_src, kv_quantized, cap, plain_decoder)
++
++
++def _names(key):
++    return tuple(e.name for e in d.resolve(key))
++
++
++def test_only_prefill_ever_matches():
++    # No decode/verify/other call may ever hit a fast kernel -> sink to stock FA.
++    for phase, hd in itertools.product((Phase.DECODE, Phase.VERIFY, Phase.OTHER), HEADS):
++        assert _names(_key(phase, hd)) == (), (phase, hd)
++
++
++def test_fp16pv_owns_hd256_prefill():
++    # int8-QK removed (net-negative in every scenario); fp16-PV legs own the hd256 prefill slot.
++    # fp16 q -> fp16pv only.
++    assert _names(_key(Phase.PREFILL, 256, q_src=QSrc.HALF)) == ("fp16pv",)
++    # bf16 q -> bf16cvt only (fp16-PV via runtime bf16->fp16 upcast).
++    assert _names(_key(Phase.PREFILL, 256, q_src=QSrc.BF16)) == ("bf16cvt",)
++    # other dtype (e.g. fp8) -> no fp16-PV leg -> sink to stock FA.
++    assert _names(_key(Phase.PREFILL, 256, q_src=QSrc.OTHER)) == ()
++
++
++def test_fp16pv_legs_are_dtype_exclusive():
++    # fp16pv fires ONLY for fp16 source, bf16cvt ONLY for bf16 source — never both, never crossed.
++    half = _names(_key(Phase.PREFILL, 256, q_src=QSrc.HALF))
++    bf16 = _names(_key(Phase.PREFILL, 256, q_src=QSrc.BF16))
++    assert "fp16pv" in half and "fp16pv" not in bf16
++    assert "bf16cvt" in bf16 and "bf16cvt" not in half
++    # bf16cvt is PREFILL-only and never leaks to decode/verify/other.
++    for phase in (Phase.DECODE, Phase.VERIFY, Phase.OTHER):
++        assert "bf16cvt" not in _names(_key(phase, 256, q_src=QSrc.BF16)), phase
++
++
++def test_sage_owns_small_head_dims():
++    for hd in (64, 96, 128):
++        assert _names(_key(Phase.PREFILL, hd)) == ("sage",), hd
++
++
++def test_unsupported_head_dims_sink():
++    assert _names(_key(Phase.PREFILL, 576)) == ()
++
++
++def test_quantized_kv_always_sinks():
++    # fp8/int8 KV breaks the prefill cache-read contract -> no fast row, every head dim.
++    for hd in HEADS:
++        assert _names(_key(Phase.PREFILL, hd, kv_quantized=True)) == (), hd
++
++
++def test_non_plain_decoder_sinks():
++    # SWA/alibi/softcap/sinks/encoder => plain_decoder False => sink, every head dim.
++    for hd in HEADS:
++        assert _names(_key(Phase.PREFILL, hd, plain_decoder=False)) == (), hd
++
++
++def test_capability_class():
++    assert cap_mod.classify_card(8, "NVIDIA GeForce RTX 3090") is Cap.GEFORCE_GA10X
++    assert cap_mod.classify_card(8, "NVIDIA GeForce RTX 3080 Ti") is Cap.GEFORCE_GA10X
++    assert cap_mod.classify_card(8, "NVIDIA GeForce RTX 3060 Laptop GPU") is Cap.GEFORCE_GA10X
++    # Pro Ampere sm_80/86 -> SERVER (fp16-PV forced off).
++    for nm in ("NVIDIA A100-SXM4-80GB", "NVIDIA A40", "NVIDIA RTX A6000", "NVIDIA A10"):
++        assert cap_mod.classify_card(8, nm) is Cap.AMPERE_SERVER, nm
++    # Ada (cc 8.9, GeForce RTX 40xx) is NOT GA10x -> SERVER (fp16-PV nerf moved to fp8).
++    assert cap_mod.classify_card(8, "NVIDIA GeForce RTX 4090") is Cap.AMPERE_SERVER
++    # Non-Ampere.
++    assert cap_mod.classify_card(9, "NVIDIA H100") is Cap.OTHER
++    assert cap_mod.classify_card(7, "Tesla V100") is Cap.OTHER
++
++
++def test_pv_fp16_never_on_non_geforce():
++    # The load-bearing safety invariant: fp16-PV must be off everywhere but GeForce-GA10x,
++    # even with the toggle on and the kernel present.
++    env = {"VLLM_FLASHAMPERE": "1", "VLLM_FLASHAMPERE_PV_FP16": "1"}
++    for nm, expect in (
++        ("NVIDIA GeForce RTX 3090", True),
++        ("NVIDIA A40", False),
++        ("NVIDIA RTX A6000", False),
++        ("NVIDIA A100-SXM4-80GB", False),
++    ):
++        caps = cap_mod.detect(8, nm, env, has_flashinfer=True, has_sage=True,
++                              has_fp16pv_kernel=True)
++        assert caps.pv_fp16 is expect, nm
++        # fp16-PV with an un-patched flashinfer (no kernel) is a silent no-op, never on.
++        caps_nokernel = cap_mod.detect(8, nm, env, has_flashinfer=True, has_sage=True,
++                                       has_fp16pv_kernel=False)
++        assert caps_nokernel.pv_fp16 is False, nm
++
++
++def test_master_gate_off_disables_every_leg():
++    env = {"VLLM_FLASHAMPERE": "0", "VLLM_FLASHAMPERE_PV_FP16": "1",
++           "VLLM_FLASHAMPERE_BF16CVT": "1", "VLLM_FLASHAMPERE_SAGE": "1"}
++    caps = cap_mod.detect(8, "NVIDIA GeForce RTX 3090", env, has_flashinfer=True,
++                          has_sage=True, has_fp16pv_kernel=True)
++    for leg in ("fp16pv", "bf16cvt", "sage"):
++        assert caps.enabled(leg) is False, leg
++
++
++def test_default_toggles_when_master_on():
++    env = {"VLLM_FLASHAMPERE": "1"}  # only master on -> fp16-PV legs default-on (GeForce), sage off
++    caps = cap_mod.detect(8, "NVIDIA GeForce RTX 3090", env, has_flashinfer=True,
++                          has_sage=True, has_fp16pv_kernel=True)
++    assert caps.enabled("fp16pv") is True  # fp16-PV default-on now (int8-QK removed); GeForce-gated
++    assert caps.enabled("bf16cvt") is True  # bf16cvt default-on now; GeForce-gated
++    assert caps.enabled("sage") is False  # Sage defaults off (research)
++
++
++def test_bf16cvt_gating():
++    # bf16cvt: GeForce-GA10x-only, needs the fp16-PV kernel — never on AMPERE_SERVER. (PV_FP16 set
++    # off here to isolate bf16cvt's own toggle from the now-default-on fp16pv leg.)
++    env = {"VLLM_FLASHAMPERE": "1", "VLLM_FLASHAMPERE_BF16CVT": "1", "VLLM_FLASHAMPERE_PV_FP16": "0"}
++    on = cap_mod.detect(8, "NVIDIA GeForce RTX 3090", env, has_flashinfer=True,
++                        has_sage=True, has_fp16pv_kernel=True)
++    assert on.enabled("bf16cvt") is True and on.pv_fp16_bf16 is True
++    # PV_FP16 explicitly off here -> fp16-served leg off, bf16cvt independent.
++    assert on.enabled("fp16pv") is False
++    for nm in ("NVIDIA A40", "NVIDIA A100-SXM4-80GB", "NVIDIA RTX A6000"):
++        srv = cap_mod.detect(8, nm, env, has_flashinfer=True, has_sage=True,
++                             has_fp16pv_kernel=True)
++        assert srv.enabled("bf16cvt") is False, nm  # never on pro Ampere
++    # un-patched flashinfer (no fp16-PV kernel) -> silent no-op.
++    nok = cap_mod.detect(8, "NVIDIA GeForce RTX 3090", env, has_flashinfer=True,
++                         has_sage=True, has_fp16pv_kernel=False)
++    assert nok.enabled("bf16cvt") is False
++
++
++def test_enablement_requires_library():
++    env = {"VLLM_FLASHAMPERE": "1", "VLLM_FLASHAMPERE_SAGE": "1"}
++    caps = cap_mod.detect(8, "NVIDIA GeForce RTX 3090", env, has_flashinfer=False,
++                          has_sage=False, has_fp16pv_kernel=False)
++    assert caps.enabled("fp16pv") is False  # no flashinfer / no fp16-PV kernel
++    assert caps.enabled("bf16cvt") is False  # no flashinfer / no fp16-PV kernel
++    assert caps.enabled("sage") is False  # no sageattention
++
++
++def _run_all():
++    fns = [v for k, v in sorted(globals().items())
++           if k.startswith("test_") and callable(v)]
++    for fn in fns:
++        fn()
++        print(f"  PASS {fn.__name__}")
++    print(f"\n{len(fns)} tests passed.")
++
++
++if __name__ == "__main__":
++    _run_all()
+diff --git a/vllm/vllm/v1/attention/backends/flashampere/__init__.py b/vllm/vllm/v1/attention/backends/flashampere/__init__.py
+new file mode 100644
+index 0000000..f18e967
+--- /dev/null
++++ b/vllm/vllm/v1/attention/backends/flashampere/__init__.py
+@@ -0,0 +1,33 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""flashampere — the unified Ampere (sm_80/sm_86) attention backend.
++
++ONE FlashAttention subclass that the deployment actually selects (via Backend.CUSTOM), whose
++forward() dispatches per call to the best Ampere kernel and sinks everything else to stock FA:
++
++  prefill hd256, fp16 query (plain dec, non-quant KV) -> fp16-PV FlashInfer prefill (fp16pv)
++  prefill hd256, bf16 query                            -> fp16-PV via runtime bf16->fp16 (bf16cvt)
++  prefill hd64/96/128                                  -> SageAttn (int8-QK; research-grade, opt-in)
++  decode / MTP-verify / encoder / cascade /            -> super().forward() (stock FA; verify already
++    quantized-KV / non-plain-decoder / non-GA10x          uses the fwd_kvcache split-KV fix in base FA)
++
++(int8-QK was removed: a sweep found it net-negative in every scenario — fresh 16/32/64k + cached-prefix.)
++
++Opt-in: master env VLLM_FLASHAMPERE=1 (+ per-leg sub-toggles). Registered in every TP/PP worker
++via the vllm.general_plugins entry-point register_flashampere (backend.py).
++
++dispatch.py and capability.py are deliberately import-light (no torch/CUDA, no vllm runtime) so
++the routing + gating policy is unit-testable on CPU; impl.py / backend.py carry the GPU code.
++"""
++
++# Lazily re-export the entry-point so importing this package stays cheap (the entry-point path
++# in pyproject points straight at backend:register_flashampere; this is just for convenience).
++__all__ = ["register_flashampere"]
++
++
++def __getattr__(name: str):
++    if name == "register_flashampere":
++        from .backend import register_flashampere
++
++        return register_flashampere
++    raise AttributeError(name)
+diff --git a/vllm/vllm/v1/attention/backends/flashampere/backend.py b/vllm/vllm/v1/attention/backends/flashampere/backend.py
+new file mode 100644
+index 0000000..e72113f
+--- /dev/null
++++ b/vllm/vllm/v1/attention/backends/flashampere/backend.py
+@@ -0,0 +1,73 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""FlashAmpereBackend — the unified Ampere attention backend, registered into Backend.CUSTOM.
++
++Inherits FlashAttentionBackend wholesale (KV-cache shape/layout, metadata builder, and all the
++validate_configuration supports_* gates) and changes only three things: get_name()=="CUSTOM"
++(round-trips through AttentionBackendEnum["CUSTOM"]), get_impl_cls()->FlashAmpereImpl, and
++supports_compute_capability restricted to Ampere (sm major 8). The compute-capability gate
++self-fences: on non-Ampere, validate_configuration appends "compute capability not supported" so
++the cuda.py priority walk skips CUSTOM and falls to FLASH_ATTN. Inheriting FA's
++supports_kv_cache_dtype also means fp8-KV makes CUSTOM invalid on Ampere (FA3+sm90-only) -> the
++selector routes fp8-KV elsewhere automatically (the "fp8-KV is either/or" scoping, for free).
++
++Registered in EVERY process (engine core + each TP/PP worker) via the vllm.general_plugins
++entry-point register_flashampere; opt-in behind VLLM_FLASHAMPERE=1 so a plain image swap does not
++change attention for every model.
++"""
++from __future__ import annotations
++
++from vllm.logger import init_logger
++from vllm.platforms.interface import DeviceCapability
++from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
++
++from .impl import FlashAmpereImpl
++
++logger = init_logger(__name__)
++
++
++class FlashAmpereBackend(FlashAttentionBackend):
++    @staticmethod
++    def get_name() -> str:
++        # Registered into the CUSTOM slot; AttentionBackendEnum["CUSTOM"] resolves cleanly.
++        return "CUSTOM"
++
++    @staticmethod
++    def get_impl_cls() -> type[FlashAmpereImpl]:
++        return FlashAmpereImpl
++
++    @classmethod
++    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
++        # Ampere only (sm_80/sm_86/sm_89). Hopper/Blackwell have better backends; non-Ampere
++        # gets "compute capability not supported" -> selector falls back to FLASH_ATTN.
++        return capability.major == 8
++
++
++def register_flashampere() -> None:
++    """vllm.general_plugins entry-point: install FlashAmpere into Backend.CUSTOM in every process.
++
++    Opt-in: no-op unless VLLM_FLASHAMPERE truthy. load_general_plugins() runs this in the engine
++    core AND each TP/PP worker subprocess before attention-backend selection, so CUSTOM is
++    registered everywhere the cuda.py priority-prepend (guarded on CUSTOM.is_overridden()) needs it.
++    Idempotent.
++    """
++    import os
++
++    if os.environ.get("VLLM_FLASHAMPERE", "0") not in ("1", "true", "True"):
++        return
++
++    from vllm.v1.attention.backends.registry import (
++        AttentionBackendEnum,
++        register_backend,
++    )
++
++    register_backend(
++        AttentionBackendEnum.CUSTOM,
++        "vllm.v1.attention.backends.flashampere.backend.FlashAmpereBackend",
++    )
++    logger.info(
++        "flashampere plugin: registered FlashAmpereBackend in Backend.CUSTOM (VLLM_FLASHAMPERE=1). "
++        "Auto-selected for Ampere full-attn layers; hd256 prefill -> fp16-PV: fp16pv (fp16-served) "
++        "| bf16cvt (bf16->fp16 upcast); GeForce-GA10x-gated, default-on; "
++        "verify/decode/everything-else -> stock FA."
++    )
+diff --git a/vllm/vllm/v1/attention/backends/flashampere/capability.py b/vllm/vllm/v1/attention/backends/flashampere/capability.py
+new file mode 100644
+index 0000000..0bb2e4c
+--- /dev/null
++++ b/vllm/vllm/v1/attention/backends/flashampere/capability.py
+@@ -0,0 +1,165 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""flashampere capability detection — per-card + per-toggle gating.
++
++The make-or-break decision is fp16-accumulate PV: it runs at 2x ONLY on GeForce-GA10x
++consumer Ampere (RTX 3090/3080/3070/3060/3050); on pro Ampere (A100/A40/A6000/A10) the
++FP32-accumulate path is already full-rate, so fp16-PV gives ZERO speed and only costs
++accuracy. The gate is therefore the device NAME, never ``__CUDA_ARCH__ >= 860`` (which
++would silently degrade the pro sm_86 cards).
++
++detect() takes its inputs by argument so the whole policy is unit-testable on CPU with no
++GPU; gather_inputs() collects the real values from the platform + env at backend init.
++"""
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass
++
++from .dispatch import Cap
++
++# Substring that identifies a GeForce GA10x consumer card (all RTX 30-series, incl. Ti and
++# Laptop). Excludes Ada "GeForce RTX 40..." and every pro SKU (A100/A40/A6000/A10/...).
++_GEFORCE_GA10X_MARK = "geforce rtx 30"
++
++
++def classify_card(cc_major: int, device_name: str) -> Cap:
++    """Map (compute-capability major, device name) -> capability class.
++
++    Ampere is cc major 8 (incl. Ada 8.9, which is a pro/consumer non-GA10x => SERVER).
++    """
++    if cc_major != 8:
++        return Cap.OTHER
++    if _GEFORCE_GA10X_MARK in device_name.lower():
++        return Cap.GEFORCE_GA10X
++    return Cap.AMPERE_SERVER
++
++
++def _envflag(env: dict[str, str], name: str, default: str = "0") -> bool:
++    return env.get(name, default) in ("1", "true", "True")
++
++
++@dataclass(frozen=True)
++class FlashAmpereCaps:
++    cap: Cap
++    has_flashinfer: bool
++    has_sage: bool
++    has_fp16pv_kernel: bool  # vendored flashinfer exposes use_fp16_pv_reduction (patch 0007)
++    fp16pv_on: bool  # VLLM_FLASHAMPERE_PV_FP16 (fp16-served fp16-PV; default on)
++    bf16cvt_on: bool  # VLLM_FLASHAMPERE_BF16CVT (bf16-served fp16-PV via upcast; default on)
++    sage_on: bool  # VLLM_FLASHAMPERE_SAGE
++
++    @property
++    def pv_fp16(self) -> bool:
++        """Effective fp16-PV: GeForce-GA10x AND vendored kernel present AND toggled on.
++        Forced off on AMPERE_SERVER/OTHER (0 gain + accuracy cost) regardless of the toggle."""
++        return (
++            self.cap is Cap.GEFORCE_GA10X
++            and self.has_fp16pv_kernel
++            and self.fp16pv_on
++        )
++
++    @property
++    def pv_fp16_bf16(self) -> bool:
++        """Effective bf16cvt (bf16-served fp16-PV via runtime upcast): same GeForce-GA10x +
++        vendored-kernel gate as pv_fp16, but its OWN toggle. Separate from fp16pv_on because the
++        bf16 source adds a runtime upcast cost and a (small) numeric round-trip, so it ships
++        opt-in until a bf16-served e2e A/B promotes it. Forced off on AMPERE_SERVER/OTHER."""
++        return (
++            self.cap is Cap.GEFORCE_GA10X
++            and self.has_fp16pv_kernel
++            and self.bf16cvt_on
++        )
++
++    def enabled(self, name: str) -> bool:
++        """Is the dispatch leg `name` permitted to run (lib present + toggled on)?"""
++        if name == "fp16pv":
++            # Standalone fp16-PV prefill: needs the kernel + an effective (GeForce) gate.
++            return self.has_flashinfer and self.pv_fp16
++        if name == "bf16cvt":
++            # bf16-served fp16-PV (runtime upcast): same kernel + GeForce gate, own toggle.
++            return self.has_flashinfer and self.pv_fp16_bf16
++        if name == "sage":
++            return self.has_sage and self.sage_on
++        return False
++
++
++def detect(
++    cc_major: int,
++    device_name: str,
++    env: dict[str, str],
++    has_flashinfer: bool,
++    has_sage: bool,
++    has_fp16pv_kernel: bool,
++) -> FlashAmpereCaps:
++    """Pure policy: build the caps from explicit inputs (unit-testable, no GPU)."""
++    master = _envflag(env, "VLLM_FLASHAMPERE")
++    # Sub-toggles: fp16-PV legs (fp16pv fp16-served / bf16cvt bf16-served) default ON — they are
++    # the primary Ampere prefill win and are GeForce-GA10x-gated by the pv_fp16* properties, so
++    # default-on is a no-op on AMPERE_SERVER/OTHER. Sage stays research/off. int8-QK was removed
++    # (net-negative everywhere). The master gate must also be on for any leg to fire.
++    fp16pv_on = master and _envflag(env, "VLLM_FLASHAMPERE_PV_FP16", "1")
++    bf16cvt_on = master and _envflag(env, "VLLM_FLASHAMPERE_BF16CVT", "1")
++    sage_on = master and _envflag(env, "VLLM_FLASHAMPERE_SAGE", "0")
++    return FlashAmpereCaps(
++        cap=classify_card(cc_major, device_name),
++        has_flashinfer=has_flashinfer,
++        has_sage=has_sage,
++        has_fp16pv_kernel=has_fp16pv_kernel,
++        fp16pv_on=fp16pv_on,
++        bf16cvt_on=bf16cvt_on,
++        sage_on=sage_on,
++    )
++
++
++def gather_inputs() -> dict:
++    """Collect the real runtime inputs for detect() (called once at backend init)."""
++    cc_major = 0
++    device_name = ""
++    try:
++        from vllm.platforms import current_platform
++
++        dc = current_platform.get_device_capability()
++        if dc is not None:
++            cc_major = dc.major
++        device_name = current_platform.get_device_name()
++    except Exception:
++        pass
++
++    try:
++        import flashinfer  # noqa: F401
++
++        has_flashinfer = True
++    except Exception:
++        has_flashinfer = False
++
++    try:
++        import sageattention  # noqa: F401
++
++        has_sage = True
++    except Exception:
++        has_sage = False
++
++    return dict(
++        cc_major=cc_major,
++        device_name=device_name,
++        env=dict(os.environ),
++        has_flashinfer=has_flashinfer,
++        has_sage=has_sage,
++        has_fp16pv_kernel=_flashinfer_has_fp16pv(),
++    )
++
++
++def _flashinfer_has_fp16pv() -> bool:
++    """True iff the vendored FlashInfer exposes the use_fp16_pv_reduction lever (patch 0007).
++    Probed so VLLM_FLASHAMPERE_PV_FP16=1 on a stock (un-patched) FlashInfer is a silent no-op
++    rather than a crash."""
++    try:
++        import inspect
++
++        import flashinfer
++
++        sig = inspect.signature(flashinfer.single_prefill_with_kv_cache)
++        return "use_fp16_pv_reduction" in sig.parameters
++    except Exception:
++        return False
+diff --git a/vllm/vllm/v1/attention/backends/flashampere/dispatch.py b/vllm/vllm/v1/attention/backends/flashampere/dispatch.py
+new file mode 100644
+index 0000000..15b109c
+--- /dev/null
++++ b/vllm/vllm/v1/attention/backends/flashampere/dispatch.py
+@@ -0,0 +1,144 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""flashampere dispatch core — pure, GPU-free, unit-testable.
++
++Maps a per-call ``DispatchKey`` (phase x head_dim x dtype x kv-quant x capability x
++plain-decoder) to the ordered list of Ampere kernels that may run it. An empty list
++means "no fast kernel applies" -> the impl sinks to stock FlashAttention (bit-faithful).
++
++This module imports NOTHING from torch/CUDA or the vllm runtime so the entire routing
++decision can be enumerated and asserted on CPU in milliseconds (see test_dispatch.py).
++Enablement (is a leg toggled on? is its library present? does the card qualify?) is NOT
++decided here — that is the capability/runtime concern (capability.py + impl.forward).
++The table encodes only STRUCTURAL eligibility, which is what must stay correct across
++vLLM rebases.
++"""
++from __future__ import annotations
++
++from collections.abc import Callable
++from enum import Enum
++from typing import NamedTuple
++
++# Head dims each prefill leg accelerates. fp16-PV (fp16pv fp16-served / bf16cvt bf16-served) targets
++# the Qwen3.x hd256 full-attn layers; SageAttn targets the smaller dense hd's. Extend to widen.
++FP16PV_HEADS: tuple[int, ...] = (256,)  # fp16-served (q dtype == fp16)
++BF16CVT_HEADS: tuple[int, ...] = (256,)  # bf16-served (runtime upcast to fp16)
++SAGE_HEADS: tuple[int, ...] = (64, 96, 128)
++
++
++class Phase(Enum):
++    """Per-call attention phase, derived from metadata in impl._classify (CPU-only)."""
++
++    PREFILL = "prefill"  # fresh or chunked-prefix prefill (large query)
++    DECODE = "decode"  # query_len <= 1
++    VERIFY = "verify"  # uniform small-query spec-decode verify (1 < q <= 1+K)
++    OTHER = "other"  # encoder / cascade / unclassifiable -> sink
++
++
++class Cap(Enum):
++    """SM-capability CLASS, not raw compute capability (per-card, set in capability.py)."""
++
++    GEFORCE_GA10X = "geforce_ga10x"  # 3090/3080/3070/3060/3050 — fp16-PV runs at 2x
++    AMPERE_SERVER = "ampere_server"  # A100/A40/A6000/A10/... — fp16-PV gives 0, forced off
++    OTHER = "other"  # not Ampere (sm major != 8) — backend declines everything
++
++
++class QSrc(Enum):
++    """Query source dtype CLASS — selects which fp16-PV variant (if any) is structurally
++    eligible. fp16-PV is half-only (DTypeProb=half), so a fp16-served model (HALF) routes to
++    the fp16pv leg directly, while a bf16-served model (BF16) routes to the bf16cvt leg, which
++    upcasts Q/K/V to fp16 at runtime (lossless: fp16 has 10 mantissa bits vs bf16's 7) then runs
++    the SAME fp16 cubin. OTHER (fp8 etc.) is ineligible for either -> sink."""
++
++    HALF = "half"  # float16
++    BF16 = "bf16"  # bfloat16 — runtime-upcast to fp16 for the fp16-PV cubin
++    OTHER = "other"  # anything else -> no fp16-PV leg
++
++
++class DispatchKey(NamedTuple):
++    phase: Phase
++    head_dim: int
++    q_src: QSrc  # query source dtype class (fp16->fp16pv, bf16->bf16cvt, else no fp16-PV leg)
++    kv_quantized: bool  # fp8/int8 kv cache (breaks the prefill cache-read contract)
++    cap: Cap
++    plain_decoder: bool  # no SWA/alibi/softcap/sinks and attn_type == DECODER
++
++
++class KernelEntry(NamedTuple):
++    name: str
++    capture_safe: bool  # may execute inside a captured cudagraph (no CPU<->GPU sync)
++
++
++class KernelDecline(Exception):
++    """Raised inside a kernel at run time (missing lib, overflow, unsupported slice) to
++    fall back to the next candidate, ultimately stock FA. Never a correctness compromise."""
++
++
++# Ordered (matcher, entry) rows. resolve() returns every structural match in order; the
++# impl runs the first ENABLED + capture-compatible one, else sinks. First-registered wins
++# ties (fp16pv and bf16cvt are dtype-exclusive on the hd256 prefill slot, so no real contention).
++_TABLE: list[tuple[Callable[[DispatchKey], bool], KernelEntry]] = []
++
++
++def register(matcher: Callable[[DispatchKey], bool], entry: KernelEntry) -> None:
++    _TABLE.append((matcher, entry))
++
++
++def resolve(key: DispatchKey) -> tuple[KernelEntry, ...]:
++    """All structurally-eligible kernels for this call, in priority order ( () => sink)."""
++    return tuple(entry for matcher, entry in _TABLE if matcher(key))
++
++
++def clear() -> None:
++    _TABLE.clear()
++
++
++def build_default_table() -> None:
++    """(Re)install the v1 routing table. Idempotent; called at import and in tests."""
++    clear()
++
++    # hd256 prefill, fp16 query: fp16-PV FlashInfer prefill (fp16-served models). The fp16-PV
++    # reduction (DTypeProb=half) is the measured Ampere win; int8-QK was removed after a sweep
++    # found it net-negative in every scenario (fresh 16/32/64k + cached-prefix) — its O(L^2)
++    # per-token dequant + fp16-KV-read-then-requant tax always exceeds the ~1.7% IMMA-QK gain.
++    register(
++        lambda k: (
++            k.phase is Phase.PREFILL
++            and k.head_dim in FP16PV_HEADS
++            and k.plain_decoder
++            and not k.kv_quantized
++            and k.q_src is QSrc.HALF
++        ),
++        KernelEntry("fp16pv", capture_safe=False),
++    )
++    # Same slot, bf16 query: bf16cvt = fp16pv with a runtime bf16->fp16 upcast of Q/K/V (the
++    # kernel already casts; this row only widens eligibility). Delivers the half-only fp16-PV
++    # win to bf16-served models (the Qwen3.x default dtype). GeForce-gated at enablement.
++    register(
++        lambda k: (
++            k.phase is Phase.PREFILL
++            and k.head_dim in BF16CVT_HEADS
++            and k.plain_decoder
++            and not k.kv_quantized
++            and k.q_src is QSrc.BF16
++        ),
++        KernelEntry("bf16cvt", capture_safe=False),
++    )
++    # Small dense head dims -> SageAttn int8-QK prefill (research-grade; gated by HAS_SAGE
++    # + toggle at enablement time, so the row is harmless when the package is absent).
++    register(
++        lambda k: (
++            k.phase is Phase.PREFILL
++            and k.head_dim in SAGE_HEADS
++            and k.plain_decoder
++            and not k.kv_quantized
++        ),
++        KernelEntry("sage", capture_safe=False),
++    )
++    # DECODE / VERIFY / OTHER / quantized-KV / non-plain-decoder: no row -> () -> stock FA.
++    # VERIFY deliberately has no fast row: it is memory/occupancy-bound (tiny q, long KV),
++    # so the compute-side fp16-PV gives ~0 and would reintroduce the long-ctx occupancy
++    # cliff; stock FA already routes it to fwd_kvcache (FlashDecoding split-KV).
++
++
++build_default_table()
+diff --git a/vllm/vllm/v1/attention/backends/flashampere/impl.py b/vllm/vllm/v1/attention/backends/flashampere/impl.py
+new file mode 100644
+index 0000000..6ff5513
+--- /dev/null
++++ b/vllm/vllm/v1/attention/backends/flashampere/impl.py
+@@ -0,0 +1,157 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""FlashAmpereImpl — the one Ampere attention impl. forward() is a thin guard + per-call phase
++classify + dispatch-table resolve, with stock FlashAttention (super().forward) as the universal,
++bit-faithful sink. All accelerated work lives in kernels.py; routing/gating in dispatch.py +
++capability.py. The base FA forward already carries the MTP-verify fwd_kvcache fix
++(VLLM_FA2_KVCACHE_VERIFY), so VERIFY and DECODE sink to it unchanged."""
++from __future__ import annotations
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.v1.attention.backend import AttentionType
++from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
++
++from . import capability, kernels
++from .dispatch import DispatchKey, KernelDecline, Phase, QSrc, resolve
++
++logger = init_logger(__name__)
++
++_CAPS: capability.FlashAmpereCaps | None = None
++
++
++def _caps() -> capability.FlashAmpereCaps:
++    # Process-global: one GPU per process, so detect once and reuse across all layers.
++    global _CAPS
++    if _CAPS is None:
++        _CAPS = capability.detect(**capability.gather_inputs())
++        logger.info("flashampere caps: %s", _CAPS)
++    return _CAPS
++
++
++def _verify_upper_bound() -> int:
++    """Max query length treated as spec-decode verify (= reorder_batch_threshold = 1 + K). A
++    prefill chunk has q_len above this; a verify step at or below it. 1 means no spec -> no verify."""
++    try:
++        from vllm.config import get_current_vllm_config
++
++        sc = get_current_vllm_config().speculative_config
++        if sc is not None and sc.num_speculative_tokens is not None:
++            mult = 2 if getattr(sc, "parallel_drafting", False) else 1
++            return 1 + mult * sc.num_speculative_tokens
++    except Exception:
++        pass
++    return 1
++
++
++class FlashAmpereImpl(FlashAttentionImpl):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        sw = getattr(self, "sliding_window", None)
++        no_sw = sw is None or tuple(sw) == (-1, -1)
++        soft_cap = getattr(self, "logits_soft_cap", None)
++        no_soft_cap = soft_cap is None or soft_cap == 0
++        # Per-layer static eligibility for the fp16-PV legs: a plain causal decoder attention
++        # (no SWA/alibi/softcap/sinks); head_size lives in the DispatchKey, the library probe in caps.
++        self._plain_decoder = (
++            getattr(self, "attn_type", AttentionType.DECODER) == AttentionType.DECODER
++            and no_sw
++            and getattr(self, "alibi_slopes", None) is None
++            and no_soft_cap
++            and getattr(self, "sinks", None) is None
++        )
++        self._caps = _caps()
++        self._verify_ub = _verify_upper_bound()
++
++    def _classify(self, m) -> Phase:
++        """Per-call phase from CPU-only metadata scalars (capture-safe: no .item()/.tolist())."""
++        if getattr(m, "use_cascade", False):
++            return Phase.OTHER
++        mql = getattr(m, "max_query_len", None)
++        if mql is None or mql <= 1:
++            return Phase.DECODE
++        # Uniform small-query batch == spec-decode verify -> sink to base FA fwd_kvcache.
++        num_reqs = m.seq_lens.shape[0]
++        if mql <= self._verify_ub and m.num_actual_tokens == num_reqs * mql:
++            return Phase.VERIFY
++        return Phase.PREFILL
++
++    def forward(
++        self,
++        layer: torch.nn.Module,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        kv_cache: torch.Tensor,
++        attn_metadata,
++        output: torch.Tensor,
++        output_scale: torch.Tensor | None = None,
++        output_block_scale: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        m = attn_metadata
++        # Universal hard fallbacks -> stock FA (cannot be expressed in the structural key).
++        if (
++            m is None
++            or output_scale is not None
++            or output_block_scale is not None
++            or getattr(self, "dcp_world_size", 1) > 1
++        ):
++            return super().forward(
++                layer, query, key, value, kv_cache, m, output,
++                output_scale, output_block_scale,
++            )
++
++        # Hot-path early-out: only PREFILL is ever routed to a fast kernel (the table invariant
++        # asserted by test_only_prefill_ever_matches). Decode/verify/encoder/cascade skip key
++        # construction + resolve and sink straight to stock FA — keeps the decode path lean and
++        # routes MTP-verify to the base fwd_kvcache fix unchanged.
++        if self._classify(m) is not Phase.PREFILL:
++            return super().forward(
++                layer, query, key, value, kv_cache, m, output,
++                output_scale, output_block_scale,
++            )
++
++        key_t = DispatchKey(
++            phase=Phase.PREFILL,
++            head_dim=self.head_size,
++            q_src=(
++                QSrc.HALF if query.dtype == torch.float16
++                else QSrc.BF16 if query.dtype == torch.bfloat16
++                else QSrc.OTHER
++            ),
++            kv_quantized=kernels.is_quantized_kv_cache(self.kv_cache_dtype),
++            cap=self._caps.cap,
++            plain_decoder=self._plain_decoder,
++        )
++
++        # Sync-bearing prefill legs (.tolist() gather) are illegal during cudagraph capture;
++        # capture_safe=False legs route to FA while capturing. Prefill is eager so this only
++        # ever fires defensively (incl. spec-decode capture, where verify already sank above).
++        capturing = torch.cuda.is_current_stream_capturing()
++
++        for entry in resolve(key_t):
++            if capturing and not entry.capture_safe:
++                continue
++            if not self._caps.enabled(entry.name):
++                continue
++            try:
++                return self._run(entry.name, layer, query, key, value, kv_cache, m, output)
++            except KernelDecline:
++                continue  # try the next candidate, else the sink below
++
++        return super().forward(
++            layer, query, key, value, kv_cache, m, output,
++            output_scale, output_block_scale,
++        )
++
++    def _run(self, name, layer, query, key, value, kv_cache, m, output):
++        # fp16pv (fp16-served) and bf16cvt (bf16-served) share the SAME kernel: it casts Q/K/V
++        # to fp16 internally (lossless from bf16) and writes back at output.dtype. The leg name
++        # only differs for routing/gating + telemetry. (int8-QK was removed: net-negative.)
++        if name in ("fp16pv", "bf16cvt"):
++            return kernels.fp16pv_prefill(
++                self, layer, query, key, value, kv_cache, m, output, leg=name
++            )
++        # "sage" lands here in a future phase; until implemented, decline -> sink.
++        raise KernelDecline
+diff --git a/vllm/vllm/v1/attention/backends/flashampere/kernels.py b/vllm/vllm/v1/attention/backends/flashampere/kernels.py
+new file mode 100644
+index 0000000..9d12eba
+--- /dev/null
++++ b/vllm/vllm/v1/attention/backends/flashampere/kernels.py
+@@ -0,0 +1,165 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""flashampere prefill kernel — the fp16-PV FlashInfer prefill leg.
++
++fp16pv_prefill() runs a fp16 FlashInfer prefill with use_fp16_pv_reduction (the patch-0007
++half-accumulate PV — the measured Ampere prefill win on GeForce-GA10x). It serves both fp16-served
++models (leg="fp16pv") and bf16-served models (leg="bf16cvt", runtime bf16->fp16 upcast of Q/K/V,
++lossless in fp16 range). int8-QK was removed: a sweep found it net-negative in every scenario
++(fresh 16/32/64k + cached-prefix) — its O(L^2) per-token dequant + fp16-KV-read-then-requant tax
++always exceeded the ~1.7% IMMA-QK gain.
++
++Targets hd256 plain-decoder prefill (fresh + cached-prefix chunks); the dispatcher guarantees it
++is only ever called for a positively-routed PREFILL key, and any run-time shortfall raises
++KernelDecline to fall back to stock FA (bit-faithful).
++"""
++from __future__ import annotations
++
++import os
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.v1.attention.backends import flash_attn as _fa
++
++from .dispatch import KernelDecline
++
++logger = init_logger(__name__)
++
++try:
++    import flashinfer  # noqa: F401
++
++    _HAS_FI = True
++except Exception as e:  # pragma: no cover - import guard
++    flashinfer = None
++    _HAS_FI = False
++    logger.warning("flashinfer not importable (%s); flashampere prefill legs delegate to FA.", e)
++
++# Fire counter (read by the validation harness): totals + per-leg breakdown.
++FIRE = {"calls": 0, "seqs": 0, "fresh": 0, "cached": 0, "fp16pv": 0, "bf16cvt": 0}
++
++# bf16->fp16 upcast is lossless for attention inputs in the fp16 NORMAL range (fp16 carries 10
++# mantissa bits vs bf16's 7), but bf16's wider exponent can hold values above fp16 max (65504).
++# Such a value would overflow to +-inf on .to(fp16) and NaN the attention. Real post-norm Q/K/V
++# are O(1-50) so this never fires in practice, but the bf16cvt leg range-checks all three operands
++# before the upcast and declines to bit-faithful FA if any exceeds this -> never emits inf/NaN.
++_FP16_MAX = 65504.0
++
++# Per-PROCESS one-time "fired here" latch -> a per-rank log line under TP/PP (separate procs).
++_FIRED_LOGGED = False
++
++is_quantized_kv_cache = _fa.is_quantized_kv_cache
++
++
++def _reshape_and_cache_flash(*args, **kwargs):
++    # Bound lazily (FA's varlen kernel binds reshape_and_cache_flash only on a real CUDA build).
++    return _fa.reshape_and_cache_flash(*args, **kwargs)
++
++
++def _gather_one(cache: torch.Tensor, blk: torch.Tensor, n_blocks: int, seq_len: int) -> torch.Tensor:
++    """Gather the first `seq_len` logical tokens of ONE request's K or V from the paged cache.
++    cache: [num_blocks, block_size, Hkv, D]; blk: [n_blocks] physical block ids. Returns a fresh
++    contiguous [seq_len, Hkv, D] in the cache dtype."""
++    bs, Hkv, D = cache.shape[1], cache.shape[2], cache.shape[3]
++    blocks = cache.index_select(0, blk)
++    return blocks.reshape(n_blocks * bs, Hkv, D)[:seq_len]
++
++
++def _fi_prefill(q, k, v, *, causal, sm, o_dtype, use_fp16_pv=False):
++    """Single FlashInfer fp16 prefill; thread use_fp16_pv_reduction only when requested (the param
++    exists only on the patch-0007 flashinfer, and the caller gates that via caps.has_fp16pv_kernel)."""
++    kw = {"use_fp16_pv_reduction": True} if use_fp16_pv else {}
++    return flashinfer.single_prefill_with_kv_cache(
++        q, k, v, causal=causal, backend="fa2", o_dtype=o_dtype,
++        pos_encoding_mode="NONE", sm_scale=sm, **kw,
++    )
++
++
++def _log_fired_once(leg: str, Lq: int, ctx: int, D: int) -> None:
++    global _FIRED_LOGGED
++    if _FIRED_LOGGED:
++        return
++    _FIRED_LOGGED = True
++    try:
++        from vllm.distributed.parallel_state import get_pp_group, get_tp_group
++
++        rank = f"tp{get_tp_group().rank_in_group}/pp{get_pp_group().rank_in_group}"
++    except Exception:
++        rank = "single"
++    logger.info(
++        "FLASHAMPERE %s FIRED rank=%s pid=%d (q_len=%d ctx=%d head_size=%d)",
++        leg, rank, os.getpid(), Lq, ctx, D,
++    )
++
++
++def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: str = "fp16pv"):
++    """fp16-PV prefill — gather/loop + fp16 FlashInfer with use_fp16_pv_reduction. Casts Q/K/V to fp16
++    and runs FlashInfer with use_fp16_pv_reduction (DTypeProb=half). Serves BOTH:
++      - leg="fp16pv": fp16-served models (Q already fp16; cast is a no-op).
++      - leg="bf16cvt": bf16-served models, runtime-upcast bf16->fp16 (lossless in fp16 range) so
++        the half-only fp16-PV win reaches bf16 deploys without int8-QK's quant/gather tax.
++    Output is written back at output.dtype (fp16->bf16 downcast for bf16 models). Real post-norm
++    Q/K/V are O(1-50), far inside fp16 range; but a bf16 source could in principle hold a value
++    above fp16-max (65504) that would become inf at the .to(fp16) cast (the cast happens before the
++    matmul, so fp32 QK^T accumulation cannot rescue an already-inf operand). For the bf16cvt leg we
++    therefore range-check ALL THREE operands before upcast and decline to bit-faithful stock FA if
++    any exceeds fp16-max (never fires in practice; pure insurance)."""
++    if not _HAS_FI:
++        raise KernelDecline
++    guard_fp16 = leg == "bf16cvt"  # bf16 source: range-check Q/K/V before upcast (else inf on cast)
++    cu_list = m.query_start_loc.tolist()
++    n_req = len(cu_list) - 1
++    qlens = [int(cu_list[i + 1] - cu_list[i]) for i in range(n_req)]
++    seq_lens_cpu = m.seq_lens.tolist()
++    for i in range(n_req):
++        if qlens[i] == 1 and seq_lens_cpu[i] > 1:
++            raise KernelDecline
++
++    key_cache, value_cache = kv_cache.unbind(1)
++    _reshape_and_cache_flash(
++        key, value, key_cache, value_cache,
++        m.slot_mapping, impl.kv_cache_dtype, layer._k_scale, layer._v_scale,
++    )
++    H, Hkv, D = impl.num_heads, impl.num_kv_heads, impl.head_size
++    sm = impl.scale
++    causal = m.causal
++    block_table = m.block_table
++    bs = key_cache.shape[1]
++
++    for i in range(n_req):
++        s, e = int(cu_list[i]), int(cu_list[i + 1])
++        if e <= s:
++            continue
++        Lq = e - s
++        seq_len = int(seq_lens_cpu[i])
++        ctx = seq_len - Lq
++        q_src = query[s:e].reshape(Lq, H, D)
++        if ctx <= 0:
++            k_src = key[s:e].reshape(Lq, Hkv, D)
++            v_src = value[s:e].reshape(Lq, Hkv, D)
++            FIRE["fresh"] += 1
++        else:
++            n_blocks = (seq_len + bs - 1) // bs
++            blk = block_table[i][:n_blocks]
++            k_src = _gather_one(key_cache, blk, n_blocks, seq_len)
++            v_src = _gather_one(value_cache, blk, n_blocks, seq_len)
++            FIRE["cached"] += 1
++        # bf16 source: any Q/K/V element above fp16-max would become inf on the upcast (Q/K turn
++        # the score inf, V poisons the PV accumulator) -> range-check all three and sink to
++        # bit-faithful FA. The `not (mx <= max)` form also catches a pre-existing NaN/inf operand
++        # (NaN fails the <=), so the leg never forwards a non-finite tensor into the cubin. Never
++        # fires for real O(1-50) post-norm activations; pure insurance.
++        if guard_fp16:
++            mx = max(float(q_src.abs().amax()), float(k_src.abs().amax()), float(v_src.abs().amax()))
++            if not (mx <= _FP16_MAX):
++                raise KernelDecline
++        q = q_src.to(torch.float16)
++        k = k_src.to(torch.float16)
++        v = v_src.to(torch.float16)
++        o = _fi_prefill(q, k, v, causal=causal, sm=sm, o_dtype=torch.float16, use_fp16_pv=True)
++        output[s:e] = o.reshape(output[s:e].shape).to(output.dtype)
++        FIRE["calls"] += 1
++        FIRE["seqs"] += 1
++        FIRE[leg] += 1
++        _log_fired_once(leg, Lq, ctx, D)
++    return output

@@ -1162,6 +1162,7 @@ def single_prefill_with_kv_cache(
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
     use_fp16_qk_reduction: bool = False,
+    use_fp16_pv_reduction: bool = False,
     sm_scale: Optional[float] = None,
     window_left: int = -1,
     logits_soft_cap: Optional[float] = None,
@@ -1190,6 +1191,7 @@ def single_prefill_with_kv_cache(
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
     use_fp16_qk_reduction: bool = False,
+    use_fp16_pv_reduction: bool = False,
     sm_scale: Optional[float] = None,
     window_left: int = -1,
     logits_soft_cap: Optional[float] = None,
@@ -1218,6 +1220,7 @@ def single_prefill_with_kv_cache(
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
     use_fp16_qk_reduction: bool = False,
+    use_fp16_pv_reduction: bool = False,
     sm_scale: Optional[float] = None,
     window_left: int = -1,
     logits_soft_cap: Optional[float] = None,
@@ -1440,6 +1443,7 @@ def single_prefill_with_kv_cache(
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
         use_fp16_qk_reduction,
+        use_fp16_pv_reduction,
     )
 
     module.run(
