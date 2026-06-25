@@ -47,6 +47,7 @@ class FlashAmpereCaps:
     has_fp16pv_kernel: bool  # vendored flashinfer exposes use_fp16_pv_reduction (patch 0007)
     fp16pv_on: bool  # VLLM_FLASHAMPERE_PV_FP16 (fp16-served fp16-PV; default on)
     bf16cvt_on: bool  # VLLM_FLASHAMPERE_BF16CVT (bf16-served fp16-PV via upcast; default on)
+    xqa_verify_on: bool  # VLLM_FLASHAMPERE_XQA_VERIFY (MTP spec-verify via vendored XQA; opt-in)
     sage_on: bool  # VLLM_FLASHAMPERE_SAGE
 
     @property
@@ -79,6 +80,10 @@ class FlashAmpereCaps:
         if name == "bf16cvt":
             # bf16-served fp16-PV (runtime upcast): same kernel + GeForce gate, own toggle.
             return self.has_flashinfer and self.pv_fp16_bf16
+        if name == "xqa_verify":
+            # MTP spec-verify via famp's vendored XQA. Any Ampere (sm80/86; NOT GeForce-only — it
+            # is a separate decode kernel, not fp16-PV). has_flashinfer = the JIT toolchain. Opt-in.
+            return self.has_flashinfer and self.cap is not Cap.OTHER and self.xqa_verify_on
         if name == "sage":
             return self.has_sage and self.sage_on
         return False
@@ -100,6 +105,7 @@ def detect(
     # (net-negative everywhere). The master gate must also be on for any leg to fire.
     fp16pv_on = master and _envflag(env, "VLLM_FLASHAMPERE_PV_FP16", "1")
     bf16cvt_on = master and _envflag(env, "VLLM_FLASHAMPERE_BF16CVT", "1")
+    xqa_verify_on = master and _envflag(env, "VLLM_FLASHAMPERE_XQA_VERIFY", "0")
     sage_on = master and _envflag(env, "VLLM_FLASHAMPERE_SAGE", "0")
     return FlashAmpereCaps(
         cap=classify_card(cc_major, device_name),
@@ -108,6 +114,7 @@ def detect(
         has_fp16pv_kernel=has_fp16pv_kernel,
         fp16pv_on=fp16pv_on,
         bf16cvt_on=bf16cvt_on,
+        xqa_verify_on=xqa_verify_on,
         sage_on=sage_on,
     )
 

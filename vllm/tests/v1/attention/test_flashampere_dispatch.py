@@ -41,10 +41,22 @@ def _names(key):
     return tuple(e.name for e in d.resolve(key))
 
 
-def test_only_prefill_ever_matches():
-    # No decode/verify/other call may ever hit a fast kernel -> sink to stock FA.
-    for phase, hd in itertools.product((Phase.DECODE, Phase.VERIFY, Phase.OTHER), HEADS):
+def test_decode_other_never_match():
+    # DECODE (q=1, bandwidth-bound) + OTHER (encoder/cascade) never hit a fast kernel -> sink to FA.
+    for phase, hd in itertools.product((Phase.DECODE, Phase.OTHER), HEADS):
         assert _names(_key(phase, hd)) == (), (phase, hd)
+
+
+def test_verify_routes_to_xqa():
+    # MTP spec-verify hd in (64,128,256), plain decoder, non-quant KV -> xqa_verify; else sink.
+    for hd in (64, 128, 256):
+        assert _names(_key(Phase.VERIFY, hd)) == ("xqa_verify",), hd
+    assert _names(_key(Phase.VERIFY, 96)) == ()  # hd96 not an XQA head dim
+    assert _names(_key(Phase.VERIFY, 256, kv_quantized=True)) == ()
+    assert _names(_key(Phase.VERIFY, 256, plain_decoder=False)) == ()
+    # PREFILL/DECODE never get the verify leg.
+    assert "xqa_verify" not in _names(_key(Phase.PREFILL, 256))
+    assert "xqa_verify" not in _names(_key(Phase.DECODE, 256))
 
 
 def test_fp16pv_owns_hd256_prefill():
@@ -124,20 +136,36 @@ def test_pv_fp16_never_on_non_geforce():
 
 def test_master_gate_off_disables_every_leg():
     env = {"VLLM_FLASHAMPERE": "0", "VLLM_FLASHAMPERE_PV_FP16": "1",
-           "VLLM_FLASHAMPERE_BF16CVT": "1", "VLLM_FLASHAMPERE_SAGE": "1"}
+           "VLLM_FLASHAMPERE_BF16CVT": "1", "VLLM_FLASHAMPERE_XQA_VERIFY": "1",
+           "VLLM_FLASHAMPERE_SAGE": "1"}
     caps = cap_mod.detect(8, "NVIDIA GeForce RTX 3090", env, has_flashinfer=True,
                           has_sage=True, has_fp16pv_kernel=True)
-    for leg in ("fp16pv", "bf16cvt", "sage"):
+    for leg in ("fp16pv", "bf16cvt", "xqa_verify", "sage"):
         assert caps.enabled(leg) is False, leg
 
 
 def test_default_toggles_when_master_on():
-    env = {"VLLM_FLASHAMPERE": "1"}  # only master on -> fp16-PV legs default-on (GeForce), sage off
+    env = {"VLLM_FLASHAMPERE": "1"}  # only master on -> fp16-PV legs default-on (GeForce), rest off
     caps = cap_mod.detect(8, "NVIDIA GeForce RTX 3090", env, has_flashinfer=True,
                           has_sage=True, has_fp16pv_kernel=True)
     assert caps.enabled("fp16pv") is True  # fp16-PV default-on now (int8-QK removed); GeForce-gated
     assert caps.enabled("bf16cvt") is True  # bf16cvt default-on now; GeForce-gated
+    assert caps.enabled("xqa_verify") is False  # XQA verify opt-in (default off, unproven e2e)
     assert caps.enabled("sage") is False  # Sage defaults off (research)
+
+
+def test_xqa_verify_gating():
+    # XQA verify: opt-in, ANY Ampere (not GeForce-only — it's a separate decode kernel, not fp16-PV).
+    env = {"VLLM_FLASHAMPERE": "1", "VLLM_FLASHAMPERE_XQA_VERIFY": "1"}
+    for nm in ("NVIDIA GeForce RTX 3090", "NVIDIA A100-SXM4-80GB", "NVIDIA A40"):
+        caps = cap_mod.detect(8, nm, env, has_flashinfer=True, has_sage=True,
+                              has_fp16pv_kernel=True)
+        assert caps.enabled("xqa_verify") is True, nm  # all Ampere, unlike fp16-PV (GeForce-only)
+    # non-Ampere -> off; no flashinfer -> off.
+    assert cap_mod.detect(9, "NVIDIA H100", env, has_flashinfer=True, has_sage=True,
+                          has_fp16pv_kernel=True).enabled("xqa_verify") is False
+    assert cap_mod.detect(8, "NVIDIA GeForce RTX 3090", env, has_flashinfer=False, has_sage=True,
+                          has_fp16pv_kernel=True).enabled("xqa_verify") is False
 
 
 def test_bf16cvt_gating():

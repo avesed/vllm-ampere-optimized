@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     VLLM_FLASHAMPERE: bool = False
     VLLM_FLASHAMPERE_PV_FP16: bool = True
     VLLM_FLASHAMPERE_BF16CVT: bool = True
+    VLLM_FLASHAMPERE_XQA_VERIFY: bool = False
     VLLM_FLASHAMPERE_SAGE: bool = False
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
     MAX_JOBS: str | None = None
@@ -623,6 +624,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sageattention package -> default off.
     "VLLM_FLASHAMPERE_PV_FP16": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE_PV_FP16", "1"))),
     "VLLM_FLASHAMPERE_BF16CVT": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE_BF16CVT", "1"))),
+    # MTP spec-decode verify via famp's vendored XQA kernel (any Ampere; 1.8-4.3x faster than FA2
+    # fwd_kvcache verify). Opt-in (default off) until e2e MTP serve + cudagraph are validated.
+    "VLLM_FLASHAMPERE_XQA_VERIFY": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE_XQA_VERIFY", "0"))),
     "VLLM_FLASHAMPERE_SAGE": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE_SAGE", "0"))),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on

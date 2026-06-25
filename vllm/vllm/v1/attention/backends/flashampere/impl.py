@@ -102,18 +102,19 @@ class FlashAmpereImpl(FlashAttentionImpl):
                 output_scale, output_block_scale,
             )
 
-        # Hot-path early-out: only PREFILL is ever routed to a fast kernel (the table invariant
-        # asserted by test_only_prefill_ever_matches). Decode/verify/encoder/cascade skip key
-        # construction + resolve and sink straight to stock FA — keeps the decode path lean and
-        # routes MTP-verify to the base fwd_kvcache fix unchanged.
-        if self._classify(m) is not Phase.PREFILL:
+        # Hot-path early-out: DECODE (q=1, bandwidth-bound) + OTHER (encoder/cascade) have no fast
+        # row -> sink straight to stock FA (keeps the decode path lean). PREFILL (fp16-PV legs) and
+        # VERIFY (xqa_verify) go through resolve below; when their leg is disabled they sink too
+        # (VERIFY -> the base-FA fwd_kvcache verify fix).
+        phase = self._classify(m)
+        if phase is Phase.DECODE or phase is Phase.OTHER:
             return super().forward(
                 layer, query, key, value, kv_cache, m, output,
                 output_scale, output_block_scale,
             )
 
         key_t = DispatchKey(
-            phase=Phase.PREFILL,
+            phase=phase,
             head_dim=self.head_size,
             q_src=(
                 QSrc.HALF if query.dtype == torch.float16
@@ -153,5 +154,8 @@ class FlashAmpereImpl(FlashAttentionImpl):
             return kernels.fp16pv_prefill(
                 self, layer, query, key, value, kv_cache, m, output, leg=name
             )
+        if name == "xqa_verify":
+            from . import xqa_verify as _xqa_verify
+            return _xqa_verify.xqa_verify(self, layer, query, key, value, kv_cache, m, output)
         # "sage" lands here in a future phase; until implemented, decline -> sink.
         raise KernelDecline

@@ -23,6 +23,7 @@ from typing import NamedTuple
 # the Qwen3.x hd256 full-attn layers; SageAttn targets the smaller dense hd's. Extend to widen.
 FP16PV_HEADS: tuple[int, ...] = (256,)  # fp16-served (q dtype == fp16)
 BF16CVT_HEADS: tuple[int, ...] = (256,)  # bf16-served (runtime upcast to fp16)
+XQA_VERIFY_HEADS: tuple[int, ...] = (64, 128, 256)  # MTP spec-verify (XQA headElems 64/128/256)
 SAGE_HEADS: tuple[int, ...] = (64, 96, 128)
 
 
@@ -124,6 +125,21 @@ def build_default_table() -> None:
         ),
         KernelEntry("bf16cvt", capture_safe=False),
     )
+    # MTP spec-decode VERIFY (uniform q=1+K) -> famp's vendored XQA (decode-shaped, KV-split,
+    # warp-specialized; q-scaling ~flat so q=1+K is 1.8-4.3x faster than FA2 fwd_kvcache on Ampere,
+    # cos=1.0). Any-dtype (XQA handles fp16/bf16). capture_safe=True: the kernel + the slim
+    # module.xqa_wrapper launch are cudagraph-capturable (persistent buffers, copy_/zero_/launch only
+    # — verified capture+replay cos=1.0); this is REQUIRED for the e2e win (verify runs in the captured
+    # decode graph, so per-call Python overhead is eliminated). Declines to base-FA verify on shortfall.
+    register(
+        lambda k: (
+            k.phase is Phase.VERIFY
+            and k.head_dim in XQA_VERIFY_HEADS
+            and k.plain_decoder
+            and not k.kv_quantized
+        ),
+        KernelEntry("xqa_verify", capture_safe=True),
+    )
     # Small dense head dims -> SageAttn int8-QK prefill (research-grade; gated by HAS_SAGE
     # + toggle at enablement time, so the row is harmless when the package is absent).
     register(
@@ -135,10 +151,9 @@ def build_default_table() -> None:
         ),
         KernelEntry("sage", capture_safe=False),
     )
-    # DECODE / VERIFY / OTHER / quantized-KV / non-plain-decoder: no row -> () -> stock FA.
-    # VERIFY deliberately has no fast row: it is memory/occupancy-bound (tiny q, long KV),
-    # so the compute-side fp16-PV gives ~0 and would reintroduce the long-ctx occupancy
-    # cliff; stock FA already routes it to fwd_kvcache (FlashDecoding split-KV).
+    # DECODE / OTHER / quantized-KV / non-plain-decoder: no row -> () -> stock FA. (DECODE q=1 is
+    # bandwidth-bound; stock FA fwd_kvcache split-KV is its lever.) VERIFY now routes to xqa_verify
+    # above (opt-in, env-gated); when disabled it declines/sinks to the base-FA fwd_kvcache verify.
 
 
 build_default_table()
