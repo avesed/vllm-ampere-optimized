@@ -550,9 +550,10 @@ def run(args) -> int:  # pragma: no cover - drives a server
                                       f"(weight {wgb} GB/token exceeds measured TPOT — bad estimate)")
                 rb = hw.ridge(getattr(args, "weight_bits", 4) / 8.0)
                 if rb:
-                    report += (f"\n  throughput: max-num-seqs compute<->bandwidth ridge ~{rb:.0f} "
-                               f"(from THESE live clocks) — beyond it more max-num-seqs adds "
-                               f"prefill/latency, not aggregate decode.")
+                    report += (f"\n  throughput: max-num-seqs compute<->bandwidth ridge >~{rb:.0f} "
+                               f"(LOWER bound — from a generic int8 GEMM, NOT the faster W4A8 Marlin "
+                               f"serving kernel; the real ridge is higher). For the actual ceiling use "
+                               f"the batch-curve knee (--batch-curve) or prefill-derived compute.")
             else:
                 report += "\n\n(bw_verify unavailable — build instruments/bw_verify to fold actual bandwidth)"
         if tps:                                     # closed-loop delta: before->after vs the last run
