@@ -173,15 +173,66 @@ def read_clocks_mhz(cuda_visible: Optional[str] = None) -> Tuple[Optional[int], 
 
 
 def measure_hw_factors(bw_bin: str, *, compute_dtype: str = "int8", cuda_visible: Optional[str] = None,
-                       bw_size_gib: int = 8, bw_iters: int = 200, gemm_n: int = 4096,
-                       gemm_iters: int = 80) -> MeasuredHw:  # pragma: no cover - GPU
+                       image: Optional[str] = None, bw_size_gib: int = 8, bw_iters: int = 200,
+                       gemm_n: int = 4096, gemm_iters: int = 80) -> MeasuredHw:  # pragma: no cover - GPU
     """Measure BOTH factors LIVE at the current operating point + record the clocks they ran at.
-    Run on a WARM card (sustained thermal throttle lowers both further → treat as a slight
-    over-estimate, keep a margin). Re-measure if conditions change (OC applied, thermal state)."""
-    tflops = measure_tflops(dtype=compute_dtype, n=gemm_n, iters=gemm_iters)   # SM clock under compute
-    bw = measure_bw_gbs(bw_bin, size_gib=bw_size_gib, iters=bw_iters, cuda_visible=cuda_visible)  # mem clock under load
+    Compute: via the SERVING IMAGE's torch when ``image`` is given (the autotune venv has no torch),
+    else in-process. Run on a WARM card (sustained thermal throttle lowers both → slight over-
+    estimate, keep a margin). Re-measure if conditions change (OC applied, thermal state)."""
+    tflops = measure_tflops(dtype=compute_dtype, n=gemm_n, iters=gemm_iters)   # in-process if torch present
+    if tflops is None and image:                          # else borrow the serving image's torch
+        tflops = measure_tflops_via_image(image, cuda_visible=cuda_visible, dtype=compute_dtype,
+                                          n=gemm_n, iters=gemm_iters)
+    bw = measure_bw_gbs(bw_bin, size_gib=bw_size_gib, iters=bw_iters, cuda_visible=cuda_visible)
     sm, mem = read_clocks_mhz(cuda_visible)
     return MeasuredHw(bw_gbs=bw, tflops=tflops, sm_mhz=sm, mem_mhz=mem, compute_dtype=compute_dtype)
+
+
+# GEMM bench run INSIDE the vLLM serving image (it ships torch — the lightweight autotune venv
+# doesn't, by scope). Same idea as running bw_verify: reuse the image's torch+CUDA at the LIVE clock.
+_GEMM_BENCH = (
+    "import torch,json,time\n"
+    "n={n};it={it}\n"
+    "dt=torch.int8 if '{dt}'=='int8' else (torch.bfloat16 if '{dt}'=='bf16' else torch.float16)\n"
+    "if dt==torch.int8:\n"
+    " a=torch.randint(-8,8,(n,n),dtype=dt,device='cuda');b=torch.randint(-8,8,(n,n),dtype=dt,device='cuda')\n"
+    " op=lambda: torch._int_mm(a,b)\n"
+    "else:\n"
+    " a=torch.randn(n,n,dtype=dt,device='cuda');b=torch.randn(n,n,dtype=dt,device='cuda')\n"
+    " op=lambda: a@b\n"
+    "for _ in range(10): op()\n"
+    "torch.cuda.synchronize();t0=time.time()\n"
+    "for _ in range(it): op()\n"
+    "torch.cuda.synchronize();ms=(time.time()-t0)/it*1000\n"
+    "print(json.dumps({{'tflops':2*n**3/(ms/1000)/1e12}}))\n"
+)
+
+
+def _gemm_script(dtype: str, n: int, iters: int) -> str:
+    return _GEMM_BENCH.format(n=n, it=iters, dt=dtype)
+
+
+def measure_tflops_via_image(image: str, *, cuda_visible: Optional[str] = None, dtype: str = "int8",
+                             n: int = 4096, iters: int = 80, gpus: str = "all"
+                             ) -> Optional[float]:  # pragma: no cover - docker+GPU
+    """Achievable GEMM TFLOP/s by running the bench in the SERVING IMAGE's torch (no torch dep in
+    the autotune venv). Runs on the host GPU at its LIVE clock (mem-OC/throttle included)."""
+    import json
+    import subprocess
+    env = ["-e", f"CUDA_VISIBLE_DEVICES={cuda_visible}"] if cuda_visible else []
+    cmd = ["docker", "run", "--rm", "--gpus", gpus, *env, "--entrypoint", "python", image,
+           "-c", _gemm_script(dtype, n, iters)]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in reversed(p.stdout.strip().splitlines()):
+        if line.strip().startswith("{"):
+            try:
+                return float(json.loads(line)["tflops"])
+            except (ValueError, KeyError):
+                continue
+    return None
 
 
 def measure_bw_gbs(bw_bin: str, *, size_gib: int = 8, iters: int = 200,

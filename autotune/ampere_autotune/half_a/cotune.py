@@ -535,7 +535,7 @@ def run(args) -> int:  # pragma: no cover - drives a server
             import os as _os
             bw_bin = (_os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(__file__))),
                                     "instruments", "bw_verify", "bw_verify") if bwv == "@default" else bwv)
-            hw = hw_factors.measure_hw_factors(bw_bin)   # bw + compute LIVE, at the under-load clock
+            hw = hw_factors.measure_hw_factors(bw_bin, image=getattr(args, "image", None))   # bw + compute LIVE
             if hw.bw_gbs:
                 eff_gb = hw.bw_gbs / tps           # effective GB read per decoded token (model-free)
                 clk = (f" @ live clocks sm {hw.sm_mhz}/mem {hw.mem_mhz} MHz (under load, NOT spec)"

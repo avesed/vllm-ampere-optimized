@@ -86,3 +86,10 @@ def test_measured_hw_ridge_uses_live_values_not_spec():
 def test_measured_hw_ridge_none_without_measurement():
     assert MeasuredHw(bw_gbs=None, tflops=250.0, sm_mhz=None, mem_mhz=None).ridge(0.5) is None
     assert MeasuredHw(bw_gbs=838.0, tflops=None, sm_mhz=None, mem_mhz=None).ridge(0.5) is None
+
+
+def test_gemm_bench_script_is_valid_int8():
+    from ampere_autotune.half_a.hw_factors import _gemm_script
+    s = _gemm_script("int8", 4096, 80)
+    assert "torch._int_mm" in s and "4096" in s and "tflops" in s
+    compile(s, "<gemm>", "exec")   # the bench we ship into the serving image must be valid python
