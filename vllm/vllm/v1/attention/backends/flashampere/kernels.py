@@ -163,3 +163,193 @@ def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: 
         FIRE[leg] += 1
         _log_fired_once(leg, Lq, ctx, D)
     return output
+
+
+def _decode_hd512_eager(impl, layer, query, key, value, kv_cache, m, output):
+    """EAGER hd512 (Gemma4 full-attn) decode — per-request gather + FI prefill (q-pad-2). The
+    capturable path (decode_hd512 below) supersedes this; kept as the not-capturing fallback when
+    the paged BatchPrefill wrapper is unavailable. Casts the (small) gathered KV to fp16."""
+    if not _HAS_FI:
+        raise KernelDecline
+    key_cache, value_cache = kv_cache.unbind(1)
+    _reshape_and_cache_flash(
+        key, value, key_cache, value_cache,
+        m.slot_mapping, impl.kv_cache_dtype, layer._k_scale, layer._v_scale,
+    )
+    H, D = impl.num_heads, impl.head_size
+    sm = impl.scale
+    bs = key_cache.shape[1]
+    seq_lens = m.seq_lens.tolist()
+    for i in range(len(seq_lens)):
+        seq_len = int(seq_lens[i])
+        if seq_len <= 0:
+            continue
+        q_i = query[i].reshape(1, H, D).to(torch.float16)         # [1, H, D]
+        n_blocks = (seq_len + bs - 1) // bs
+        blk = m.block_table[i][:n_blocks]
+        k_i = _gather_one(key_cache, blk, n_blocks, seq_len).to(torch.float16)  # [seq_len, Hkv=1, D]
+        v_i = _gather_one(value_cache, blk, n_blocks, seq_len).to(torch.float16)
+        q2 = q_i.repeat(2, 1, 1)                                   # [2, H, D]
+        o = _fi_prefill(q2, k_i, v_i, causal=True, sm=sm, o_dtype=torch.float16, use_fp16_pv=True)
+        output[i] = o[1].reshape(output[i].shape).to(output.dtype)
+        FIRE["calls"] += 1
+    if seq_lens:
+        _log_fired_once("decode_hd512_eager", 1, int(seq_lens[0]) - 1, impl.head_size)
+    return output
+
+
+class _Hd512DecodeState:
+    """Persistent cudagraph state for hd512 (Gemma4 full-attn) DECODE via paged BatchPrefill.
+
+    hd512 has no FA decode kernel (head_size<=256) and every FI DECODE kernel (single/Batch decode)
+    rejects Gemma4's MQA group_size=16; only BatchPrefill (q_len>=2) runs it. To make that path
+    FULL-cudagraph-capturable we mirror vLLM's FI-backend pattern: ONE shared workspace + max-sized
+    metadata buffers, a per-batch-size BatchPrefill wrapper binding to buffer slices, PLANNED ONCE at
+    worst-case during the eager warmup (dummy_run), then per step the FI metadata (qo/kv indptr +
+    indices + last-page-len) is rebuilt with CAPTURABLE GPU ops from block_table/seq_lens and run() is
+    replayed inside the captured graph. Validated cos=1.0: plan-once-run-varying-seqlen + in-graph
+    metadata rebuild (new pages appearing) both survive capture/replay. bf16 native (no fp16-PV: the
+    wrapper path needs no register relaxation and decode is bandwidth-bound, so half-PV buys nothing).
+
+    q is replicated to length 2 per request (qo_indptr=[0,2,4,...]) and the LAST row of each pair is
+    the decode (causal -> sits at the true last position, attends all ctx incl. this step's K/V)."""
+
+    def __init__(self, impl, query, kv_cache, m):
+        dev = m.seq_lens.device
+        self.ps = kv_cache.shape[2]                       # paged block_size
+        self.mb = m.block_table.shape[1]                  # max blocks/req (== cdiv(max_model_len,ps))
+        self.max_bs = impl._fc_max_num_seqs               # captured at impl __init__ (config-context)
+        self.max_pages = self.max_bs * self.mb
+        self.Hq, self.Hkv, self.D = impl.num_heads, impl.num_kv_heads, impl.head_size
+        self.sm = impl.scale                              # Gemma uses a non-1/sqrt(D) attn scale
+        sw = getattr(impl, "sliding_window", None)        # FA stores (left,right); full-attn -> none
+        self.window = int(sw[0]) if isinstance(sw, (tuple, list)) and tuple(sw) != (-1, -1) else -1
+        self.qdtype, self.kvdtype = query.dtype, kv_cache.dtype
+        # Shared workspace + max-sized metadata buffers (per-bs wrappers bind to slices of these).
+        # Sized for the WORST-CASE plan (every req full max_model_len -> split-KV work buffer); the
+        # q-pad-2 BatchPrefill scheduler needs more than FI's 256MB default at 8k+ ctx.
+        self.ws = torch.empty(1024 * 1024 * 1024, dtype=torch.uint8, device=dev)
+        self.qo = torch.zeros(self.max_bs + 1, dtype=torch.int32, device=dev)
+        self.kvi = torch.zeros(self.max_bs + 1, dtype=torch.int32, device=dev)
+        self.kvidx = torch.zeros(self.max_pages, dtype=torch.int32, device=dev)
+        self.klp = torch.zeros(self.max_bs, dtype=torch.int32, device=dev)
+        self.qpad = torch.zeros(self.max_bs * 2, self.Hq, self.D, dtype=self.qdtype, device=dev)
+        # Constants for the capturable metadata rebuild (no host<->device traffic in the graph).
+        self.QO_CONST = torch.arange(0, 2 * (self.max_bs + 1), 2, dtype=torch.int32, device=dev)
+        self.COL = torch.arange(self.mb, device=dev).unsqueeze(0).expand(self.max_bs, -1).reshape(-1)
+        self.kvidx_ext = torch.zeros(self.max_pages + 1, dtype=torch.int32, device=dev)  # +1 trash slot
+        self.ZERO1 = torch.zeros(1, dtype=torch.int32, device=dev)
+        self.wrappers: dict[int, object] = {}
+        # The N hd512 full-attn layers share one block_table/seq_lens -> identical FI metadata. Rebuild
+        # it ONCE per step (the first hd512 layer) and let the rest reuse the buffers. id() match is a
+        # capture-time Python branch, so only the first layer's rebuild ops land in the captured graph.
+        self._first_layer_id: int | None = None
+
+    def _build_meta(self, block_table, seq_lens, B):
+        """CAPTURABLE: block_table[:B]+seq_lens[:B] -> kvi/kvidx/klp buffers (no .item()/.tolist()).
+        qo is constant ([0,2,..,2B], set once at plan time) so it is not rebuilt here."""
+        npg = (seq_lens + self.ps - 1) // self.ps                                   # [B]
+        self.kvi[: B + 1].copy_(torch.cat([self.ZERO1, torch.cumsum(npg, 0).to(torch.int32)]))
+        self.klp[:B].copy_(seq_lens - (npg - 1) * self.ps)
+        flat = block_table.reshape(-1)                                              # [B*mb] physical ids
+        col = self.COL[: B * self.mb]
+        valid = col < npg.unsqueeze(1).expand(-1, self.mb).reshape(-1)             # [B*mb] in-range pages
+        out_pos = torch.cumsum(valid.to(torch.int64), 0) - 1                        # compact dest index
+        dest = torch.where(valid, out_pos, torch.full_like(out_pos, self.max_pages))  # invalid -> trash
+        self.kvidx_ext.zero_()
+        self.kvidx_ext.scatter_(0, dest, flat)
+        self.kvidx.copy_(self.kvidx_ext[: self.max_pages])
+
+    def _ensure_wrapper(self, B):
+        """Lazily build+plan a per-bs wrapper at WORST case (every req full mb pages). Eager-only
+        (called when not capturing); plan sizes the work buffer for the largest seq_len the captured
+        graph can later replay, so subsequent smaller-seq runs stay within it."""
+        w = self.wrappers.get(B)
+        if w is not None:
+            return w
+        w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            self.ws, "NHD", use_cuda_graph=True,
+            qo_indptr_buf=self.qo[: B + 1],
+            paged_kv_indptr_buf=self.kvi[: B + 1],
+            paged_kv_indices_buf=self.kvidx,
+            paged_kv_last_page_len_buf=self.klp[:B],
+        )
+        dev = self.qo.device
+        self.qo[: B + 1].copy_(self.QO_CONST[: B + 1])
+        self.kvi[: B + 1].copy_(torch.arange(0, (B + 1) * self.mb, self.mb, dtype=torch.int32, device=dev))
+        self.kvidx[: B * self.mb].copy_(torch.arange(B * self.mb, dtype=torch.int32, device=dev))
+        self.klp[:B].fill_(self.ps)
+        w.plan(
+            self.qo[: B + 1], self.kvi[: B + 1], self.kvidx, self.klp[:B],
+            self.Hq, self.Hkv, self.D, self.ps, causal=False, sm_scale=self.sm,
+            window_left=self.window, q_data_type=self.qdtype, kv_data_type=self.kvdtype,
+        )
+        self.wrappers[B] = w
+        return w
+
+    def run(self, impl, layer, query, key, value, kv_cache, m, output):
+        key_cache, value_cache = kv_cache.unbind(1)
+        _reshape_and_cache_flash(
+            key, value, key_cache, value_cache,
+            m.slot_mapping, impl.kv_cache_dtype, layer._k_scale, layer._v_scale,
+        )
+        B = m.seq_lens.shape[0]
+        capturing = torch.cuda.is_current_stream_capturing()
+        w = self.wrappers.get(B)
+        if w is None:
+            if capturing:
+                # Not warmed for this size (dummy_run should have covered every capture size) -> the
+                # caller sinks to FA, which rejects hd512. Surface loudly rather than corrupt silently.
+                raise KernelDecline
+            w = self._ensure_wrapper(B)
+        if self._first_layer_id is None:
+            self._first_layer_id = id(layer)
+        # Rebuild the shared FI metadata only on the first hd512 layer of the step (the others reuse it).
+        if id(layer) == self._first_layer_id:
+            self._build_meta(m.block_table[:B], m.seq_lens, B)
+        q = query.reshape(B, self.Hq, self.D)
+        qp = self.qpad[: 2 * B].view(B, 2, self.Hq, self.D)
+        qp[:, 0].copy_(q)
+        qp[:, 1].copy_(q)
+        o = w.run(self.qpad[: 2 * B], kv_cache)                # [2B, Hq, D]
+        # Take the FIRST row of each q-pad pair (o[0::2]). The pad is q_len=2 only because the FI
+        # paged kernel rejects q_len=1 (max_mma_kv=0); attention is non-causal (causal=False) since a
+        # decode query attends ALL ctx incl. its own just-cached K/V, so BOTH rows would equal the
+        # decode under an actual-sized plan. But the cudagraph plan is sized at WORST case (full
+        # max_model_len) and FI's bottom-right alignment then masks the SECOND row to zero at small
+        # actual ctx; row 0 (validated cos=1.0) is unaffected by the worst-case plan -> use it.
+        output.copy_(o[0::2].reshape(output.shape).to(output.dtype))
+        FIRE["calls"] += 1
+        return output
+
+
+_STATES: dict[int, _Hd512DecodeState] = {}   # keyed by head_size (hd256 sliding + hd512 full)
+
+
+def decode_hd512(impl, layer, query, key, value, kv_cache, m, output):
+    """hd512 (Gemma4 full-attn) DECODE — FULL-cudagraph-capturable paged BatchPrefill (q-pad-2),
+    superseding the eager per-request gather. A process-global _Hd512DecodeState holds the shared
+    cudagraph buffers + per-bs wrappers (planned at worst-case during warmup); each step rebuilds the
+    FI metadata capturably and replays run() in the captured decode graph. Not-capturing calls plan
+    on demand (so eager serving works too); a capturing call for an un-warmed batch size declines to
+    the eager fallback. See _Hd512DecodeState for the validated capture/replay correctness."""
+    if not _HAS_FI:
+        raise KernelDecline
+    hs = impl.head_size
+    try:
+        st = _STATES.get(hs)
+        if (
+            st is None
+            and getattr(impl, "_fc_max_num_seqs", None)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            st = _STATES[hs] = _Hd512DecodeState(impl, query, kv_cache, m)
+        if st is not None:
+            out = st.run(impl, layer, query, key, value, kv_cache, m, output)
+            _log_fired_once("decode_hd512", 1, 0, impl.head_size)
+            return out
+    except KernelDecline:
+        if torch.cuda.is_current_stream_capturing():
+            raise
+    # Not-capturing fallback (state un-init or wrapper build failed): eager gather path.
+    return _decode_hd512_eager(impl, layer, query, key, value, kv_cache, m, output)

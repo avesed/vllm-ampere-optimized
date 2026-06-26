@@ -85,12 +85,19 @@ class Gemma4Config(VerifyAndUpdateConfig):
         # the config carries global_head_dim but all layers can still use
         # the same FA backend.
         max_head_dim = max(head_dim or 0, global_head_dim or 0)
+        # famp: when VLLM_FLASHAMPERE=1, the FlashAmpere CUSTOM backend handles head_dim>256 itself
+        # (fp16-PV-hd512 prefill via the vendored-FI IsInvalid relaxation), uniformly across the
+        # sliding(256) and full(512) layers -> NO mixed-backend divergence, so skip the TRITON force
+        # and let the cuda.py priority-walk pick CUSTOM (priority 0 on Ampere).
+        import os as _os
+        _famp_on = _os.environ.get("VLLM_FLASHAMPERE", "0") in ("1", "true", "True")
         if (
             head_dim is not None
             and global_head_dim is not None
             and head_dim != global_head_dim
             and max_head_dim > 256
             and vllm_config.attention_config.backend is None
+            and not _famp_on
         ):
             from vllm.v1.attention.backends.registry import (
                 AttentionBackendEnum,

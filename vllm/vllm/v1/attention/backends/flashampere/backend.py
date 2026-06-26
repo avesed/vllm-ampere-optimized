@@ -42,6 +42,27 @@ class FlashAmpereBackend(FlashAttentionBackend):
         # gets "compute capability not supported" -> selector falls back to FLASH_ATTN.
         return capability.major == 8
 
+    @classmethod
+    def supports_head_size(cls, head_size: int) -> bool:
+        # FA's ceiling is 256 (flash_attn supports_head_size: >256 needs FA4, not on Ampere). famp
+        # extends to 512 for the PREFILL fp16-PV leg: the vendored-FI prefill IsInvalid register
+        # heuristic (8*NUM_MMA_D_VO>=256) is relaxed and fp16-PV halves the O accumulator to fit
+        # 256 regs -> hd512 prefill runs on Ampere (validated cos=1.0). Unlocks Gemma4's hd512
+        # full-attn layers. (Decode at hd512 still sinks to FA, which rejects it -> hd512 layers are
+        # prefill-only through famp for now; covered for prefill-bench / enforce-eager.)
+        if head_size % 8 != 0:
+            return False
+        return head_size <= 512
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        # VL models (Gemma4 unified) declare a multimodal-prefix capability; FA's default is False,
+        # which would filter CUSTOM out of the per-layer backend selection for every VL model. famp's
+        # prefill leg handles the TEXT path correctly (causal m.causal); the mm-prefix image-token
+        # bidirectional mask is carried in the attention metadata. Declare support so CUSTOM is
+        # selectable for Gemma4's hd512 full-attn layers (text-serving / prefill-bench).
+        return True
+
 
 def register_flashampere() -> None:
     """vllm.general_plugins entry-point: install FlashAmpere into Backend.CUSTOM in every process.

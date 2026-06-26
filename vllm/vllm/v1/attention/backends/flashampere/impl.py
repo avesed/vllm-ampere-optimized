@@ -63,6 +63,14 @@ class FlashAmpereImpl(FlashAttentionImpl):
         )
         self._caps = _caps()
         self._verify_ub = _verify_upper_bound()
+        # Captured at construction (the vllm config context is live here, NOT during forward):
+        # max batch size for the hd512-decode cudagraph buffer sizing (kernels._Hd512DecodeState).
+        try:
+            from vllm.config import get_current_vllm_config
+
+            self._fc_max_num_seqs = get_current_vllm_config().scheduler_config.max_num_seqs
+        except Exception:
+            self._fc_max_num_seqs = None
 
     def _classify(self, m) -> Phase:
         """Per-call phase from CPU-only metadata scalars (capture-safe: no .item()/.tolist())."""
@@ -107,7 +115,22 @@ class FlashAmpereImpl(FlashAttentionImpl):
         # VERIFY (xqa_verify) go through resolve below; when their leg is disabled they sink too
         # (VERIFY -> the base-FA fwd_kvcache verify fix).
         phase = self._classify(m)
-        if phase is Phase.DECODE or phase is Phase.OTHER:
+        if phase is Phase.DECODE:
+            # hd512 (Gemma4 full-attn) decode: FA's head_size<=256 ceiling rejects it, so route to
+            # famp's FULL-cudagraph-capturable paged BatchPrefill (q-pad-2, cos=1.0 @ hd512 group16).
+            # Capture-safe: the metadata is rebuilt with capturable GPU ops and run() replays in the
+            # captured graph (warmup plans per batch size). hd<=256 decode is bandwidth-bound -> stock
+            # FA fwd_kvcache split-KV stays its lever.
+            if self.head_size > 256:
+                try:
+                    return kernels.decode_hd512(self, layer, query, key, value, kv_cache, m, output)
+                except KernelDecline:
+                    pass
+            return super().forward(
+                layer, query, key, value, kv_cache, m, output,
+                output_scale, output_block_scale,
+            )
+        if phase is Phase.OTHER:
             return super().forward(
                 layer, query, key, value, kv_cache, m, output,
                 output_scale, output_block_scale,
