@@ -59,9 +59,12 @@ def build_restart_cmd(args) -> Optional[str]:
     else:
         mount = ""
         model_arg = model
+    # force `vllm serve <model>` via --entrypoint: the ampere fork image is ENTRYPOINT=[vllm]
+    # (needs the `serve` subcommand), and both it and vllm/vllm-openai ship the `vllm` CLI, so this
+    # is robust to either image's default entrypoint.
     return (f"docker rm -f {_LAUNCH_NAME} >/dev/null 2>&1; "
             f"docker run -d --name {_LAUNCH_NAME} --gpus {gpus} --shm-size=8g {mount}"
-            f"-p {port}:8000 {image} --model {model_arg} {serve} {{flags}}")
+            f"-p {port}:8000 --entrypoint vllm {image} serve {model_arg} {serve} {{flags}}")
 
 # values meaning "use the server default / disabled toggle" -> omit the flag entirely
 _DEFAULTY = {"auto", "default", "", "-", "false", "off", "no", "0"}

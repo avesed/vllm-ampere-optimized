@@ -19,7 +19,8 @@ def test_build_restart_cmd_docker_from_abs_model():
                               image="img:tag", gpus="all", port=8000, tp=2, serve_extra=None)
     cmd = build_restart_cmd(a)
     assert "docker run -d" in cmd and "{flags}" in cmd and "img:tag" in cmd
-    assert "-v /models:/models:ro" in cmd and "--model /models/Qwen" in cmd   # abs -> parent-mount
+    assert "-v /models:/models:ro" in cmd and "--entrypoint vllm" in cmd        # abs -> parent-mount
+    assert "serve /models/Qwen" in cmd                                          # `vllm serve <model>`
     assert "--tensor-parallel-size 2" in cmd
 
 
