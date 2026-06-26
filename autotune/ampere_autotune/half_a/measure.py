@@ -191,6 +191,55 @@ def spec_accept_len(endpoint: str) -> Optional[float]:  # pragma: no cover - nee
     return (1.0 + acc / drafts) if drafts > 0 else None
 
 
+def _prefill_point(endpoint: str, mid: str, repeats: int,
+                   temperature=None) -> Optional[Tuple[int, float]]:  # pragma: no cover - needs a server
+    """POST a long prompt at max_tokens=1; return (server's actual prompt_tokens, wall_s)."""
+    import time
+    import requests
+    prompt = "The quick brown fox jumps over the lazy dog. " * repeats
+    body = {"model": mid, "prompt": prompt, "max_tokens": 1, "ignore_eos": True}
+    if temperature is not None:
+        body["temperature"] = temperature
+    t0 = time.time()
+    try:
+        r = requests.post(endpoint.rstrip("/") + "/v1/completions", timeout=300, json=body)
+        r.raise_for_status()
+    except Exception:
+        return None
+    wall = time.time() - t0
+    ptoks = int(r.json().get("usage", {}).get("prompt_tokens", 0))
+    return (ptoks, wall) if ptoks > 0 else None
+
+
+def prefill_toks(endpoint: str, repeats=(80, 300), reps: int = 2,
+                 temperature=None) -> Optional[float]:  # pragma: no cover - needs a server
+    """Compute-bound prefill tok/s = 1 / slope of wall-vs-prompt_tokens across 2 prompt lengths (the
+    slope removes the fixed TTFT overhead + the single decode step). This runs the REAL serving
+    (Marlin) GEMM, so it's the right compute number for the max-num-seqs ridge — not a synthetic
+    GEMM. Default prompt lengths ~800 and ~3000 tokens (fit a 4096 max-model-len)."""
+    try:
+        mid, _ = model_info(endpoint)
+    except Exception:
+        return None
+    _prefill_point(endpoint, mid, repeats[0], temperature)        # warm-up (first prefill is cold)
+    pts = []
+    for w in repeats:
+        best = None
+        for _ in range(reps):
+            pt = _prefill_point(endpoint, mid, w, temperature)
+            if pt and (best is None or pt[1] < best[1]):          # min wall = least-noisy
+                best = pt
+        if best:
+            pts.append(best)
+    if len(pts) < 2:
+        return None
+    (n1, t1), (n2, t2) = pts[0], pts[-1]
+    if n2 <= n1 or t2 <= t1:
+        return None
+    per_tok = (t2 - t1) / (n2 - n1)
+    return (1.0 / per_tok) if per_tok > 0 else None
+
+
 def _prefix_hit(d: Dict[str, List[float]]) -> Optional[float]:
     q = _sum(d, "vllm:prefix_cache_queries_total") or _sum(d, "vllm:gpu_prefix_cache_queries_total")
     h = _sum(d, "vllm:prefix_cache_hits_total") or _sum(d, "vllm:gpu_prefix_cache_hits_total")

@@ -95,6 +95,9 @@ def build_parser() -> argparse.ArgumentParser:
     ct.add_argument("--weight-bits", type=int, default=4,
                     help="(--bw-verify) weight storage bits/param (4 int4 / 8 int8 / 16 fp16) for the "
                          "max-num-seqs compute<->bandwidth ridge")
+    ct.add_argument("--params-b", type=float, default=None,
+                    help="(--bw-verify) model params in billions -> ACCURATE max-num-seqs ridge from "
+                         "MEASURED prefill (the real serving kernel), not a synthetic GEMM")
     ct.add_argument("--output", "-o", default=None,
                     help="save the result here (file or dir); default ~/.local/state/ampere-autotune/results/ "
                          "(in docker, mount a volume + point here — the default is ephemeral). Always also printed.")

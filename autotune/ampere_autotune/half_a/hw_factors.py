@@ -99,6 +99,19 @@ def max_num_seqs_from_ridge(ridge: float, capacity_wall: int) -> Tuple[int, str]
     return rec, bound
 
 
+def ridge_from_prefill(prefill_toks: float, bw_gbs: float, params_b: float,
+                       bytes_per_param: float) -> Optional[float]:
+    """ACCURATE max-num-seqs ridge from the REAL serving kernel. Prefill is compute-bound and runs
+    the SAME Marlin GEMM as batched decode, so the per-token compute time ≈ 1/prefill_toks (measured,
+    not a synthetic GEMM). Ridge = weight-read time (params*bytes/bw) * prefill_toks = the batch where
+    the amortized weight read equals the compute. VALIDATED: ~15.4k tok/s prefill, 838 GB/s, 9B int4
+    -> ~83 ≈ the empirical max-num-seqs<=82 (the synthetic torch._int_mm gave a too-low 18.6)."""
+    if prefill_toks <= 0 or bw_gbs <= 0 or params_b <= 0:
+        return None
+    weight_read_s = (params_b * 1e9 * bytes_per_param) / (bw_gbs * 1e9)
+    return weight_read_s * prefill_toks
+
+
 def prefill_ceiling_toks(tflops: float, params_b: float) -> float:
     """Compute-bound prefill ceiling (tok/s) = FLOPs / (2 * params). Bounds the empirical fit and
     sizes chunked-prefill / max-num-batched-tokens (prefill is the compute-bound phase)."""

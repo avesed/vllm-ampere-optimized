@@ -3,7 +3,7 @@ import pytest
 
 from ampere_autotune.half_a.hw_factors import (
     fit_decode_two_points, decode_from_one_point, memoc_decode_gain_pct, DecodeModel,
-    ridge_batch, prefill_ceiling_toks, max_num_seqs_from_ridge, MeasuredHw,
+    ridge_batch, prefill_ceiling_toks, max_num_seqs_from_ridge, MeasuredHw, ridge_from_prefill,
 )
 
 # the real measurement this session: single-stream 9B-w4a8, offset 0 (838 GB/s) vs +1000 (888).
@@ -86,6 +86,13 @@ def test_measured_hw_ridge_uses_live_values_not_spec():
 def test_measured_hw_ridge_none_without_measurement():
     assert MeasuredHw(bw_gbs=None, tflops=250.0, sm_mhz=None, mem_mhz=None).ridge(0.5) is None
     assert MeasuredHw(bw_gbs=838.0, tflops=None, sm_mhz=None, mem_mhz=None).ridge(0.5) is None
+
+
+def test_ridge_from_prefill_matches_empirical_82():
+    # the ACCURATE path: real Marlin prefill (~15.4k tok/s) instead of the synthetic GEMM ->
+    # ridge ~83 ≈ empirical max-num-seqs<=82 (the torch._int_mm 62 TOPS gave a wrong-low 18.6).
+    assert ridge_from_prefill(15400.0, 838.0, 9.0, 0.5) == pytest.approx(83.0, abs=6.0)
+    assert ridge_from_prefill(0, 838.0, 9.0, 0.5) is None         # no prefill -> None
 
 
 def test_gemm_bench_script_is_valid_int8():

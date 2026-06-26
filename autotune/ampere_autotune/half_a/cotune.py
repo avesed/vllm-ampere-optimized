@@ -548,12 +548,21 @@ def run(args) -> int:  # pragma: no cover - drives a server
                     m = hw_factors.decode_from_one_point(tps, hw.bw_gbs, wgb * 1e9)
                     report += "\n" + (hw_factors.render(m, hw.bw_gbs) if m else
                                       f"(weight {wgb} GB/token exceeds measured TPOT — bad estimate)")
-                rb = hw.ridge(getattr(args, "weight_bits", 4) / 8.0)
-                if rb:
-                    report += (f"\n  throughput: max-num-seqs compute<->bandwidth ridge >~{rb:.0f} "
-                               f"(LOWER bound — from a generic int8 GEMM, NOT the faster W4A8 Marlin "
-                               f"serving kernel; the real ridge is higher). For the actual ceiling use "
-                               f"the batch-curve knee (--batch-curve) or prefill-derived compute.")
+                bpp = getattr(args, "weight_bits", 4) / 8.0
+                pb = getattr(args, "params_b", None)
+                pf = measure.prefill_toks(endpoint, temperature=temp) if pb else None
+                rr = hw_factors.ridge_from_prefill(pf, hw.bw_gbs, pb, bpp) if (pf and pb) else None
+                if rr:                              # ACCURATE: measured prefill = the real Marlin kernel
+                    report += (f"\n  throughput: max-num-seqs ridge ~{rr:.0f} (from MEASURED prefill "
+                               f"{pf:.0f} tok/s, the real serving kernel) — set max-num-seqs ~min({rr:.0f}, "
+                               f"KV-capacity wall); beyond it more concurrency adds prefill/latency, not "
+                               f"aggregate decode.")
+                else:
+                    rb = hw.ridge(bpp)
+                    if rb:
+                        report += (f"\n  throughput: max-num-seqs ridge >~{rb:.0f} (LOWER bound — generic "
+                                   f"int8 GEMM, not the faster W4A8 Marlin kernel). Pass --params-b for the "
+                                   f"accurate prefill-derived ridge, or use the --batch-curve knee.")
             else:
                 report += "\n\n(bw_verify unavailable — build instruments/bw_verify to fold actual bandwidth)"
         if tps:                                     # closed-loop delta: before->after vs the last run
