@@ -213,14 +213,21 @@ def _gemm_script(dtype: str, n: int, iters: int) -> str:
 
 
 def measure_tflops_via_image(image: str, *, cuda_visible: Optional[str] = None, dtype: str = "int8",
-                             n: int = 4096, iters: int = 80, gpus: str = "all"
-                             ) -> Optional[float]:  # pragma: no cover - docker+GPU
+                             n: int = 8192, iters: int = 80) -> Optional[float]:  # pragma: no cover - docker+GPU
     """Achievable GEMM TFLOP/s by running the bench in the SERVING IMAGE's torch (no torch dep in
-    the autotune venv). Runs on the host GPU at its LIVE clock (mem-OC/throttle included)."""
+    the autotune venv). Runs on the host GPU at its LIVE clock (mem-OC/throttle included).
+
+    CAVEAT: this is torch._int_mm — a generic int8 GEMM, NOT the W4A8 Marlin kernel vLLM serves
+    with, so it UNDER-estimates the real serving compute (measured 62 TOPS vs ~142 dense peak) and
+    yields a conservative (low) ridge. For an accurate ridge use the SERVER's measured prefill
+    throughput (compute-bound, the real kernel) — see TODO. Treat this as a lower bound / sanity.
+    """
     import json
     import subprocess
-    env = ["-e", f"CUDA_VISIBLE_DEVICES={cuda_visible}"] if cuda_visible else []
-    cmd = ["docker", "run", "--rm", "--gpus", gpus, *env, "--entrypoint", "python", image,
+    # the host docker is wired for --runtime=nvidia + NVIDIA_VISIBLE_DEVICES (not --gpus); the
+    # image's interpreter is python3 (no `python`). Match the proven serving-container pattern.
+    sel = ["-e", f"NVIDIA_VISIBLE_DEVICES={cuda_visible}"] if cuda_visible else []
+    cmd = ["docker", "run", "--rm", "--runtime=nvidia", *sel, "--entrypoint", "python3", image,
            "-c", _gemm_script(dtype, n, iters)]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
