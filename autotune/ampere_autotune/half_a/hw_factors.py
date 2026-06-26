@@ -138,6 +138,52 @@ def measure_tflops(dtype: str = "fp16", n: int = 4096, iters: int = 50) -> Optio
     return (2.0 * n ** 3) / (ms / 1000.0) / 1e12  # 2*n^3 FLOPs per matmul -> TFLOP/s
 
 
+@dataclass
+class MeasuredHw:
+    """Hardware factors MEASURED at the actual operating point (NOT spec). bw + compute are read
+    LIVE because the clock is load-dependent: CUDA runs in P2 (mem downclocked ~2.6%), then thermal
+    throttle / power cap / a mem-OC offset all move it further. sm_mhz/mem_mhz are the clocks the
+    bench actually ran at — proof these are the under-load values, not the catalog peak."""
+    bw_gbs: Optional[float]
+    tflops: Optional[float]
+    sm_mhz: Optional[int]
+    mem_mhz: Optional[int]
+    compute_dtype: str = "int8"
+
+    def ridge(self, bytes_per_param: float) -> Optional[float]:
+        if not self.bw_gbs or not self.tflops:
+            return None
+        return ridge_batch(self.tflops * 1e12, self.bw_gbs, bytes_per_param)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def read_clocks_mhz(cuda_visible: Optional[str] = None) -> Tuple[Optional[int], Optional[int]]:  # pragma: no cover - GPU
+    """The CURRENT sm/mem clocks via nvidia-smi (the under-load operating point, not spec)."""
+    import subprocess
+    sel = ["-i", cuda_visible] if cuda_visible else []
+    try:
+        out = subprocess.run(["nvidia-smi", *sel, "--query-gpu=clocks.sm,clocks.mem",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=20)
+        sm, mem = out.stdout.strip().splitlines()[0].split(",")
+        return int(sm), int(mem)
+    except Exception:
+        return None, None
+
+
+def measure_hw_factors(bw_bin: str, *, compute_dtype: str = "int8", cuda_visible: Optional[str] = None,
+                       bw_size_gib: int = 8, bw_iters: int = 200, gemm_n: int = 4096,
+                       gemm_iters: int = 80) -> MeasuredHw:  # pragma: no cover - GPU
+    """Measure BOTH factors LIVE at the current operating point + record the clocks they ran at.
+    Run on a WARM card (sustained thermal throttle lowers both further → treat as a slight
+    over-estimate, keep a margin). Re-measure if conditions change (OC applied, thermal state)."""
+    tflops = measure_tflops(dtype=compute_dtype, n=gemm_n, iters=gemm_iters)   # SM clock under compute
+    bw = measure_bw_gbs(bw_bin, size_gib=bw_size_gib, iters=bw_iters, cuda_visible=cuda_visible)  # mem clock under load
+    sm, mem = read_clocks_mhz(cuda_visible)
+    return MeasuredHw(bw_gbs=bw, tflops=tflops, sm_mhz=sm, mem_mhz=mem, compute_dtype=compute_dtype)
+
+
 def measure_bw_gbs(bw_bin: str, *, size_gib: int = 8, iters: int = 200,
                    cuda_visible: Optional[str] = None) -> Optional[float]:  # pragma: no cover - GPU
     """Run the bw_verify CUDA kernel (NO privilege) -> achievable read GB/s, or None on failure."""

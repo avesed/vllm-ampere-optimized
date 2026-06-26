@@ -3,7 +3,7 @@ import pytest
 
 from ampere_autotune.half_a.hw_factors import (
     fit_decode_two_points, decode_from_one_point, memoc_decode_gain_pct, DecodeModel,
-    ridge_batch, prefill_ceiling_toks, max_num_seqs_from_ridge,
+    ridge_batch, prefill_ceiling_toks, max_num_seqs_from_ridge, MeasuredHw,
 )
 
 # the real measurement this session: single-stream 9B-w4a8, offset 0 (838 GB/s) vs +1000 (888).
@@ -74,3 +74,15 @@ def test_max_num_seqs_picks_min_of_ridge_and_capacity():
 
 def test_prefill_ceiling_positive():
     assert prefill_ceiling_toks(284e12, 9.0) > 1000   # 9B prefill compute ceiling (tok/s)
+
+
+def test_measured_hw_ridge_uses_live_values_not_spec():
+    # the ridge comes from LIVE-measured bw + compute at the under-load clock (P2 9501, not spec 9751)
+    hw = MeasuredHw(bw_gbs=838.0, tflops=250.0, sm_mhz=1950, mem_mhz=9501, compute_dtype="int8")
+    assert hw.ridge(0.5) == pytest.approx(ridge_batch(250e12, 838.0, 0.5))
+    assert hw.mem_mhz == 9501            # proof it's the under-load clock, not the 9751 spec
+
+
+def test_measured_hw_ridge_none_without_measurement():
+    assert MeasuredHw(bw_gbs=None, tflops=250.0, sm_mhz=None, mem_mhz=None).ridge(0.5) is None
+    assert MeasuredHw(bw_gbs=838.0, tflops=None, sm_mhz=None, mem_mhz=None).ridge(0.5) is None
