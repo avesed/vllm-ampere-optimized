@@ -191,12 +191,18 @@ def spec_accept_len(endpoint: str) -> Optional[float]:  # pragma: no cover - nee
     return (1.0 + acc / drafts) if drafts > 0 else None
 
 
-def _prefill_point(endpoint: str, mid: str, repeats: int,
+_PREFILL_WORDS = ("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi "
+                  "omicron pi rho sigma tau upsilon phi chi psi omega ")
+
+
+def _prefill_point(endpoint: str, mid: str, repeats: int, nonce: int,
                    temperature=None) -> Optional[Tuple[int, float]]:  # pragma: no cover - needs a server
-    """POST a long prompt at max_tokens=1; return (server's actual prompt_tokens, wall_s)."""
+    """POST a long prompt at max_tokens=1; return (server's actual prompt_tokens, wall_s). A unique
+    leading nonce per call makes the FIRST token block differ -> defeats prefix caching (else the
+    longer prompt's shared prefix is served free and the prefill rate is wildly over-estimated)."""
     import time
     import requests
-    prompt = "The quick brown fox jumps over the lazy dog. " * repeats
+    prompt = f"req{nonce}uniq{nonce}zx " + (_PREFILL_WORDS * repeats)
     body = {"model": mid, "prompt": prompt, "max_tokens": 1, "ignore_eos": True}
     if temperature is not None:
         body["temperature"] = temperature
@@ -211,22 +217,24 @@ def _prefill_point(endpoint: str, mid: str, repeats: int,
     return (ptoks, wall) if ptoks > 0 else None
 
 
-def prefill_toks(endpoint: str, repeats=(80, 300), reps: int = 2,
+def prefill_toks(endpoint: str, repeats=(35, 130), reps: int = 2,
                  temperature=None) -> Optional[float]:  # pragma: no cover - needs a server
     """Compute-bound prefill tok/s = 1 / slope of wall-vs-prompt_tokens across 2 prompt lengths (the
-    slope removes the fixed TTFT overhead + the single decode step). This runs the REAL serving
-    (Marlin) GEMM, so it's the right compute number for the max-num-seqs ridge — not a synthetic
-    GEMM. Default prompt lengths ~800 and ~3000 tokens (fit a 4096 max-model-len)."""
+    slope removes fixed TTFT overhead + the single decode step). Runs the REAL serving (Marlin) GEMM
+    -> the right compute number for the max-num-seqs ridge, not a synthetic GEMM. EVERY request gets
+    a unique nonce so prefix caching can't contaminate it. ~25 tokens/repeat -> ~900 / ~3300 tokens
+    (fit a 4096 max-model-len)."""
     try:
         mid, _ = model_info(endpoint)
     except Exception:
         return None
-    _prefill_point(endpoint, mid, repeats[0], temperature)        # warm-up (first prefill is cold)
+    nonce = 0
+    _prefill_point(endpoint, mid, repeats[0], nonce, temperature); nonce += 1   # warm-up
     pts = []
     for w in repeats:
         best = None
         for _ in range(reps):
-            pt = _prefill_point(endpoint, mid, w, temperature)
+            pt = _prefill_point(endpoint, mid, w, nonce, temperature); nonce += 1
             if pt and (best is None or pt[1] < best[1]):          # min wall = least-noisy
                 best = pt
         if best:
