@@ -3,6 +3,7 @@ import pytest
 
 from ampere_autotune.half_a.hw_factors import (
     fit_decode_two_points, decode_from_one_point, memoc_decode_gain_pct, DecodeModel,
+    ridge_batch, prefill_ceiling_toks, max_num_seqs_from_ridge,
 )
 
 # the real measurement this session: single-stream 9B-w4a8, offset 0 (838 GB/s) vs +1000 (888).
@@ -49,3 +50,27 @@ def test_compute_bound_model_shows_tiny_memoc_gain():
     m = DecodeModel(bw_coef=0.5, fixed_t=0.01)
     assert m.bw_bound_frac(838.0) < 0.1
     assert memoc_decode_gain_pct(m, 838.0, 950.0) < 1.0
+
+
+# ---- actual COMPUTE -> max-num-seqs (the throughput-side factor) ------------------------------
+
+def test_ridge_batch_predicts_the_max_num_seqs_ceiling():
+    # 3090 ~284 INT8 TOPS, 838 GB/s achievable, int4 weights (0.5 B/param) -> ridge ~85,
+    # matching the project's empirical max-num-seqs<=82.
+    rb = ridge_batch(284e12, 838.0, 0.5)
+    assert rb == pytest.approx(85.0, abs=8.0)
+
+
+def test_ridge_scales_with_compute_and_inverse_bandwidth():
+    base = ridge_batch(284e12, 838.0, 0.5)
+    assert ridge_batch(2 * 284e12, 838.0, 0.5) == pytest.approx(2 * base)   # 2x compute -> 2x ridge
+    assert ridge_batch(284e12, 2 * 838.0, 0.5) == pytest.approx(base / 2)   # 2x bw -> half ridge
+
+
+def test_max_num_seqs_picks_min_of_ridge_and_capacity():
+    assert max_num_seqs_from_ridge(85.0, 200) == (85, "compute-ridge")     # compute caps first
+    assert max_num_seqs_from_ridge(85.0, 32) == (32, "KV-capacity")        # KV memory caps first
+
+
+def test_prefill_ceiling_positive():
+    assert prefill_ceiling_toks(284e12, 9.0) > 1000   # 9B prefill compute ceiling (tok/s)

@@ -78,6 +78,66 @@ def memoc_decode_gain_pct(model: DecodeModel, cur_bw: float, new_bw: float) -> f
     return (n / c - 1.0) * 100.0 if c > 0 else 0.0
 
 
+def ridge_batch(tflops: float, bw_gbs: float, bytes_per_param: float) -> float:
+    """Decode COMPUTE<->BANDWIDTH crossover BATCH — the actual-compute lever for max-num-seqs.
+    Below it decode is weight-bandwidth-bound (more batch amortizes the weight read -> more
+    AGGREGATE tok/s); ABOVE it decode is compute-bound (more max-num-seqs adds prefill/latency,
+    NOT aggregate decode throughput). B* = bytes_per_param * FLOPs / (2 * bytes/s). Use the
+    COMPUTE-dtype TFLOPs (int8 for W4A8) and the WEIGHT-storage bytes/param (0.5 int4 / 1 int8 /
+    2 fp16). VALIDATED: 3090 ~284 INT8 TOPS, 838 GB/s, int4 weights -> ~85 ≈ the empirical
+    max-num-seqs<=82. So actual compute+bandwidth PREDICT the max-num-seqs ceiling a priori."""
+    bps = bw_gbs * 1e9
+    return (bytes_per_param * tflops) / (2.0 * bps) if bps > 0 else 0.0
+
+
+def max_num_seqs_from_ridge(ridge: float, capacity_wall: int) -> Tuple[int, str]:
+    """Recommended max-num-seqs ~ min(compute ridge, KV-capacity wall). Above the ridge decode is
+    compute-bound (more concurrency adds no aggregate decode tok/s); above the wall it OOMs/preempts.
+    Combines the actual-compute factor (ridge) with the capacity model (wall)."""
+    rec = int(max(1, min(ridge, capacity_wall)))
+    bound = "compute-ridge" if ridge <= capacity_wall else "KV-capacity"
+    return rec, bound
+
+
+def prefill_ceiling_toks(tflops: float, params_b: float) -> float:
+    """Compute-bound prefill ceiling (tok/s) = FLOPs / (2 * params). Bounds the empirical fit and
+    sizes chunked-prefill / max-num-batched-tokens (prefill is the compute-bound phase)."""
+    return tflops / (2.0 * params_b * 1e9) if params_b > 0 else 0.0
+
+
+def measure_tflops(dtype: str = "fp16", n: int = 4096, iters: int = 50) -> Optional[float]:  # pragma: no cover - GPU
+    """Achievable GEMM TFLOP/s via a timed torch matmul (optional; None if torch absent). Use int8
+    for the W4A8 decode-compute estimate. This is the ACTUAL achievable, not the spec peak."""
+    try:
+        import torch
+    except Exception:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    dt = {"fp16": torch.float16, "bf16": torch.bfloat16, "int8": torch.int8}.get(dtype, torch.float16)
+    dev = "cuda"
+    if dt == torch.int8:
+        a = torch.randint(-8, 8, (n, n), dtype=torch.int8, device=dev)
+        b = torch.randint(-8, 8, (n, n), dtype=torch.int8, device=dev)
+        op = lambda: torch._int_mm(a, b)  # noqa: E731
+    else:
+        a = torch.randn(n, n, dtype=dt, device=dev)
+        b = torch.randn(n, n, dtype=dt, device=dev)
+        op = lambda: a @ b  # noqa: E731
+    for _ in range(5):
+        op()
+    torch.cuda.synchronize()
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+    s.record()
+    for _ in range(iters):
+        op()
+    e.record()
+    torch.cuda.synchronize()
+    ms = s.elapsed_time(e) / iters
+    return (2.0 * n ** 3) / (ms / 1000.0) / 1e12  # 2*n^3 FLOPs per matmul -> TFLOP/s
+
+
 def measure_bw_gbs(bw_bin: str, *, size_gib: int = 8, iters: int = 200,
                    cuda_visible: Optional[str] = None) -> Optional[float]:  # pragma: no cover - GPU
     """Run the bw_verify CUDA kernel (NO privilege) -> achievable read GB/s, or None on failure."""
