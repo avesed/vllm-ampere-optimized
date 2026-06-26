@@ -117,14 +117,16 @@ __constant__ constexpr uint32_t cacheVTileSeqLen = 64;
 constexpr uint32_t kHeadPartBytes = mha::min(preferedKHeadPartBytes, paddedCacheHeadBytes);
 // constexpr uint32_t cacheElemsPerKHeadPart = exactDiv(kHeadPartBytes, cacheElemSize);
 
-constexpr bool persistentQ = paddedInputHeadBytes * ctaTile.y <= (16u << 10);
+// famp wide-head: the persistent Q buffer + the gemm0 K-part counts use the full QK head width
+// (paddedQHeadBytes / paddedKCacheHeadBytes); for normal heads these equal the 256 versions.
+constexpr bool persistentQ = paddedQHeadBytes * ctaTile.y <= (16u << 10);
 static_assert(persistentQ);
-constexpr uint32_t qHeadPartBytes = persistentQ ? paddedInputHeadBytes : kHeadPartBytes;
+constexpr uint32_t qHeadPartBytes = persistentQ ? paddedQHeadBytes : kHeadPartBytes;
 constexpr uint32_t qHeadPartElems = exactDiv(qHeadPartBytes, inputElemSize);
 
-constexpr uint32_t nbPartsPerCacheKHead = exactDiv(paddedCacheHeadBytes, kHeadPartBytes);
-constexpr uint32_t nbPartsPerInputKHead = exactDiv(paddedInputHeadBytes, kHeadPartBytes);
-constexpr uint32_t nbPartsPerInputQHead = exactDiv(paddedInputHeadBytes, qHeadPartBytes);
+constexpr uint32_t nbPartsPerCacheKHead = exactDiv(paddedKCacheHeadBytes, kHeadPartBytes);
+constexpr uint32_t nbPartsPerInputKHead = exactDiv(paddedQHeadBytes, kHeadPartBytes);
+constexpr uint32_t nbPartsPerInputQHead = exactDiv(paddedQHeadBytes, qHeadPartBytes);
 
 // false - each warp load V tiles independent of each other; true - all warps in a warp group load V
 // tiles together.
@@ -1765,11 +1767,11 @@ CUBIN_EXPORT __global__
     bool const isFullTile = (nbValidHeadTokens == warpTile.y);
     static_assert(nbQBuffers == 1);
     if (isFullTile) {
-      copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
+      copyHeadsAsync<PaddedQHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
                      qkSwizzle, true, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
                                                   nbValidHeadTokens, localQHeadTokenIdxMap);
     } else {
-      copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
+      copyHeadsAsync<PaddedQHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
                      qkSwizzle, false, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
                                                    nbValidHeadTokens, localQHeadTokenIdxMap);
     }
@@ -1802,9 +1804,15 @@ CUBIN_EXPORT __global__
 
     constexpr bool isFullTile = (nbValidRows == warpTile.y);
     static_assert(nbQBuffers == 1);
-    copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
-                   qkSwizzle, isFullTile, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
-                                                      nbValidRows, localQHeadIdxMap);
+    if constexpr (isWideHead) {
+      copyWideHeadAsync<PaddedQHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
+                        qkSwizzle, isFullTile, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
+                                                           nbValidRows, localQHeadIdxMap);
+    } else {
+      copyHeadsAsync<PaddedQHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
+                     qkSwizzle, isFullTile, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
+                                                        nbValidRows, localQHeadIdxMap);
+    }
     ldgsts::barArrive(smem.qBarrier[warpIdx.y], true);
   }
 #endif
@@ -1927,7 +1935,7 @@ CUBIN_EXPORT __global__
       // }
       bool const isFullTile = (seqIter + 1 < nbSeqIters);
       if (isFullTile) {
-        copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
+        copyPartialHeadsAsync<PaddedKCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
                               grainBytesGmemCache, qkSwizzle, true>(warp, dst, dstHeadOffset, src,
                                                                     idxPart);
       } else {
@@ -1935,7 +1943,7 @@ CUBIN_EXPORT __global__
             (seqOffset < cacheSeqLen
                  ? cacheSeqLen - seqOffset
                  : 0U);  // may also be full but it can be handled correctly anyway
-        copyPartialHeadsAsync<PaddedCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
+        copyPartialHeadsAsync<PaddedKCacheHead, warpTile.x, nbPartsPerCacheKHead, grainBytes,
                               grainBytesGmemCache, qkSwizzle, false>(warp, dst, dstHeadOffset, src,
                                                                      idxPart, nbHeadsAvail);
       }
@@ -2004,7 +2012,7 @@ CUBIN_EXPORT __global__
         assert(idxBeam < (isConvergedTile(seqIter) ? 1U : beamWidth));
         using KElemType = mha::decay_t<decltype(elemK)>;
         constexpr uint32_t elemsPerKHeadPart = exactDiv(kHeadPartBytes, sizeof(KElemType));
-        constexpr uint32_t nbPartsPerKHead = exactDiv(headElems, elemsPerKHeadPart);
+        constexpr uint32_t nbPartsPerKHead = exactDiv(headElemsQK, elemsPerKHeadPart);
         // the accumulator
         WarpAcc acc{};
         // famp: cap K-part unroll on sm86 (nbPartsPerKHead=8 -> 4) to trade a little long-ctx

@@ -61,15 +61,19 @@ def gen_xqa_module(
     else:
         flag_kv_cache_dtype = ["-DCACHE_ELEM_ENUM=0"]
 
-    if page_size not in [16, 32, 64, 128]:
+    # 256 added for gemma4's hd512 hybrid KV-cache group (physical page_size=256 even at
+    # --block-size 64); the kernel's page math is page-count-agnostic (nbPagesPerWarpTile=1).
+    if page_size not in [16, 32, 64, 128, 256]:
         raise ValueError(
-            f"Invalid page_size: {page_size}, only 16, 32, 64, 128 are supported"
+            f"Invalid page_size: {page_size}, only 16, 32, 64, 128, 256 are supported"
         )
     flag_tokens_per_page = [f"-DTOKENS_PER_PAGE={page_size}"]
 
-    if head_dim % 16 != 0 or head_dim > 256 or head_dim < 16:
+    # famp wide-head: 512 (gemma4 full-attn) is supported via the headElemsQK/headElems split in
+    # mha.h (gemm0 runs full-512 QK, gemm1 covers the 512 V/output in nbVChunks=2 passes of 256).
+    if head_dim % 16 != 0 or head_dim < 16 or (head_dim > 256 and head_dim != 512):
         raise ValueError(
-            f"Invalid head_dim: {head_dim}, must be divisible by 16 and in range [16, 256]"
+            f"Invalid head_dim: {head_dim}, must be divisible by 16 and in [16, 256] or == 512"
         )
     flag_head_dim = [f"-DHEAD_ELEMS={head_dim}"]
 

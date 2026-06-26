@@ -15,6 +15,7 @@ KernelDecline to fall back to stock FA (bit-faithful).
 """
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -111,9 +112,14 @@ def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: 
     n_req = len(cu_list) - 1
     qlens = [int(cu_list[i + 1] - cu_list[i]) for i in range(n_req)]
     seq_lens_cpu = m.seq_lens.tolist()
-    for i in range(n_req):
-        if qlens[i] == 1 and seq_lens_cpu[i] > 1:
-            raise KernelDecline
+    # A decode row (q=1, ctx>0) mixed into a prefill batch (continuous batching) is the one shape FI
+    # single_prefill can't do (q_len=1 -> max_mma_kv=0). For hd<=256 we DECLINE so stock FA handles
+    # the whole mixed batch optimally. For hd>256 (Gemma4 512) FA has NO path (head_size>256 reject),
+    # so declining would crash; instead the per-request loop below handles q=1 rows via q-pad-2.
+    if impl.head_size <= 256:
+        for i in range(n_req):
+            if qlens[i] == 1 and seq_lens_cpu[i] > 1:
+                raise KernelDecline
 
     key_cache, value_cache = kv_cache.unbind(1)
     _reshape_and_cache_flash(
@@ -156,7 +162,14 @@ def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: 
         q = q_src.to(torch.float16)
         k = k_src.to(torch.float16)
         v = v_src.to(torch.float16)
-        o = _fi_prefill(q, k, v, causal=causal, sm=sm, o_dtype=torch.float16, use_fp16_pv=True)
+        if Lq == 1:
+            # q=1 row (decode in a mixed hd>256 batch, or a rare 1-token prefill): FI single_prefill
+            # rejects q_len=1, so q-pad to 2 and take the LAST row (causal bottom-right -> attends all
+            # ctx incl. this step's just-cached K/V). Same q-pad-2 trick as the hd512 decode path.
+            o = _fi_prefill(q.repeat(2, 1, 1), k, v, causal=True, sm=sm,
+                            o_dtype=torch.float16, use_fp16_pv=True)[1:2]
+        else:
+            o = _fi_prefill(q, k, v, causal=causal, sm=sm, o_dtype=torch.float16, use_fp16_pv=True)
         output[s:e] = o.reshape(output[s:e].shape).to(output.dtype)
         FIRE["calls"] += 1
         FIRE["seqs"] += 1
@@ -323,7 +336,104 @@ class _Hd512DecodeState:
         return output
 
 
-_STATES: dict[int, _Hd512DecodeState] = {}   # keyed by head_size (hd256 sliding + hd512 full)
+class _XqaHd512DecodeState:
+    """Persistent cudagraph state for hd512 (Gemma4 full-attn) DECODE via famp's OWN vendored XQA
+    kernel (flashampere/xqa), superseding the FlashInfer q-pad-2 BatchPrefill hack. XQA is a real
+    decode kernel (q=1, MQA group16, head_dim=512) — no q-pad waste — so it is faster than FI at the
+    common ctx (<=~6k; micro-bench 1k 1.40x / 4k 1.17x). head_dim=512 is realised by the
+    headElemsQK(512)/headElems(256) split in mha.h (gemm0 runs full-512 QK; gemm1+output cover the
+    512 V/output as TWO 256-wide chunks); here the chunks are TWO kernel calls with the 2nd reading
+    V cols [256,512) and writing output cols [256,512) via a +256-element pointer offset (the wrapper
+    derives strides from the K-cache, so v_cache[...,256:] just moves the base). cos=1.0 validated.
+
+    CUDAGRAPH-SAFE (same recipe as xqa_verify): module JIT-build + per-bs buffers are made lazily on
+    the EAGER warmup call (never during capture); the hot path is only reshape_and_cache + copy_ +
+    zero_ + two module.xqa_wrapper launches (no alloc / host-sync / .item()). XQA takes block_table +
+    seq_lens directly, so there is NO FI-style metadata rebuild. gemm0-once (single K read, a uniform
+    win incl. 8k+/large-batch) is the documented next optimisation."""
+
+    def __init__(self, impl, query, kv_cache, m):
+        dev = m.seq_lens.device
+        self.ps = kv_cache.shape[2]                       # paged block_size
+        self.mb = m.block_table.shape[1]                  # max blocks/req
+        self.Hq, self.Hkv, self.D = impl.num_heads, impl.num_kv_heads, impl.head_size
+        self.grp = self.Hq // self.Hkv
+        self.half = self.D // 2                           # 256 — the gemm1/output chunk width
+        # XQA qkScale = q_scale * rsqrt(D); we want it == impl.scale (Gemma's custom attn scale).
+        self.q_scale = float(impl.scale) * math.sqrt(self.D)
+        self.qdtype, self.kvdtype = query.dtype, kv_cache.dtype
+        self.sm_count = torch.cuda.get_device_properties(dev).multi_processor_count
+        self.scratch = torch.zeros(256 << 20, dtype=torch.uint8, device=dev)
+        self.module = None
+        self.bufs: dict[int, tuple] = {}                  # B -> (sem, seq_u32)
+
+    def _get_module(self):
+        if self.module is None:
+            from .xqa._jit_xqa import gen_xqa_module
+            # full-attn -> no sliding window; output dtype == input dtype; q_seq_len=1 (decode).
+            self.module = gen_xqa_module(
+                self.qdtype, self.kvdtype, self.ps, self.D, self.grp, False, self.qdtype, 1
+            ).build_and_load()
+        return self.module
+
+    def _get_bufs(self, B, dev):
+        b = self.bufs.get(B)
+        if b is None:
+            nb_seq = self.Hkv * B
+            sem = torch.zeros((nb_seq + 1) // 2 * 2 + 2 + nb_seq + 2, dtype=torch.uint32, device=dev)
+            seq_u32 = torch.zeros(B, 1, dtype=torch.uint32, device=dev)
+            b = self.bufs[B] = (sem, seq_u32)
+        return b
+
+    def run(self, impl, layer, query, key, value, kv_cache, m, output):
+        key_cache, value_cache = kv_cache.unbind(1)       # [num_blocks, page_size, Hkv, D] (NHD)
+        _reshape_and_cache_flash(
+            key, value, key_cache, value_cache,
+            m.slot_mapping, impl.kv_cache_dtype, layer._k_scale, layer._v_scale,
+        )
+        B = m.seq_lens.shape[0]
+        dev = query.device
+        capturing = torch.cuda.is_current_stream_capturing()
+        # JIT build + buffer alloc must NOT run during capture -> decline (caller sinks to FA, which
+        # rejects hd512; the eager warmup builds these so the next capture for this size succeeds).
+        if (self.module is None or B not in self.bufs) and capturing:
+            raise KernelDecline
+        mod = self._get_module()
+        sem, seq_u32 = self._get_bufs(B, dev)
+        q4 = query.view(B, 1, self.Hq, self.D)
+        out4 = output.view(B, 1, self.Hq, self.D)
+        max_seq_len = self.mb * self.ps
+        page_table = m.block_table[:B]
+        # Capturable hot path: refresh persistent seq_lens (int32->uint32), then two launches.
+        seq_u32.copy_(m.seq_lens.view(B, 1))
+
+        def _launch(out_t, v_t):
+            sem.zero_()
+            mod.xqa_wrapper(
+                False, self.sm_count, self.Hkv, 0,        # run_sm90, sm_count, num_kv_heads, sliding_win
+                self.q_scale, None,                       # q_scale (float), q_scale tensor
+                out_t, 1.0,                               # output, rcp_out_scale
+                q4, None,                                 # q, sinks
+                key_cache, v_t, None, None,               # k/v cache, k/v sf
+                page_table, max_seq_len, seq_u32, B,      # page_table, max_seq_len, seq_lens, batch
+                1.0, None,                                # kv_scale (float), kv_scale tensor
+                1, None,                                  # q_seq_len=1 (decode), mask
+                sem, self.scratch, False,                 # semaphores, workspace, enable_pdl
+            )
+
+        _launch(out4, value_cache)                        # chunk 0: V cols [0,256) -> out cols [0,256)
+        _launch(out4[..., self.half:], value_cache[..., self.half:])  # chunk 1: +256 ptr offset
+        FIRE["calls"] += 1
+        return output
+
+
+_STATES: dict[int, object] = {}   # keyed by head_size (hd512 full-attn decode state)
+
+
+def _use_xqa_hd512() -> bool:
+    # Opt-in (default off) while the FI BatchPrefill path stays the validated shipped default. Flip to
+    # default-on after the e2e (cudagraph + GSM8K) validation of the owned XQA hd512 decode kernel.
+    return os.environ.get("VLLM_FAMP_XQA_HD512", "0") == "1"
 
 
 def decode_hd512(impl, layer, query, key, value, kv_cache, m, output):
@@ -343,7 +453,9 @@ def decode_hd512(impl, layer, query, key, value, kv_cache, m, output):
             and getattr(impl, "_fc_max_num_seqs", None)
             and not torch.cuda.is_current_stream_capturing()
         ):
-            st = _STATES[hs] = _Hd512DecodeState(impl, query, kv_cache, m)
+            # Owned XQA hd512 kernel (faster, drops the FI q-pad-2 hack) is opt-in; FI is the default.
+            cls = _XqaHd512DecodeState if _use_xqa_hd512() else _Hd512DecodeState
+            st = _STATES[hs] = cls(impl, query, kv_cache, m)
         if st is not None:
             out = st.run(impl, layer, query, key, value, kv_cache, m, output)
             _log_fired_once("decode_hd512", 1, 0, impl.head_size)

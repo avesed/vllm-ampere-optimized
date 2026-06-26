@@ -28,12 +28,21 @@ using CacheElemConverter = ElemTypeConverter<CACHE_ELEM_ENUM>;
 using CacheElem = CacheElemConverter::Type;
 constexpr uint32_t validElemsPerHead = HEAD_ELEMS;
 constexpr bool isMLA = IS_MLA;
-static_assert((isMLA || validElemsPerHead <= 256) &&
+// famp wide-head (gemma4 full-attn: symmetric head_dim>256, e.g. 512 on Ampere; not MLA): gemm0/Q/K
+// run at the full QK width (headElemsQK) while gemm1/V/output keep the native 256 tile (headElems)
+// and cover the wider V/output in nbVChunks passes. Sidesteps the gemm1 warp blocker
+// exactDiv(ctaShapeInWarps.x=4, headElems/64) and keeps persistentQ at its 16KB boundary.
+constexpr bool isWideHead = (!isMLA && validElemsPerHead > 256);
+static_assert((isMLA || validElemsPerHead <= 256 || isWideHead) &&
               (sizeof(CacheElem) * validElemsPerHead) % 16 == 0);
+static_assert(!isWideHead || validElemsPerHead == 512, "wide head: only 512 implemented");
+// gemm1 / V / output tile width (clamped to 256 for wide heads so the warp split stays 4/grp).
 constexpr uint32_t headElems =
     validElemsPerHead <= 64 ? 64 : (validElemsPerHead <= 128 ? 128 : (isMLA ? 576 : 256));
 static_assert(headElems == 64 || headElems == 128 || headElems == 256 || headElems == 576,
               "not implemented");
+// gemm0 / Q / K tile width = the full QK head (512 for wide heads, else == headElems).
+constexpr uint32_t headElemsQK = (validElemsPerHead <= 256 || isMLA) ? headElems : validElemsPerHead;
 constexpr uint32_t beamWidth = BEAM_WIDTH;
 constexpr uint32_t headGrpSize = HEAD_GRP_SIZE;
 #if SPEC_DEC
@@ -80,6 +89,9 @@ using OutputElem = OutputHead::Elem;
 using PaddedInputHead = Vec<InputElem, headElems>;
 // For 4 bit KV cache, each 16 elements (64b) are padded with 64b to match 128b banks.
 using PaddedCacheHead = Vec<CacheElemConverter::ContainerType, headElems>;
+// famp wide-head: full-QK-width padded Q and K heads (identical to the 256 versions for normal heads).
+using PaddedQHead = Vec<InputElem, headElemsQK>;
+using PaddedKCacheHead = Vec<CacheElemConverter::ContainerType, headElemsQK>;
 
 #if ENABLE_4BIT_KV_CACHE
 using PaddedCacheHeadSf =
@@ -88,6 +100,9 @@ using PaddedCacheHeadSf =
 
 // impl detail, may be moved to mha.cu/mha_sm90.cu
 constexpr bool isHeadPadded = (validElemsPerHead != headElems);
+// famp wide-head: the V/output (validElemsPerVHead) is covered by gemm1 in nbVChunks passes of
+// headElems each (== 2 for the 512 wide head, 1 for normal heads).
+constexpr uint32_t nbVChunks = isWideHead ? exactDiv(validElemsPerVHead, headElems) : 1;
 
 constexpr bool useInputKV = USE_INPUT_KV;
 
@@ -254,6 +269,9 @@ constexpr uint32_t gmemCacheHeadBytes = sizeof(GMemCacheHead);
 
 constexpr uint32_t paddedInputHeadBytes = sizeof(PaddedInputHead);
 constexpr uint32_t paddedCacheHeadBytes = sizeof(PaddedCacheHead);
+// famp wide-head: full-QK-width byte sizes (drive the gemm0 K-part count + persistentQ Q buffer).
+constexpr uint32_t paddedQHeadBytes = sizeof(PaddedQHead);
+constexpr uint32_t paddedKCacheHeadBytes = sizeof(PaddedKCacheHead);
 
 constexpr bool allowMultiBlockMode = ALLOW_MULTI_BLOCK_MODE;
 

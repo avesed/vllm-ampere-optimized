@@ -173,6 +173,45 @@ __device__ inline void copyHeadsAsync(
                                     [&](uint32_t x) { return localHeadIdxMap(dstHeadOffset + x); });
 }
 
+// famp wide-head: load a persistent Q head that is wider than warp_size grains (e.g. the 512-wide
+// gemma4 head = 64 grains) into a full-head swizzled smem buffer. The stock copyHeadsAsync assumes
+// grains-per-head <= warp_size (one lane per grain column); here each lane loads
+// grainsPerHead/warp_size columns, writing through the SAME dst.at<swizzle> so the smem layout is
+// bit-identical to what gemm0's per-part Q read expects. No head padding (the source head is full).
+template <typename Head, uint32_t maxNbCopiedHeads, uint32_t nbWarps, uint32_t grainBytesSmem,
+          uint32_t grainBytesGmem, bool swizzle, bool isFull, uint32_t dstNbHeads,
+          typename SrcHeadPtr, typename _LdGrain, typename LocalHeadIdxMap = uint32_t (*)(uint32_t)>
+__device__ inline void copyWideHeadAsync(
+    uint32_t idxWarp, Array2D<_LdGrain, dstNbHeads, exactDiv(sizeof(Head), grainBytesSmem)>& dst,
+    SrcHeadPtr const& src, uint32_t nbAvailHeads = maxNbCopiedHeads,
+    LocalHeadIdxMap&& localHeadIdxMap = [](uint32_t x) { return x; }) {
+  static_assert(grainBytesSmem == grainBytesGmem, "wide head load is unpacked (no convert)");
+  assert(idxWarp < nbWarps);
+  constexpr uint32_t grainsPerHead = exactDiv(sizeof(Head), grainBytesSmem);
+  static_assert(grainsPerHead % warp_size == 0, "wide head must be whole warp grain rows");
+  constexpr uint32_t grainColsPerLane = exactDiv(grainsPerHead, warp_size);
+  constexpr uint32_t maxNbHeadsPerWarp = exactDiv(maxNbCopiedHeads, nbWarps);
+  uint32_t const dstHeadOffset = maxNbHeadsPerWarp * idxWarp;
+  using SrcHead = mha::decay_t<decltype(src[0])>;
+  static_assert(sizeof(SrcHead) == sizeof(Head), "wide head src/dst width mismatch");
+#pragma unroll
+  for (uint32_t hl = 0; hl < maxNbHeadsPerWarp; hl++) {
+    uint32_t const idxHeadLocal = dstHeadOffset + hl;
+    bool const isHeadInBound = isFull || (idxHeadLocal < nbAvailHeads);
+    SrcHead const* const pSrcHead = src + localHeadIdxMap(idxHeadLocal);
+    bool const isValidPage = (pSrcHead != nullptr);
+    auto const* const pSrcGrains = reinterpret_cast<Vec<uint8_t, grainBytesGmem> const*>(pSrcHead);
+#pragma unroll
+    for (uint32_t gi = 0; gi < grainColsPerLane; gi++) {
+      uint32_t const gcol = warp_size * gi + laneId();
+      Vec<uint8_t, grainBytesSmem>* const pDst = reinterpret_cast<Vec<uint8_t, grainBytesSmem>*>(
+          &dst.template at<swizzle>(idxHeadLocal, gcol));
+      ldgsts::copyAsync<grainBytesGmem>(pDst, pSrcGrains + gcol,
+                                        isValidPage && isHeadInBound ? grainBytesGmem : 0u);
+    }
+  }
+}
+
 template <bool isAsync, uint32_t maxTotalNbGrains, uint32_t nbWarps, bool isFull = true>
 __device__ inline void copyGrains(uint32_t idxWarp, LdGrain* dst, LdGrain const* src,
                                   uint32_t totalNbGrains = maxTotalNbGrains) {
