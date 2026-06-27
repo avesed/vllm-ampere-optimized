@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.so
+build/
+*kernel_*.cu
+kernel_selector.h
+*.o
+_cuda_inc/
