@@ -159,7 +159,10 @@ def _ensure_cuda_libs() -> list:
 def _manual_build(sources, arch):
     """nvcc -rdc compile (parallel) -> nvcc -dlink -> g++ -shared famp_marlin.so."""
     os.makedirs(_BUILD, exist_ok=True)
-    cc = arch.replace(".", "")  # "8.6" -> "86"
+    # arch is a single cc ("8.6") or a comma list ("8.0,8.6") matching generate_kernels.py — emit one
+    # -gencode per arch so the .so is a multi-arch fatbin (release builds target sm_80+sm_86).
+    ccs = [a.strip().split("+")[0].replace(".", "") for a in arch.split(",") if a.strip()]
+    gencodes = [f"-gencode=arch=compute_{cc},code=sm_{cc}" for cc in ccs]
     abi = int(getattr(torch._C, "_GLIBCXX_USE_CXX11_ABI", True))
     cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
     nvcc = os.path.join(cuda_home, "bin", "nvcc")
@@ -179,7 +182,7 @@ def _manual_build(sources, arch):
     common = [
         "-std=c++17", "-O3", "-Xcompiler", "-fPIC",
         "--relocatable-device-code=true", "--expt-relaxed-constexpr", "--expt-extended-lambda",
-        f"-gencode=arch=compute_{cc},code=sm_{cc}",
+        *gencodes,
         f"-D_GLIBCXX_USE_CXX11_ABI={abi}", "-DTORCH_EXTENSION_NAME=famp_marlin",
         "-DTORCH_API_INCLUDE_EXTENSION_H", "-DNDEBUG",
         "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
@@ -195,7 +198,7 @@ def _manual_build(sources, arch):
         objs = list(ex.map(compile_one, sources))
 
     dlink = os.path.join(_BUILD, "famp_marlin_dlink.o")
-    subprocess.check_call([nvcc, "-dlink", f"-gencode=arch=compute_{cc},code=sm_{cc}",
+    subprocess.check_call([nvcc, "-dlink", *gencodes,
                            "--relocatable-device-code=true", "-Xcompiler", "-fPIC"]
                           + objs + ["-o", dlink])
 

@@ -56,6 +56,10 @@ if [ ! -d vllm/.git ]; then
 fi
 
 VLLM_IMG="${IMAGE}:${VLLM_TAG}-vllm-${CU}"             # intermediate (vLLM-only) tag
+FI_IMG="${IMAGE}:${VLLM_TAG}-fi-${CU}"                 # intermediate (vLLM + flashinfer) tag
+# famp_marlin release arches (comma list; generate_kernels.py + build.py syntax). Default = Ampere
+# sm_80+sm_86 (the fork's scope); FampMarlin gates selection to these, stock _C serves other arches.
+FAMP_MARLIN_ARCH="${FAMP_MARLIN_ARCH:-8.0,8.6}"
 # Tagging channel: CHANNEL=dev -> :dev only (do NOT move :latest). Default
 # (release) -> :<VLLM_TAG>-ampere-<cu> + :latest (the existing release scheme).
 CHANNEL="${CHANNEL:-}"
@@ -83,14 +87,26 @@ docker buildx build vllm $BUILDER \
   $GHA_CACHE \
   --tag "$VLLM_IMG" --load
 
-echo "== stage 2/2: overlay vendored int8-QK flashinfer ($([ "$PUSH" = 1 ] && echo 'push to ghcr' || echo 'load locally')) =="
+echo "== stage 2/3: overlay vendored int8-QK flashinfer (load locally; the final push is stage 3) =="
 docker buildx build . $BUILDER \
   --file docker/Dockerfile.flashinfer-int8 \
   --build-arg BASE="$VLLM_IMG" \
+  --platform linux/amd64 \
+  --provenance=false \
+  --tag "$FI_IMG" --load
+
+# stage 3: compile the vendored famp_marlin FROM SOURCE on the from-source image (NOT an overlay on an
+# upstream wheel) + register the FampMarlinKernel plugin. P4 (the int8-act config widening) ships in the
+# vendored vllm/ via patches/0007.
+echo "== stage 3/3: compile vendored famp_marlin (sm: $FAMP_MARLIN_ARCH) + register plugin ($([ "$PUSH" = 1 ] && echo 'push to ghcr' || echo 'load locally')) =="
+docker buildx build . $BUILDER \
+  --file docker/Dockerfile.famp-marlin \
+  --build-arg BASE="$FI_IMG" \
+  --build-arg FAMP_MARLIN_ARCH="$FAMP_MARLIN_ARCH" \
   --platform linux/amd64 \
   --provenance=false \
   --tag "$FINAL" \
   $LATEST_TAG_ARG \
   $PUSH_FLAG
 
-echo "$([ "$PUSH" = 1 ] && echo pushed || echo 'built (local)') $FINAL${LATEST_TAG_ARG:+ + :latest}  [complete from-source fork: W4A8 + int8-8row + int8-QK flashinfer]"
+echo "$([ "$PUSH" = 1 ] && echo pushed || echo 'built (local)') $FINAL${LATEST_TAG_ARG:+ + :latest}  [complete from-source fork: W4A8 + int8-8row + int8-QK flashinfer + vendored famp_marlin]"

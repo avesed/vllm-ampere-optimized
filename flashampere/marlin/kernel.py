@@ -319,6 +319,19 @@ def register_fampmarlin():
         from vllm.platforms import PlatformEnum, current_platform
         if not current_platform.is_cuda():
             return
+        # famp_marlin ships only the cubins it was compiled for (FAMP_MARLIN_ARCH, default the Ampere
+        # sm_80+sm_86 scope). On any other GPU there is no compatible kernel image, so selecting famp
+        # would fail at the first marlin_gemm — gate to the built arches here; stock _C Marlin (full
+        # fatbin) serves the rest, bit-identically (famp is a byte-mirror). The release Dockerfile bakes
+        # FAMP_MARLIN_ARCH as an env so this stays in sync with whatever arches the .so was built for.
+        _built = {a.strip().split("+")[0]
+                  for a in (os.environ.get("FAMP_MARLIN_ARCH") or "8.0,8.6").split(",") if a.strip()}
+        _cap = current_platform.get_device_capability()
+        _cur = f"{_cap.major}.{_cap.minor}" if _cap is not None else None
+        if _cur not in _built:
+            logger.info("famp_marlin: GPU sm_%s not in built arches %s; using stock Marlin.",
+                        _cur, sorted(_built))
+            return
         from vllm.model_executor.kernels.linear import _POSSIBLE_KERNELS
         from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
             MarlinLinearKernel,

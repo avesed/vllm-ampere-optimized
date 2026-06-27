@@ -1,0 +1,29 @@
+# Stage 3 of the from-source release (scripts/build_image_source.sh): bake the vendored famp_marlin
+# Marlin GEMM. NOT an overlay on an upstream wheel/image — the BASE is the from-source fork image
+# (stage 2 output), and the .so is COMPILED here from the vendored csrc (flashampere/marlin/csrc) for
+# the release arches. FampMarlinKernel registers via a vllm.general_plugins entry point and, with P4
+# (patches/0007), owns the W4A8/W4A16 Marlin path. Build context = repo root (carries flashampere/).
+ARG BASE
+FROM ${BASE}
+
+# Comma-separated archs (generate_kernels.py + build.py syntax). Default = the Ampere scope (sm_80+86);
+# widen (e.g. "8.0,8.6,8.9,9.0") to match the vLLM fatbin if you serve famp_marlin off Ampere.
+ARG FAMP_MARLIN_ARCH="8.0,8.6"
+# Persist as a runtime env so register_fampmarlin() gates kernel selection to exactly these built
+# arches (non-Ampere GPUs fall back to stock _C Marlin, bit-identically).
+ENV FAMP_MARLIN_ARCH=${FAMP_MARLIN_ARCH}
+
+COPY flashampere/marlin /opt/famp/flashampere/marlin
+RUN set -eux; \
+    rm -rf /opt/famp/flashampere/marlin/build; \
+    : > /opt/famp/flashampere/__init__.py; : > /opt/famp/flashampere/marlin/__init__.py; \
+    SP="$(python3 -c 'import site;print(site.getsitepackages()[0])')"; \
+    echo /opt/famp > "$SP/famp.pth"; \
+    D="$SP/fampmarlin-0.1.dist-info"; mkdir -p "$D"; \
+    printf 'Metadata-Version: 2.1\nName: fampmarlin\nVersion: 0.1\n' > "$D/METADATA"; \
+    printf '[vllm.general_plugins]\nfampmarlin = flashampere.marlin.plugin:register_fampmarlin\n' > "$D/entry_points.txt"; \
+    cd /opt/famp && PYTHONPATH=/opt/famp CUDA_HOME=/usr/local/cuda PATH="/usr/local/cuda/bin:$PATH" \
+      python3 -m flashampere.marlin.build "$FAMP_MARLIN_ARCH"; \
+    test -f /opt/famp/flashampere/marlin/build/famp_marlin.so
+
+# upstream ENTRYPOINT ["vllm","serve"] is inherited; the worker loads the prebuilt .so (no toolchain).
