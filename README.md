@@ -35,7 +35,7 @@ Stock vLLM **won't load W4A8 on any Ampere GPU** — the fork is the only way to
 | RTX 3090 ×2 (pp2) · `sm_86` | 35B-A3B MoE | 9.1k → **10.8k** | **+19%** | 122 → 120 | 614 → **669** |
 | A100 ×1 · `sm_80` | 9B dense | 11.1k → 11.1k | +0% | — | — |
 | A100 ×1 · `sm_80` | 35B-A3B MoE | 22.8k → 24.7k | +8% | — | — |
-| RTX 3090 ×1 · `sm_86` | 26B-A4B dLLM† | — | **+20%** | 178 → **213** | — |
+| RTX 3090 ×1 · `sm_86` | 26B-A4B dLLM | 4.2k → **5.5k** | **+32%** | 178 → **213** | — |
 
 - **The int8 prefill win is a consumer-`sm_86` effect** — those cards' fp16 tensor (FP32 accumulate) is
   half-rate, so int8 is a ~4× compute lever. A100 (`sm_80`) fp16 is full-rate → int8 prefill ~0 (dense)
@@ -44,10 +44,15 @@ Stock vLLM **won't load W4A8 on any Ampere GPU** — the fork is the only way to
   int8 gain to +5%).
 - **Quality:** decode is W4A16-parity; int8 activations cost ~zero accuracy — GSM8K (thinking) 9B W4A16
   81.6% / W4A8 85.6% (N=250); 35B-A3B W4A8 GSM8K 95.8%, MMLU-Pro 80.5%. The fork's W4A16 is byte-identical to stock.
-- **† DiffusionGemma (block-diffusion dLLM):** single-stream gen tok/s, canvas 256, `TRITON_ATTN`. int8-act also
-  beats **NVFP4 (176)** — no native FP4 kernel below `sm_89`, so it dequant-emulates to bf16 (memory-only, ≈ W4A16
-  speed) — at matched accuracy: W4A8 GSM8K 95.7% / MMLU-Pro 76.4%; NVFP4 96.0% / 77.8% (N=1000/500). int8-QK n/a
-  here (the diffusion mixed causal/bidirectional mask needs Triton). Run the
+- **DiffusionGemma (block-diffusion dLLM, the row above):** prefill (8k) + single-stream gen, canvas 256. Unlike
+  AR decode (≈flat under int8), the dLLM's generation is compute-bound too (every denoise step is prefill-like), so
+  it gains as well (178 → 213, **+20%**). int8-act also beats **NVFP4 (176)** — no native FP4 kernel below `sm_89`,
+  so it dequant-emulates to bf16 (memory-only, ≈ W4A16 speed) — at matched accuracy: W4A8 GSM8K 95.7% / MMLU-Pro
+  76.4%; NVFP4 96.0% / 77.8% (N=1000/500). Two serve
+  requirements: **`--dtype bfloat16`** (under int8, Gemma's large activations overflow fp16 — down-proj GEMM
+  dequant > 65504 → inf → NaN → blank output) and **`--attention-backend TRITON_ATTN`** (the diffusion mixed
+  causal/bidirectional mask isn't supported by flash-attn (wants FA4) or FlashInfer, so int8-QK doesn't apply —
+  the int8 win is the MoE GEMM alone). Run the
   [cyankiwi W4A16 ckpt](https://huggingface.co/cyankiwi/diffusiongemma-26B-A4B-it-AWQ-INT4) with
   `VLLM_MARLIN_INPUT_DTYPE=int8 --dtype bfloat16 --attention-backend TRITON_ATTN` over the chat endpoint.
 
