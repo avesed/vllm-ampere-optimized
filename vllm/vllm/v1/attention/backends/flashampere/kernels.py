@@ -67,8 +67,14 @@ def _gather_one(cache: torch.Tensor, blk: torch.Tensor, n_blocks: int, seq_len: 
 
 
 def _fi_prefill(q, k, v, *, causal, sm, o_dtype, use_fp16_pv=False):
-    """Single FlashInfer fp16 prefill; thread use_fp16_pv_reduction only when requested (the param
-    exists only on the patch-0007 flashinfer, and the caller gates that via caps.has_fp16pv_kernel)."""
+    """Single fp16 prefill (fp16-PV when requested). Default: FlashInfer single_prefill (the
+    use_fp16_pv_reduction param exists only on patch-0007 flashinfer; the caller gates it via
+    caps.has_fp16pv_kernel). Opt-in VLLM_FAMP_OWN_PREFILL=1: the famp-VENDORED prefill kernel
+    (own prefill.cuh + own run() marshalling) which drops the patched-flashinfer dependency —
+    validated cos=1.0 vs FI fp16-PV; default-off until e2e-validated (the fallback contract)."""
+    if os.environ.get("VLLM_FAMP_OWN_PREFILL", "0") in ("1", "true", "True"):
+        from .prefill import single_prefill as _own_prefill
+        return _own_prefill(q, k, v, causal=causal, sm_scale=sm, o_dtype=o_dtype, use_fp16_pv=use_fp16_pv)
     kw = {"use_fp16_pv_reduction": True} if use_fp16_pv else {}
     return flashinfer.single_prefill_with_kv_cache(
         q, k, v, causal=causal, backend="fa2", o_dtype=o_dtype,
