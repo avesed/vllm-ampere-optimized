@@ -103,9 +103,13 @@ class FampMarlinKernel(MPLinearKernel):
         is_a_8bit = c.act_type is not None and c.act_type.itemsize == 1
 
         if is_a_8bit:
-            assert c.weight_type in (scalar_types.uint4b8, scalar_types.int4), (
-                "W4A8-INT8 marlin only supports uint4b8 or int4 weights."
-            )
+            # W4A8 also covers asym AWQ (uint4 + runtime zp): the (kS8,kU4)
+            # kernel folds zp into the int8 operand via sub_zp_and_dequant.
+            assert c.weight_type in (
+                scalar_types.uint4b8,
+                scalar_types.int4,
+                scalar_types.uint4,
+            ), "W4A8-INT8 marlin supports uint4b8, int4, or uint4 weights."
 
         if c.act_type == torch.float8_e4m3fn:
             # fp8 unreachable on Ampere (get_marlin_input_dtype rejects it < SM89); kept for parity.
@@ -256,8 +260,10 @@ class FampMarlinKernel(MPLinearKernel):
 
         a_scales = None
         if input_dtype == torch.int8:
-            assert wtype == scalar_types.uint4b8, (
-                "W8A8-INT8 is not supported by marlin kernel."
+            # uint4 = asym AWQ (zp via weight_zp); uint4b8 = sym GPTQ. Both are W4A8;
+            # an 8-bit weight (W8A8) is still unsupported.
+            assert wtype in (scalar_types.uint4b8, scalar_types.uint4), (
+                "W4A8-INT8 marlin requires a 4-bit weight (uint4b8 or uint4)."
             )
             reshaped_x, a_scales = marlin_quant_input(reshaped_x, input_dtype)
             a_scales = a_scales * input_global_scale

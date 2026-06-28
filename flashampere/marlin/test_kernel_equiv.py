@@ -19,13 +19,15 @@ Cases:
                      (permute_param_layout_ -> famp gptq_marlin_repack on PACKED int32 input), which
                      the int4-sym path NEVER reaches (it has its own nibble-pack). Closes the
                      repack-route coverage gap for the AWQ/GPTQ-packed layout.
+  - W4A8-int8 AWQ-asym g128 : weight_type=uint4 + zero_points=True (AWQ packed int32 qweight + packed
+                     int32 qzeros). Exercises the kU4 (not kU4B8) kernel path AND the zero_points leg
+                     (marlin_zero_points/unpack_cols + w_zp into the famp gemm), composed with int8
+                     activations. This is the un-gated asym-weight W4A8 config.
   M=17 forces a non-tile-aligned size_m (catches padding / atomic-add bugs).
 
-Out of test scope (rely on the byte-identical-sources argument + the GSM8K serve gate): (1) the asym
-zero_points=True leg (marlin_zero_points/unpack_cols + w_zp into the gemm) — a faithful synthetic AWQ
-qzeros layout can't be validated offline, and the ops swapped (repack/gemm) are already covered here;
-(2) act-order has_g_idx=True (g_idx_sort wiring); (3) fp8 activations (unreachable on Ampere;
-get_marlin_input_dtype rejects fp8 < SM89). All three are byte-identical to stock by inspection.
+Out of test scope (rely on the byte-identical-sources argument + the GSM8K serve gate):
+(1) act-order has_g_idx=True (g_idx_sort wiring); (2) fp8 activations (unreachable on Ampere;
+get_marlin_input_dtype rejects fp8 < SM89). Both are byte-identical to stock by inspection.
 
 Standalone vLLM marlin layers need a current VllmConfig context + a 1-rank TP group (PackedvLLMParameter
 queries the TP rank). Mirrors fused_silu_int8/test_mlp_equiv.py.
@@ -74,6 +76,11 @@ def _make_layer(K, N, group_size, seed, weight_type, zero_points):
                 packed_dim=0, shape [K//8, N] int32, exactly as auto_gptq.py:377) -> exercises
                 transform_w_q's ELSE branch (permute_param_layout_ + gptq_marlin_repack on PACKED
                 int32), which the int4-sym path NEVER reaches. zero_points stays False (GPTQ-sym).
+    uint4     : AWQ-asym checkpoint layout. Same packed-int32 qweight ELSE branch as uint4b8, PLUS a
+                qzeros PackedvLLMParameter [N//8, num_groups] int32 (input_dim=1/output_dim=0/
+                packed_dim=0, exactly as compressed_tensors_wNa16.py:189) registered as
+                weight_zero_point -> exercises the kU4 kernel path + transform_w_q's zero_points leg
+                (unpack_cols/marlin_zero_points + w_zp into the gemm).
     """
     g = torch.Generator(device="cpu").manual_seed(seed)
     eff_group = group_size if group_size != -1 else K
@@ -113,6 +120,17 @@ def _make_layer(K, N, group_size, seed, weight_type, zero_points):
         layer.register_parameter("weight_scale", GroupQuantScaleParameter(
             input_dim=0, output_dim=1, weight_loader=_noop_loader, data=ws,
         ))
+        if zero_points:
+            # AWQ-asym qzeros: [N//8, num_groups] int32, packed uint4 along N (output_dim, packed_dim=0),
+            # exactly as compressed_tensors_wNa16.py:189. Random int32 bits are valid packed uint4 zps
+            # for unpack_cols + marlin_zero_points + gemm parity.
+            qzeros = torch.randint(
+                -(2**31), 2**31, (N // PACK_FACTOR, num_groups), generator=g, dtype=torch.int64,
+            ).to(torch.int32).to(DEV)
+            layer.register_parameter("weight_zero_point", PackedvLLMParameter(
+                input_dim=1, output_dim=0, weight_loader=_noop_loader,
+                packed_factor=PACK_FACTOR, packed_dim=0, data=qzeros,
+            ))
 
     layer.register_parameter("weight_shape", BasevLLMParameter(
         data=torch.tensor([K, N], dtype=torch.int64, device=DEV), weight_loader=_noop_loader,
@@ -169,6 +187,8 @@ def run_all():
     _check("W4A8-int8 g128", K, N, M, torch.int8, 128, torch.bfloat16)
     _check("W4A16 GPTQ-sym", K, N, M, torch.bfloat16, 128, torch.bfloat16,
            weight_type=scalar_types.uint4b8, zero_points=False)
+    _check("W4A8 AWQ-asym ", K, N, M, torch.int8, 128, torch.bfloat16,
+           weight_type=scalar_types.uint4, zero_points=True)
     print("EQUIV_OK ALL")
 
 
