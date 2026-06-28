@@ -14,3 +14,6 @@ dist/
 
 # large raw eval generations (summarized in eval/*.md; on sandbox)
 eval/results_awqmse/*_n250.json
+
+# research/analysis docs are local-only (never commit)
+docs/RESEARCH-*.md
