@@ -28,6 +28,7 @@ git apply -p1 --directory=vllm patches/0002-marlin-int8-8row-decode-ampere.patch
 git apply -p1 --directory=vllm patches/0003-aot-compile-cache-quant-scheme-key.patch # 0003 AOT cache-key
 git apply -p1 --directory=vllm patches/0005-int8act-moe-perexpert-ampere.patch # 0005 int8-act MoE per-expert scale (kernel un-gate + python)
 git apply -p1 --directory=vllm patches/0006-marlin-input-dtype-cli-alias.patch # 0006 --marlin-input-dtype CLI alias for VLLM_MARLIN_INPUT_DTYPE
+git apply -p1 --directory=vllm patches/0007-famp-marlin-config.patch # 0007 widen the int8-act override to FampMarlinKernel (vendored famp_marlin, built FROM SOURCE in build_image_source.sh stage 3)
 
 echo "== re-vendor FlashInfer $FI_TAG =="
 rm -rf flashinfer
