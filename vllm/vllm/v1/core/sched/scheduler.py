@@ -211,11 +211,15 @@ class Scheduler(SchedulerInterface):
 
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
+        self.requires_eagle_cache_drop = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
             if speculative_config.use_eagle():
                 self.use_eagle = True
+                self.requires_eagle_cache_drop = (
+                    speculative_config.requires_eagle_cache_drop()
+                )
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
@@ -224,6 +228,10 @@ class Scheduler(SchedulerInterface):
                 # decoding instead of standard next-token sampling, so it has a query
                 # for the last sampled token plus queries for each draft token.
                 self.num_lookahead_tokens = self.num_spec_tokens + 1
+            if speculative_config.use_dspark():
+                # DSpark drafts exactly num_spec_tokens query slots (no bonus
+                # slot), so no extra lookahead token is needed.
+                self.num_lookahead_tokens = self.num_spec_tokens
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -233,7 +241,7 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            use_eagle=self.requires_eagle_cache_drop,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
@@ -313,13 +321,13 @@ class Scheduler(SchedulerInterface):
             # must be a multiple of `block_size`.
             # As an exception, if `num_new_tokens` is less than `block_size`, the
             # state is simply not cached, requiring no special handling.
-            # Additionally, when Eagle mode is enabled, FullAttn prunes the last
-            # matching block. To prevent this from causing a Mamba cache miss, the
-            # last chunk must be not smaller than `block_size`.
+            # Additionally, when Eagle-style cache drop is enabled, FullAttn
+            # prunes the last matching block. To prevent this from causing a
+            # Mamba cache miss, the last chunk must be not smaller than
+            # `block_size`.
             block_size = self.cache_config.block_size
             last_cache_position = request.num_tokens - request.num_tokens % block_size
-            # eagle prune
-            if self.use_eagle:
+            if self.requires_eagle_cache_drop:
                 last_cache_position = max(last_cache_position - block_size, 0)
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
             if num_computed_tokens_after_sched < last_cache_position:
@@ -430,7 +438,7 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    shift_computed_tokens=1 if self.requires_eagle_cache_drop else 0,
                 )
 
             if self.need_mamba_block_aligned_split:
@@ -711,7 +719,9 @@ class Scheduler(SchedulerInterface):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
+                            shift_computed_tokens=1
+                            if self.requires_eagle_cache_drop
+                            else 0,
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
