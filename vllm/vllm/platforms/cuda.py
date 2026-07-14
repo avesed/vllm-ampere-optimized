@@ -138,13 +138,26 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TURBOQUANT,
             ]
         else:
-            return [
+            backends = [
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
                 AttentionBackendEnum.TURBOQUANT,
             ]
+            # [flashampere] Prepend the unified Ampere backend when registered (its
+            # vllm.general_plugins entry-point ran with VLLM_FLASHAMPERE=1) on Ampere (sm_8x).
+            # CUSTOM self-fences via validate_configuration (supports_compute_capability
+            # major==8 + FA's supports_kv_cache_dtype), so non-Ampere / fp8-KV / encoder layers
+            # are skipped and fall through to FLASH_ATTN. Guard on is_overridden() so an
+            # unregistered CUSTOM never reaches get_path() (raises ValueError, which
+            # get_valid_backends does NOT catch — only ImportError).
+            if (
+                device_capability.major == 8
+                and AttentionBackendEnum.CUSTOM.is_overridden()
+            ):
+                backends.insert(0, AttentionBackendEnum.CUSTOM)
+            return backends
 
 
 def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:

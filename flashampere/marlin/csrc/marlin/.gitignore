@@ -1,0 +1,6 @@
+# generate_kernels.py build artifacts (regenerated at build time)
+*kernel_*.cu
+kernel_selector.h
+__pycache__/
+*.pyc
+*.so

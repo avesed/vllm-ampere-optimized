@@ -112,7 +112,17 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             logger.info("Using %s for CompressedTensorsWNA16", kernel_type.__name__)
             self._kernel_backends_being_used.add(kernel_type.__name__)
 
-        if kernel_type is MarlinLinearKernel:
+        # famp: FampMarlinKernel (vendored marlin) mirrors MarlinLinearKernel but is a distinct class,
+        # so the original `is MarlinLinearKernel` identity check skipped the VLLM_MARLIN_INPUT_DTYPE
+        # override for it -> W4A16-ckpt+int8 silently ran as W4A16. Widen to include it (import guarded
+        # so the fork still works without the flashampere plugin installed).
+        _marlin_kernels = (MarlinLinearKernel,)
+        try:
+            from flashampere.marlin.kernel import FampMarlinKernel
+            _marlin_kernels = (MarlinLinearKernel, FampMarlinKernel)
+        except Exception:
+            pass
+        if kernel_type in _marlin_kernels:
             input_dtype = get_marlin_input_dtype(self.layer_name)
             if input_dtype is not None:
                 mp_linear_kernel_config.act_type = input_dtype
