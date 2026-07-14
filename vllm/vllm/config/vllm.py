@@ -1890,6 +1890,19 @@ class VllmConfig:
         if architecture is None:
             return
 
+        # [flashampere] Auto-route validated architectures onto the famp attention path: set the
+        # VLLM_FAMP_* env from the fork-owned registry BEFORE the per-arch handler below reads it
+        # (e.g. the Gemma4 TRITON-force gate) and before workers spawn (env is inherited). Respects
+        # explicit user env (setdefault). No-op for unlisted archs; optional -> never blocks setup.
+        try:
+            from vllm.v1.attention.backends.flashampere.model_profiles import (
+                apply_famp_profile,
+            )
+
+            apply_famp_profile(self)
+        except Exception:
+            pass
+
         from vllm.model_executor.models.config import (
             MODELS_CONFIG_MAP,
             HybridAttentionMambaModelConfig,
