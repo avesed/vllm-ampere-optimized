@@ -15,7 +15,7 @@ watch-upstream.yml (cron, every 6h)
 maintainer, locally:
   1. scripts/revendor.sh <vllm_tag> <flashinfer_tag>   # only if upstream bumped; else skip
        └─ clones fresh upstream into vllm/ + flashinfer/, replays the recipe
-          (regenerate.py 0001 + git apply 0002 + 0003 + apply_to_source.py); drift FAILS LOUDLY
+          (regenerate.py 0001 + git apply 0002/0003/0005/0006/0009 + apply_to_source.py); drift FAILS LOUDLY
   2. git diff && git commit                             # review + commit the vendored trees
   3. OWNER=<you> scripts/build_image_source.sh          # from-source sm_80+sm_86 build → push ghcr :<tag>-ampere-<cu> + :latest
   4. (optional) scripts/smoke_test.sh <img> ; scripts/ampere_kernel_ci.sh <img> "$(cat UPSTREAM_VLLM_VERSION)"
@@ -37,8 +37,9 @@ OWNER=<you> scripts/build_image_source.sh                         # cu130 (defau
 OWNER=<you> CUDA_VERSION=12.9.1 scripts/build_image_source.sh     # cu129 broad-compat variant
 ```
 
-`build_image_source.sh` builds vLLM from `vllm/` (two-stage: vLLM image, then the int8-QK FlashInfer
-overlay from `flashinfer/`), tags `:<tag>-ampere-<cu>` + `:latest`, and `--push`es. `VLLM_TAG` defaults
+`build_image_source.sh` builds vLLM from `vllm/` (three-stage: vLLM image, the vendored FlashInfer
+overlay from `flashinfer/`, then the famp_marlin `.so` from `flashampere/marlin/csrc`), tags
+`:<tag>-ampere-<cu>` + `:latest` (fork releases add `:X.Y`, e.g. `:0.3`), and `--push`es. `VLLM_TAG` defaults
 to `UPSTREAM_VLLM_VERSION`; `TORCH_CUDA_ARCH_LIST` defaults to `8.0 8.6` (all Ampere). It uses GHA
 registry cache only when run inside Actions; locally it uses docker's own layer cache.
 
@@ -62,6 +63,6 @@ older rigs) with `CUDA_VERSION=12.9.1 scripts/build_image_source.sh`.
 
 ```bash
 docker run --gpus all -p 8000:8000 \
-  ghcr.io/<owner>/vllm-ampere-optimized:v0.23.0-ampere-cu130 \
+  ghcr.io/<owner>/vllm-ampere-optimized:latest \
   --model <hf-id> --max-model-len 8192
 ```

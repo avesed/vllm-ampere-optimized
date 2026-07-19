@@ -16,10 +16,19 @@ Marlin can run it on Ampere, but vLLM gates its W4A8 path to Hopper: on an Amper
 
 - **W4A8 on Ampere** (`patches/0001`, upstream [#38066](https://github.com/vllm-project/vllm/pull/38066)) — int4-weight + int8-act through Marlin.
 - **int8 8-row Marlin decode tile** (`patches/0002`) — completes the W4A8 small-batch decode path.
-- **int8-QK prefill attention** (`flashinfer/`) — int8 QK^T + fp16 PV for head_dim-256 hybrids (Qwen3.5/3.6); a long-context prefill lever.
 - **AOT-compile cache-key fix** (`patches/0003`) — keys the torch.compile cache on the quant scheme.
 - **int8-act opt-in flag + MoE support** (`patches/0005`–`0006`) — `--marlin-input-dtype int8` (or env
   `VLLM_MARLIN_INPUT_DTYPE=int8`) turns a W4A16 checkpoint into W4A8 at serve time, for **dense and MoE**.
+- **Vendored famp Marlin kernel** (`flashampere/marlin/`) — the fork owns its W4A8/W4A16 Marlin GEMM
+  as a plugin-selected `.so` (bit-exact vs stock, built in the image for `sm_80`+`sm_86`), so the int8
+  path survives upstream refactors.
+- **flashampere attention backend** (`flashampere/`, opt-in `VLLM_FLASHAMPERE=1`) — composable Ampere
+  attention legs: fp16-accumulate PV prefill (GeForce RTX-30 only; +1–4% long-context TTFT), a vendored
+  XQA decode kernel for head_dim-512 (gemma-4) and MTP spec-verify, with bit-faithful fallback to stock
+  FA. A per-model-architecture registry auto-applies validated defaults.
+- **DSpark / DFlash speculative decoding** — native `--speculative-config '{"method":"dspark",...}'`
+  serving of block-diffusion draft heads (DeepSeek DSpark / z-lab DFlash); ready-made head:
+  [Avesed/Qwen3.6-27B-DSpark](https://huggingface.co/Avesed/Qwen3.6-27B-DSpark).
 
 `vllm/` and `flashinfer/` carry the edits baked in; `patches/` + `scripts/revendor.sh` replay them on an
 upstream bump, and `scripts/build_image_source.sh` builds + pushes the image.
@@ -51,8 +60,8 @@ Stock vLLM **won't load W4A8 on any Ampere GPU** — the fork is the only way to
   76.4%; NVFP4 96.0% / 77.8% (N=1000/500). Two serve
   requirements: **`--dtype bfloat16`** (under int8, Gemma's large activations overflow fp16 — down-proj GEMM
   dequant > 65504 → inf → NaN → blank output) and **`--attention-backend TRITON_ATTN`** (the diffusion mixed
-  causal/bidirectional mask isn't supported by flash-attn (wants FA4) or FlashInfer, so int8-QK doesn't apply —
-  the int8 win is the MoE GEMM alone). Run the
+  causal/bidirectional mask isn't supported by flash-attn (wants FA4) or FlashInfer — the int8 win is the
+  MoE GEMM alone). Run the
   [cyankiwi W4A16 ckpt](https://huggingface.co/cyankiwi/diffusiongemma-26B-A4B-it-AWQ-INT4) with
   `VLLM_MARLIN_INPUT_DTYPE=int8 --dtype bfloat16 --attention-backend TRITON_ATTN` over the chat endpoint.
 
