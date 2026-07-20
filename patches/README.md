@@ -9,7 +9,7 @@ The complete fork is built **from source** by the maintainer running `scripts/bu
 **locally** (vLLM from `vllm/` → sm_80+sm_86 fatbin + the fp16-PV FlashInfer from
 `flashinfer/`) and pushing to ghcr. There is **no CI auto-build**: the from-source CUDA build needs a
 GPU, and a self-hosted GPU runner on a public repo is a security risk (a malicious PR could run code
-on it). The only CI is the github-hosted `patch-drift-check` canary below. Native changes (`.cu/.cuh`)
+on it). The only CI is the github-hosted `watch-upstream` release reminder. Native changes (`.cu/.cuh`)
 ship only from source — which is exactly why this is vendored rather than a pure-Python overlay.
 
 ## The edits (the recipe)
@@ -64,5 +64,5 @@ git commit -am "revendor vllm@<tag> + flashinfer@<tag>"
 OWNER=<you> scripts/build_image_source.sh          # build from source + push to ghcr (local; no CI auto-build)
 ```
 
-`patch-drift-check.yml` replays the recipe onto the LATEST upstream tags daily (in temp checkouts,
-never touching the committed trees) and opens an issue if an anchor drifted, so refreshes are caught early.
+Recipe drift surfaces when `scripts/revendor.sh` replays the recipe during a re-vendor — every
+anchor/patch failure is loud (there is no scheduled drift canary; `watch-upstream` only reminds about new releases).
