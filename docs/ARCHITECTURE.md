@@ -17,8 +17,7 @@ tree because they share files with the fp16-PV patch.)
 `patches/` is no longer applied during a build — it is the **recipe** (`regenerate.py` for 0001 +
 `git apply` for the numbered patches + `flashinfer_int8/apply_to_source.py`) that regenerates the
 vendored trees from a fresh upstream checkout, so an upstream bump stays reproducible and drift is
-detectable (`scripts/revendor.sh`; the github-hosted `patch-drift-check` canary replays it daily). See
-`patches/README.md`.
+detectable (`scripts/revendor.sh`). See `patches/README.md`.
 
 ## One build path: local, from source
 
@@ -26,8 +25,8 @@ The image is built **from the vendored source on a local GPU box** (`scripts/bui
 three stages: vLLM → sm_80+sm_86 fatbin, the vendored FlashInfer overlay, then the famp_marlin `.so`
 compiled from `flashampere/marlin/csrc`) and pushed to ghcr **by the maintainer**. There is **no CI build**: a from-source vLLM CUDA build needs a GPU, and a self-hosted
 GPU runner on a **public** repo is a security risk — a malicious PR could run arbitrary code on the
-runner. The only CI is two github-hosted canaries (`watch-upstream`, `patch-drift-check`) that just
-open issues; they never build or push. See `docs/RELEASE.md`.
+runner. The only CI is one github-hosted canary (`watch-upstream`) that opens a one-time reminder issue
+per new upstream release; it never builds or pushes. See `docs/RELEASE.md`.
 
 ## Arch: `TORCH_CUDA_ARCH_LIST="8.0 8.6"` (all Ampere)
 

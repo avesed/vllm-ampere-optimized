@@ -3,14 +3,15 @@
 The fork is **vendored + built from source, locally**. There is **no CI auto-build**: a from-source
 vLLM CUDA build needs a GPU, and a self-hosted GPU runner on a public repo is a security risk
 (`self-hosted + public PRs = arbitrary code execution`). So the maintainer builds and pushes the image
-by hand. CI is only two **github-hosted** canaries that open issues — they never build or push.
+by hand. CI is a single **github-hosted** canary (`watch-upstream`) that opens a one-time reminder
+issue per new upstream release — it never builds or pushes.
 
 ## End to end
 
 ```
-watch-upstream.yml (cron, every 6h)
+watch-upstream.yml (cron, daily)
   └─ gh api .../releases/latest  ≠  UPSTREAM_VLLM_VERSION ?
-        └─ opens a "re-vendor" ISSUE (no build is triggered)
+        └─ opens ONE reminder ISSUE per new tag (deduped incl. closed; no build is triggered)
 
 maintainer, locally:
   1. scripts/revendor.sh <vllm_tag> <flashinfer_tag>   # only if upstream bumped; else skip
@@ -22,9 +23,6 @@ maintainer, locally:
        W4A16_CKPT=<w4a16> W4A8_CKPT=<w4a8> scripts/int8_cudagraph_regression.sh <img>   # asserts patch 0003
   5. echo <tag> > UPSTREAM_VLLM_VERSION && git commit   # bump the marker (revendor.sh already does this)
 
-patch-drift-check.yml (cron daily + on patches/** PRs)  # github-hosted; replays the recipe onto the
-  └─ git apply --check patches/* onto LATEST upstream    # latest tags in temp checkouts, opens an issue
-                                                          # if an anchor drifted. Never builds.
 ```
 
 No marker auto-bump, no partial-failure logic — the human runs the steps and commits the marker.
@@ -47,7 +45,7 @@ registry cache only when run inside Actions; locally it uses docker's own layer 
 
 1. **ghcr push** — `docker login ghcr.io -u <you>` with a PAT that has `write:packages`. After the
    first push, make the package public (Packages → settings) for anonymous `docker pull`.
-2. **Actions** — only `watch-upstream` + `patch-drift-check` run in CI; both need `issues: write`
+2. **Actions** — only `watch-upstream` runs in CI; it needs `issues: write`
    (Settings → Actions → General → Workflow permissions → Read and write). No `packages: write` token,
    no self-hosted runner, no secrets — the build never runs in CI.
 3. **Build box** — any Linux host with an NVIDIA GPU + docker buildx. The from-source build is heavy
