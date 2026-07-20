@@ -91,9 +91,13 @@ class MarlinLinearKernel(MPLinearKernel):
         is_a_8bit = c.act_type is not None and c.act_type.itemsize == 1
 
         if is_a_8bit:
-            assert c.weight_type in (scalar_types.uint4b8, scalar_types.int4), (
-                "W4A8-INT8 marlin only supports uint4b8 or int4 weights."
-            )
+            # W4A8 also covers asym AWQ (uint4 + runtime zp): the (kS8,kU4)
+            # kernel folds zp into the int8 operand via sub_zp_and_dequant.
+            assert c.weight_type in (
+                scalar_types.uint4b8,
+                scalar_types.int4,
+                scalar_types.uint4,
+            ), "W4A8-INT8 marlin supports uint4b8, int4, or uint4 weights."
 
         if c.act_type == torch.float8_e4m3fn:
             ops.marlin_int4_fp8_preprocess(getattr(layer, self.w_q_name), inplace=True)

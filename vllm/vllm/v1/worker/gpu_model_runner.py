@@ -183,6 +183,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.dspark import DSparkProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
@@ -617,6 +618,12 @@ class GPUModelRunner(
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_dspark():
+                # DSpark reuses the DFlash plumbing; must come before the
+                # use_eagle() branch since use_dspark() also makes use_eagle()
+                # return True.
+                self.drafter = DSparkProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
@@ -2505,6 +2512,14 @@ class GPUModelRunner(
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
+        dflash_drafter = (
+            self.drafter
+            if self.speculative_config and isinstance(self.drafter, DFlashProposer)
+            else None
+        )
+        if dflash_drafter is not None:
+            dflash_drafter.clear_draft_block_tables()
+
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
 
@@ -2519,6 +2534,11 @@ class GPUModelRunner(
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
+
+            if dflash_drafter is not None:
+                dflash_drafter.set_draft_block_table(
+                    kv_cache_gid, cm.block_table_tensor
+                )
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
@@ -7130,6 +7150,117 @@ class GPUModelRunner(
         for attn_groups in self.attn_groups:
             yield from attn_groups
 
+    @staticmethod
+    def _get_standard_kv_cache_orders(
+        attn_backend: type[AttentionBackend],
+        kv_cache_shape: tuple[int, ...],
+        num_blocks: int,
+    ) -> tuple[tuple[int, ...], tuple[str, ...] | None, tuple[str, ...] | None]:
+        try:
+            stride_order = attn_backend.get_kv_cache_stride_order()
+            assert len(stride_order) == len(kv_cache_shape)
+        except (AttributeError, NotImplementedError):
+            stride_order = tuple(range(len(kv_cache_shape)))
+        if len(kv_cache_shape) != 5:
+            return stride_order, None, None
+        if kv_cache_shape[:2] == (2, num_blocks):
+            public_order = ("kv", "block", "token", "head", "dim")
+        elif kv_cache_shape[:2] == (num_blocks, 2):
+            public_order = ("block", "kv", "token", "head", "dim")
+        else:
+            return stride_order, None, None
+        return stride_order, public_order, tuple(public_order[i] for i in stride_order)
+
+    @staticmethod
+    def _view_kv_cache_with_physical_order(
+        raw_tensor: torch.Tensor,
+        kv_cache_shape: tuple[int, ...],
+        public_order: tuple[str, ...],
+        physical_order: tuple[str, ...],
+    ) -> torch.Tensor:
+        # Backends can expose the same standard KV cache with different public
+        # shapes or physical orders. When they share one raw tensor, keep each
+        # backend's public shape but map it to the shared physical layout.
+        dim_sizes = dict(zip(public_order, kv_cache_shape))
+        physical_strides: dict[str, int] = {}
+        stride = 1
+        for dim in reversed(physical_order):
+            physical_strides[dim] = stride
+            stride *= dim_sizes[dim]
+        public_strides = tuple(physical_strides[dim] for dim in public_order)
+        return torch.as_strided(
+            raw_tensor,
+            size=kv_cache_shape,
+            stride=public_strides,
+        )
+
+    def _get_attention_kv_cache_shape(
+        self,
+        attn_backend: type[AttentionBackend],
+        kv_cache_spec: AttentionSpec,
+        num_blocks: int,
+        kernel_block_size: int,
+    ) -> tuple[int, ...]:
+        # For MLA with compression, storage_block_size != block_size.
+        if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
+            shape_block_size = kv_cache_spec.storage_block_size
+        else:
+            shape_block_size = kernel_block_size
+        # Skipped layers (--kv-cache-dtype-skip-layers) need the
+        # unquantized shape.
+        layer_cache_dtype_str = (
+            "auto"
+            if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+            else getattr(kv_cache_spec, "cache_dtype_str", None)
+            or self.cache_config.cache_dtype
+        )
+        return attn_backend.get_kv_cache_shape(
+            num_blocks,
+            shape_block_size,
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+            cache_dtype_str=layer_cache_dtype_str,
+        )
+
+    def _get_raw_tensor_physical_orders(
+        self,
+        kv_cache_raw_tensors: dict[str, torch.Tensor],
+        kernel_block_sizes: list[int],
+        layer_packing: dict[str, tuple[int, int]],
+    ) -> dict[int, set[tuple[str, ...]]]:
+        raw_tensor_physical_orders: dict[int, set[tuple[str, ...]]] = defaultdict(set)
+        for group in self._kv_cache_spec_attn_group_iterator():
+            kv_cache_spec = group.kv_cache_spec
+            if group.kv_cache_group_id == len(kernel_block_sizes) or not isinstance(
+                kv_cache_spec, AttentionSpec
+            ):
+                continue
+            kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+            for layer_name in group.layer_names:
+                if (
+                    layer_name in self.runner_only_attn_layers
+                    or layer_name not in kv_cache_raw_tensors
+                    or layer_name in layer_packing
+                ):
+                    continue
+                raw_tensor = kv_cache_raw_tensors[layer_name]
+                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                num_blocks *= kv_cache_spec.block_size // kernel_block_size
+                kv_cache_shape = self._get_attention_kv_cache_shape(
+                    group.backend,
+                    kv_cache_spec,
+                    num_blocks,
+                    kernel_block_size,
+                )
+                _, _, physical_order = self._get_standard_kv_cache_orders(
+                    group.backend,
+                    kv_cache_shape,
+                    num_blocks,
+                )
+                if physical_order is not None:
+                    raw_tensor_physical_orders[id(raw_tensor)].add(physical_order)
+        return raw_tensor_physical_orders
+
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_raw_tensors: dict[str, torch.Tensor],
@@ -7156,6 +7287,10 @@ class GPUModelRunner(
             if kv_tensor.block_stride > 0:
                 for ln in kv_tensor.shared_by:
                     layer_packing[ln] = (kv_tensor.offset, kv_tensor.block_stride)
+
+        raw_tensor_physical_orders = self._get_raw_tensor_physical_orders(
+            kv_cache_raw_tensors, kernel_block_sizes, layer_packing
+        )
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             attn_backend = group.backend
@@ -7181,37 +7316,48 @@ class GPUModelRunner(
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
-                    # For MLA with compression, storage_block_size != block_size
-                    if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:
-                        shape_block_size = kv_cache_spec.storage_block_size
-                    else:
-                        shape_block_size = kernel_block_size
-
-                    # Skipped layers (--kv-cache-dtype-skip-layers) need
-                    # the unquantized shape.
-                    layer_cache_dtype_str = (
-                        "auto"
-                        if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-                        else getattr(
-                            kv_cache_spec,
-                            "cache_dtype_str",
-                            None,
-                        )
-                        or self.cache_config.cache_dtype
-                    )
-                    kv_cache_shape = attn_backend.get_kv_cache_shape(
+                    kv_cache_shape = self._get_attention_kv_cache_shape(
+                        attn_backend,
+                        kv_cache_spec,
                         kernel_num_blocks,
-                        shape_block_size,
-                        kv_cache_spec.num_kv_heads,
-                        kv_cache_spec.head_size,
-                        cache_dtype_str=layer_cache_dtype_str,
+                        kernel_block_size,
                     )
-                    try:
-                        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
-                        assert len(kv_cache_stride_order) == len(kv_cache_shape)
-                    except (AttributeError, NotImplementedError):
-                        kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                    (
+                        kv_cache_stride_order,
+                        public_order,
+                        physical_order,
+                    ) = self._get_standard_kv_cache_orders(
+                        attn_backend,
+                        kv_cache_shape,
+                        kernel_num_blocks,
+                    )
                     raw_tensor = kv_cache_raw_tensors[layer_name]
+                    # Backends sharing one raw tensor may disagree on the
+                    # physical KV layout (e.g. DFlash draft layers grouped with
+                    # target layers served by a different backend). Keep this
+                    # layer's public shape but map it onto the shared physical
+                    # order so all sharers address the same bytes consistently.
+                    shared_orders = raw_tensor_physical_orders[id(raw_tensor)]
+                    block_major_orders = (
+                        order for order in shared_orders if order[:2] == ("block", "kv")
+                    )
+                    shared_physical_order = next(
+                        iter(sorted(block_major_orders)), None
+                    ) or next(iter(sorted(shared_orders)), None)
+                    if (
+                        packing is None
+                        and public_order is not None
+                        and shared_physical_order is not None
+                        and physical_order != shared_physical_order
+                        and kv_cache_spec.page_size_padded is None
+                    ):
+                        kv_caches[layer_name] = self._view_kv_cache_with_physical_order(
+                            raw_tensor.view(kv_cache_spec.dtype),
+                            kv_cache_shape,
+                            public_order,
+                            shared_physical_order,
+                        )
+                        continue
                     kv_caches[layer_name] = _reshape_attention_kv_cache(
                         raw_tensor,
                         kv_cache_spec,

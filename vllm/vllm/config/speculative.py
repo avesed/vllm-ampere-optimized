@@ -56,7 +56,7 @@ MTPModelTypes = Literal[
     "gemma4_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
-DFlashModelTypes = Literal["dflash"]
+DFlashModelTypes = Literal["dflash", "dspark"]
 DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
@@ -313,6 +313,14 @@ class SpeculativeConfig:
                 "eagle_aux_hidden_state_layer_ids",
                 None,
             )
+            if not layer_ids:
+                dflash_config = getattr(
+                    self.draft_model_config.hf_config, "dflash_config", None
+                )
+                if dflash_config and isinstance(dflash_config, dict):
+                    layer_ids = [
+                        i + 1 for i in dflash_config.get("target_layer_ids", [])
+                    ]
             if layer_ids is not None:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
@@ -875,8 +883,18 @@ class SpeculativeConfig:
                         f"Unsupported speculative method: '{self.method}'"
                     )
 
+                # DSpark heads served on the V1 DFlash-family path declare a
+                # registered draft arch (DFlashDraftModel / Gemma4DSparkModel)
+                # and are wrapped in EAGLEConfig like dflash; upstream's
+                # Qwen3DSparkModel and in-target DeepSeek-V4 dspark surfaces
+                # are left untouched for the V2 model runner.
+                dspark_v1_head = self.method == "dspark" and any(
+                    arch in ("DFlashDraftModel", "Gemma4DSparkModel")
+                    for arch in self.draft_model_config.architectures
+                )
+
                 # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3", "dflash") or dspark_v1_head:
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
                     from vllm.transformers_utils.configs.speculators import (
                         SpeculatorsConfig,
@@ -896,8 +914,10 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if self.method == "dspark" and (
-                    "Qwen3DSparkModel" not in self.draft_model_config.architectures
+                if (
+                    self.method == "dspark"
+                    and not dspark_v1_head
+                    and "Qwen3DSparkModel" not in self.draft_model_config.architectures
                 ):
                     # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
                     # and its weights ship in the target checkpoint.
@@ -909,6 +929,22 @@ class SpeculativeConfig:
 
                 if self.method in ("dflash", "dspark"):
                     self.parallel_drafting = True
+
+                if dspark_v1_head:
+                    hf = self.draft_model_config.hf_config
+                    if not getattr(hf, "dflash_config", None):
+                        bs = int(getattr(hf, "block_size"))
+                        hf.dflash_config = {
+                            "mask_token_id": int(getattr(hf, "mask_token_id")),
+                            "markov_rank": int(getattr(hf, "markov_rank", 0)),
+                            "block_size": bs,
+                            "use_aux_hidden_state": True,
+                            "target_layer_ids": [
+                                i - 1 for i in getattr(hf, "target_layer_ids")
+                            ],
+                        }
+                    if not self.num_speculative_tokens:
+                        self.num_speculative_tokens = int(getattr(hf, "block_size"))
 
                 if self.num_speculative_tokens is not None and hasattr(
                     self.draft_model_config.hf_config, "num_lookahead_tokens"
@@ -1240,6 +1276,10 @@ class SpeculativeConfig:
         # target model hidden states"
         # TODO(ben): Refactor this so the naming is clearer
         return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+
+    def requires_eagle_cache_drop(self) -> bool:
+        """Whether prefix cache hits must drop one block for hidden states."""
+        return self.use_eagle() and not (self.use_dflash() or self.use_dspark())
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"

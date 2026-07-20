@@ -22,6 +22,7 @@ if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
     from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
         compile_flash_attn_varlen_func_from_specs,
+        flash_attn_kvcache_verify,
         flash_attn_varlen_func,
         get_scheduler_metadata,
     )
@@ -33,6 +34,7 @@ elif current_platform.is_xpu():
     reshape_and_cache_flash = ops.reshape_and_cache_flash
     flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func  # type: ignore[assignment]
     compile_flash_attn_varlen_func_from_specs = None  # type: ignore[assignment]
+    flash_attn_kvcache_verify = None  # type: ignore[assignment]
     get_scheduler_metadata = xpu_ops.get_scheduler_metadata  # type: ignore[assignment]
 elif current_platform.is_rocm():
     try:
@@ -51,6 +53,8 @@ elif current_platform.is_rocm():
             )
 
         compile_flash_attn_varlen_func_from_specs = None  # type: ignore[assignment]
+
+    flash_attn_kvcache_verify = None  # type: ignore[assignment]
 
     # ROCm doesn't use scheduler metadata (FA3 feature), provide stub
     def get_scheduler_metadata(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]

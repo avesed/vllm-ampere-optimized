@@ -35,6 +35,7 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
+        flash_attn_kvcache_verify,
         flash_attn_supports_sinks,
         flash_attn_varlen_func,
         get_scheduler_metadata,
@@ -948,6 +949,53 @@ class FlashAttentionImpl(AttentionImpl):
                         sliding_window_size is not None and sliding_window_size[1] >= 0
                     )
                     causal = not has_window
+
+                # [Ampere fork] MTP spec-decode verify (uniform q=1+K over a long
+                # paged KV) -> FA2 fwd_kvcache (FlashDecoding split-KV). FA2 varlen
+                # with q>1 does not KV-split (occupancy-starved at low num_kv_heads /
+                # head_dim=256, cost grows with KV length); fwd_kvcache is captured
+                # into the FULL cudagraph (proven capturable at num_splits=0) and
+                # recovers MTP from net-negative to net-positive at long context
+                # (9B: +54% @16k, +76% @32k decode). Every AND-term below falls back
+                # to the unchanged varlen call, so prefill / chunked-prefill / mixed
+                # batches / fp8-KV / SWA / alibi / softcap / sinks / FA4 mask_mod
+                # (mm_prefix / R-SWA) / dynamic-causal are untouched.
+                q_len = max_seqlen_q
+                num_reqs = seqused_k.shape[0]
+                if (
+                    envs.VLLM_FA2_KVCACHE_VERIFY
+                    and flash_attn_kvcache_verify is not None
+                    and self.vllm_flash_attn_version == 2
+                    and q_len > 1
+                    and num_actual_tokens == num_reqs * q_len
+                    and causal is True
+                    and dynamic_causal is None
+                    and mm_prefix_ranges is None
+                    and attn_metadata.rswa_prefix_lens is None
+                    and (
+                        sliding_window_size is None
+                        or sliding_window_size == [-1, -1]
+                    )
+                    and self.alibi_slopes is None
+                    and self.logits_soft_cap == 0
+                    and self.sinks is None
+                    and q_descale is None
+                    and not is_quantized_kv_cache(self.kv_cache_dtype)
+                    and not self.batch_invariant_enabled
+                ):
+                    flash_attn_kvcache_verify(
+                        q=query[:num_actual_tokens],
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        out=output[:num_actual_tokens],
+                        seqlens_k=seqused_k,
+                        block_table=block_table,
+                        num_reqs=num_reqs,
+                        q_len=q_len,
+                        softmax_scale=self.scale,
+                        causal=causal,
+                    )
+                    return output
 
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],

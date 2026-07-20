@@ -13,6 +13,11 @@ ARG FAMP_MARLIN_ARCH="8.0,8.6"
 # arches (non-Ampere GPUs fall back to stock _C Marlin, bit-identically).
 ENV FAMP_MARLIN_ARCH=${FAMP_MARLIN_ARCH}
 
+# Pin Model Runner V1: 0.25.1 defaults dense generate models (incl. quantized) to MRv2, which
+# bypasses the fork's V1 spec-decode stack (dspark/dflash/MTP hooks). Explicit env wins over the
+# per-method forcing, so users can opt into V2 with -e VLLM_USE_V2_MODEL_RUNNER=1.
+ENV VLLM_USE_V2_MODEL_RUNNER=0
+
 COPY flashampere/marlin /opt/famp/flashampere/marlin
 RUN set -eux; \
     rm -rf /opt/famp/flashampere/marlin/build; \
