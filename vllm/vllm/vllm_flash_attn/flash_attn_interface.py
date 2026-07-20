@@ -200,12 +200,18 @@ def flash_attn_varlen_func(
     k_descale=None,
     v_descale=None,
     num_splits: int = 0,
+    # FA4 Only
+    output_scale=None,
     # Version selector
     fa_version: int = DEFAULT_FA_VERSION,
     s_aux=None,
     cp_world_size=1,
     cp_rank=0,
     cp_tot_seqused_k=None,
+    # FA4 only
+    mask_mod=None,
+    aux_tensors=None,
+    dynamic_causal: "torch.Tensor | None" = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -269,6 +275,11 @@ def flash_attn_varlen_func(
         "seqused_k must be provided if block_table is provided"
     )
 
+    assert output_scale is None or fa_version == 4, (
+        f"Fused FP8 output (output_scale) is only supported by FA4, "
+        f"got fa_version={fa_version}"
+    )
+
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     # custom op does not support non-tuple input
@@ -297,6 +308,10 @@ def flash_attn_varlen_func(
             raise NotImplementedError("FA2 does not support s_aux")
         if num_splits > 1:
             raise NotImplementedError("FA2 does not support num_splits > 1")
+        if mask_mod is not None:
+            raise NotImplementedError("FA2 does not support mask_mod")
+        if aux_tensors is not None:
+            raise NotImplementedError("FA2 does not support aux_tensors")
         out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
             q,
             k,
@@ -325,6 +340,10 @@ def flash_attn_varlen_func(
         )
     elif fa_version == 3:
         assert alibi_slopes is None, "Alibi is not supported in FA3"
+        if mask_mod is not None:
+            raise NotImplementedError("FA3 does not support mask_mod")
+        if aux_tensors is not None:
+            raise NotImplementedError("FA3 does not support aux_tensors")
         out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
             q,
             k,
@@ -381,6 +400,7 @@ def flash_attn_varlen_func(
             page_table=block_table,
             softmax_scale=softmax_scale,
             causal=causal,
+            dynamic_causal=dynamic_causal,
             softcap=softcap,
             window_size_left=real_window_size[0] if real_window_size[0] >= 0 else None,
             window_size_right=real_window_size[1] if real_window_size[1] >= 0 else None,
@@ -388,76 +408,73 @@ def flash_attn_varlen_func(
             return_lse=return_softmax_lse,
             out=out,
             learnable_sink=s_aux,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            output_scale=output_scale,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")
     return (out, softmax_lse) if return_softmax_lse else out
 
 
-_FWD_KVCACHE_ARITY_OK = False
-
-
-def flash_attn_kvcache_verify(
-    q,
-    k_cache,
-    v_cache,
-    out,
-    seqlens_k,
-    block_table,
-    num_reqs,
-    q_len,
-    softmax_scale,
-    causal=True,
-):
-    """FlashDecoding split-KV path for uniform q=1+K MTP spec-verify batches.
-
-    FA2 ``flash_attn_varlen_func`` with q>1 runs splitkv with only batch*Hkv
-    tiles (occupancy-starved at low num_kv_heads / head_dim=256, cost grows with
-    KV length). ``fwd_kvcache`` adds the split-combine kernel so it actually
-    splits over KV (~4.3x at 32k ctx). The verify tokens are already in the paged
-    cache (written by reshape_and_cache before attention), so k/v are None and
-    ``seqlens_k`` is the full per-request length. Reshapes the flat
-    [num_actual_tokens, H, D] query to [num_reqs, q_len, H, D] (free view on the
-    contiguous slice) and writes ``out`` in place.
-    """
-    global _FWD_KVCACHE_ARITY_OK
-    if not _FWD_KVCACHE_ARITY_OK:
-        n_args = len(torch.ops._vllm_fa2_C.fwd_kvcache.default._schema.arguments)
-        assert n_args == 20, (
-            f"_vllm_fa2_C.fwd_kvcache schema arity {n_args} != 20; "
-            "flash_attn_kvcache_verify positional args need review"
+def compile_flash_attn_varlen_func_from_specs(
+    *,
+    q_shape: tuple[int, ...],
+    k_shape: tuple[int, ...],
+    v_shape: tuple[int, ...],
+    q_dtype: torch.dtype,
+    v_stride: tuple[int, ...] | None = None,
+    cu_seqlens_q_shape: tuple[int, ...] | None = None,
+    cu_seqlens_k_shape: tuple[int, ...] | None = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+    dropout_p: float = 0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size: list[int] | None = None,
+    deterministic=False,
+    return_softmax_lse=False,
+    num_splits: int = 0,
+    fa_version: int = DEFAULT_FA_VERSION,
+) -> None:
+    if fa_version != 4:
+        raise ValueError(
+            f"Compile-only FlashAttention is only supported for FA4, got FA{fa_version}"
         )
-        _FWD_KVCACHE_ARITY_OK = True
-    h, d = q.shape[-2], q.shape[-1]
-    q4 = q.view(num_reqs, q_len, h, d)
-    out4 = out.view(num_reqs, q_len, h, d)
-    # positional order == _vllm_fa2_C.fwd_kvcache schema:
-    # (q, kcache, vcache, k, v, seqlens_k, rotary_cos, rotary_sin, cache_batch_idx,
-    #  leftpad_k, block_table, alibi_slopes, out, softmax_scale, is_causal,
-    #  window_size_left, window_size_right, softcap, is_rotary_interleaved, num_splits)
-    torch.ops._vllm_fa2_C.fwd_kvcache(
-        q4,
-        k_cache,
-        v_cache,
-        None,  # k: verify tokens already written to cache
-        None,  # v
-        seqlens_k,
-        None,  # rotary_cos
-        None,  # rotary_sin
-        None,  # cache_batch_idx
-        None,  # leftpad_k
-        block_table,
-        None,  # alibi_slopes
-        out4,  # written in place; shares storage with `out`
-        softmax_scale,
-        causal,
-        -1,  # window_size_left (full context)
-        -1,  # window_size_right
-        0.0,  # softcap off
-        False,  # is_rotary_interleaved
-        0,  # num_splits = 0 -> kernel auto-splits over KV
+    if dropout_p != 0.0:
+        raise NotImplementedError("FA4 compile-only wrapper does not support dropout")
+    del deterministic
+
+    from vllm.vllm_flash_attn.cute.interface import (
+        compile_flash_attn_varlen_func_from_specs as _fa4_compile_flash_attn_varlen_func_from_specs,
     )
-    return out
+
+    real_window_size: tuple[int, int]
+    if window_size is None:
+        real_window_size = (-1, -1)
+    else:
+        assert len(window_size) == 2
+        real_window_size = (window_size[0], window_size[1])
+
+    if softmax_scale is None:
+        softmax_scale = q_shape[-1] ** (-0.5)
+
+    return _fa4_compile_flash_attn_varlen_func_from_specs(
+        q_shape=q_shape,
+        k_shape=k_shape,
+        v_shape=v_shape,
+        q_dtype=q_dtype,
+        v_stride=v_stride,
+        cu_seqlens_q_shape=cu_seqlens_q_shape,
+        cu_seqlens_k_shape=cu_seqlens_k_shape,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=real_window_size,
+        num_splits=num_splits,
+        return_lse=return_softmax_lse,
+    )
 
 
 def sparse_attn_func(

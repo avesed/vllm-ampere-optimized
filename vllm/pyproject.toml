@@ -46,11 +46,6 @@ vllm = "vllm.entrypoints.cli.main:main"
 [project.entry-points."vllm.general_plugins"]
 lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
 lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
-# Ampere fork (patch 0008): flashampere — the unified Ampere attention backend (fp16-PV prefill,
-# fp16-served + bf16-served, + inherited MTP-verify fix in one Backend.CUSTOM impl). Loaded in EVERY
-# process so CUSTOM is registered in each TP/PP worker before backend selection. Opt-in via
-# VLLM_FLASHAMPERE=1. (The old patch-0004 int8qk standalone was removed: int8-QK is net-negative.)
-flashampere = "vllm.v1.attention.backends.flashampere.backend:register_flashampere"
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
@@ -134,8 +129,9 @@ extend-exclude = ["tests/models/fixtures/*", "tests/prompts/*", "tests/tokenizer
     "docs/governance/process.md", "docs/assets/contributing/vllm_bench_serve_timeline.html", 
     "tests/v1/engine/test_fast_incdec_prefix_err.py", ".git/*", "csrc/cpu/sgl-kernels/*",
     "rust/src/chat/src/renderer/deepseek_v32/fixtures/*",
-    "rust/src/tool-parser/src/gemma4.rs", "rust/src/text/src/output/decoded.rs",
-    "rust/src/tokenizer/src/incremental.rs", "rust/src/reasoning-parser/src/tests.rs"]
+    "rust/src/parser/src/tool/gemma4.rs", "rust/src/parser/src/unified/gemma4.rs",
+    "rust/src/text/src/output/decoded.rs",
+    "rust/src/tokenizer/src/incremental.rs", "rust/src/parser/src/reasoning/tests.rs"]
 ignore-hidden = false
 
 [tool.typos.default]
@@ -167,6 +163,8 @@ dout = "dout"
 Pn = "Pn"
 arange = "arange"
 thw = "thw"
+# temporal position ids (parallels hpos/wpos in vision RoPE)
+tpos = "tpos"
 subtile = "subtile"
 HSA = "HSA"
 setp = "setp"

@@ -72,17 +72,10 @@ class EAGLEConfig(PretrainedConfig):
                 else f"DFlash{arch}"
                 for arch in self.model.architectures
             ]
-        elif method == "dspark":
-            assert self.model is not None, (
-                "model should not be None when method is dspark"
-            )
-            # DSpark draft ckpts already declare their own arch
-            # (e.g. Gemma4DSparkModel); pass it through unchanged.
-            kwargs["architectures"] = list(self.model.architectures)
         else:
             raise ValueError(
                 f"Invalid method {method}. Supported methods are "
-                "eagle, eagle3, dflash, and dspark."
+                "eagle, eagle3, and dflash."
             )
 
         super().__init__(**kwargs)
