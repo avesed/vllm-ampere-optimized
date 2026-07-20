@@ -93,6 +93,8 @@ if TYPE_CHECKING:
     VLLM_FLASHAMPERE_BF16CVT: bool = True
     VLLM_FLASHAMPERE_XQA_VERIFY: bool = False
     VLLM_FLASHAMPERE_SAGE: bool = False
+    VLLM_FAMP_OWN_PREFILL: bool = False
+    VLLM_FAMP_XQA_HD512: bool = False
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -609,6 +611,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fwd_kvcache verify). Opt-in (default off) until e2e MTP serve + cudagraph are validated.
     "VLLM_FLASHAMPERE_XQA_VERIFY": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE_XQA_VERIFY", "0"))),
     "VLLM_FLASHAMPERE_SAGE": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE_SAGE", "0"))),
+    # famp hd512 (gemma4 full-attn) opt-ins, read directly in the flashampere kernels layer.
+    # OWN_PREFILL = famp's vendored FA2 prefill; XQA_HD512 = famp's XQA hd512 decode. Registered
+    # here so 0.25.1's unknown-env-var check does not warn; both default off.
+    "VLLM_FAMP_OWN_PREFILL": lambda: bool(int(os.getenv("VLLM_FAMP_OWN_PREFILL", "0"))),
+    "VLLM_FAMP_XQA_HD512": lambda: bool(int(os.getenv("VLLM_FAMP_XQA_HD512", "0"))),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel Xe2/Xe3; the non-TD branch is dead-code-eliminated at Triton

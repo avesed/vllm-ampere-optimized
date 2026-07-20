@@ -72,7 +72,7 @@ docker run --gpus all -p 8000:8000 \
   ghcr.io/avesed/vllm-ampere-optimized:latest \
   --model Avesed/Qwen3.6-27B-INT4-W4A16 --marlin-input-dtype int8 --pipeline-parallel-size 2 --max-model-len 8192
 ```
-*(cu130 image needs NVIDIA driver ≥ 580.65. With NVLink use `--tensor-parallel-size 2`; single GPU, drop both.)*
+*(cu130 image needs NVIDIA driver ≥ 580.65. With NVLink use `--tensor-parallel-size 2`; single GPU, drop both. On a **no-NVLink** multi-GPU box, prefer `-pp 2`, or add `--disable-custom-all-reduce` if you use `-tp 2` — custom all-reduce over PCIe + `expandable_segments` can crash at startup.)*
 
 Run a plain **W4A16** checkpoint as **W4A8** by adding **`--marlin-input-dtype int8`** (dense or MoE).
 
