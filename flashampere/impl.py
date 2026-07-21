@@ -72,6 +72,26 @@ class FlashAmpereImpl(FlashAttentionImpl):
         except Exception:
             self._fc_max_num_seqs = None
 
+    @staticmethod
+    def _nonplain_metadata(m) -> bool:
+        """0.25.1 FlashAttentionMetadata drift the famp legs do NOT implement — batch-level
+        masking/window state the fast kernels would silently ignore (correctness hazard for
+        VL prefix-LM / R-SWA batches):
+          - causal became bool | Tensor (per-request dynamic causality; legs assume bool),
+          - mm_prefix_range_tensor (multimodal bidirectional prefix ranges),
+          - sliding_window on the METADATA (batch-level override of the impl's static window),
+          - rswa_prefix_lens / rswa_window / rswa_window_tensor (Reference-SWA masking).
+        Any of these set/non-default -> sink to stock FA (bit-faithful; FA implements them).
+        getattr defaults keep this a no-op on 0.23-era metadata (fields absent)."""
+        return (
+            isinstance(getattr(m, "causal", True), torch.Tensor)
+            or getattr(m, "mm_prefix_range_tensor", None) is not None
+            or getattr(m, "sliding_window", None) is not None
+            or getattr(m, "rswa_prefix_lens", None) is not None
+            or getattr(m, "rswa_window", None) is not None
+            or getattr(m, "rswa_window_tensor", None) is not None
+        )
+
     def _classify(self, m) -> Phase:
         """Per-call phase from CPU-only metadata scalars (capture-safe: no .item()/.tolist())."""
         if getattr(m, "use_cascade", False):
@@ -99,11 +119,18 @@ class FlashAmpereImpl(FlashAttentionImpl):
     ) -> torch.Tensor:
         m = attn_metadata
         # Universal hard fallbacks -> stock FA (cannot be expressed in the structural key).
+        # NB: the _nonplain_metadata sink is scoped to head_size<=256. For hd512 (Gemma4 full-attn)
+        # stock FA REJECTS the head size (>256), so sinking would crash — and it must not: Gemma4
+        # CLEARS mm_prefix for the full-attn (hd512) layers (_clear_mm_prefix_for_full_attn_layers),
+        # so they are plain causal, which the famp hd512 legs handle. hd512 therefore always routes
+        # to decode_hd512 / fp16pv_prefill below, never to FA. (The hd256 sliding layers keep the
+        # guard -> stock FA/TRITON handles their real mm_prefix/SWA.)
         if (
             m is None
             or output_scale is not None
             or output_block_scale is not None
             or getattr(self, "dcp_world_size", 1) > 1
+            or (self._nonplain_metadata(m) and self.head_size <= 256)
         ):
             return super().forward(
                 layer, query, key, value, kv_cache, m, output,

@@ -2192,6 +2192,9 @@ CUBIN_EXPORT __global__
     };
 #if BEAM_WIDTH == 1
     VCachePageIndices pageIdx = VCachePageIndices::filled(kBAD_PAGE_INDEX);
+    // famp gemm0-once: page indices captured per V smem buffer when it is prefetched, so a later
+    // chunk reload of the same tile can re-address the V cache without re-deriving the page cursor.
+    VCachePageIndices savedVPage[nbVBuffers];
 #endif
     auto loadPages = [&](uint32_t idxPageBeg) mutable {
 #if BEAM_WIDTH == 1
@@ -2225,15 +2228,26 @@ CUBIN_EXPORT __global__
       return mha::tuple<uint32_t, uint32_t, uint32_t, uint32_t>(seqIterNext, xIterNext, vIterNext,
                                                                 idxBeamNext);
     };
-    auto loadVTilePart = [&](uint32_t seqIter, uint32_t xIter, uint32_t vIter,
-                             uint32_t idxBeam) mutable {  // @fixme: merge three iteration
+    auto loadVTilePart = [&](uint32_t seqIter, uint32_t xIter, uint32_t vIter, uint32_t idxBeam,
+                             uint32_t idxVChunk = 0,
+                             bool reloadCurrent = false) mutable {  // @fixme: merge three iteration
                                                           // parameters into idxVTileGlb.
+      // famp gemm0-once: reloadCurrent reloads the CURRENT V buffer with the idxVChunk-th V half
+      // (cols [headElems*idxVChunk : headElems*(idxVChunk+1)]) of the SAME tile, reusing the page
+      // captured when this buffer was prefetched. reloadCurrent is only used for the 512 wide head
+      // (nbVChunks==2, BEAM_WIDTH==1); it must not advance the page cursor.
       assert(idxBeam < beamWidth);
       assert(seqIter % nbSubSeqPerSeq == seqIterInit % nbSubSeqPerSeq);
-      auto const idxNextSMemVBuf = idxCurrSMemVBuf.next();
+      auto const idxNextSMemVBuf =
+          reloadCurrent ? uint32_t(idxCurrSMemVBuf) : uint32_t(idxCurrSMemVBuf.next());
       auto& dst = getSmemVTile(idxNextSMemVBuf);
 #if ENABLE_4BIT_KV_CACHE
       auto& dstSf = getSmemVSfTile(idxNextSMemVBuf);
+#endif
+#if BEAM_WIDTH == 1
+      if (!reloadCurrent) {
+        savedVPage[idxNextSMemVBuf] = pageIdx;
+      }
 #endif
       uint32_t const dstHeadOffset = 0;
       constexpr bool vSwizzle = true;
@@ -2243,9 +2257,15 @@ CUBIN_EXPORT __global__
       uint32_t const tokenOffset = seqOffset % tokensPerPage;
 
 #if BEAM_WIDTH == 1
+      // famp gemm0-once: shift the V pool base by headElems*idxVChunk elements to read the
+      // idxVChunk-th V half (identical to the two-launch's v_cache[..., headElems*c:] base shift).
+      GMemCacheHead const* const vPoolChunk = reinterpret_cast<GMemCacheHead const*>(
+          reinterpret_cast<CacheElemConverter::ContainerType const*>(cacheList.vCacheVLLM) +
+          exactDiv(headElems, CacheElemConverter::ElemsPerContainer) * idxVChunk);
+      VCachePageIndices const vPageUse = reloadCurrent ? savedVPage[idxNextSMemVBuf] : pageIdx;
       HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerVTile> const src{
-          cacheList.vCacheVLLM, pageIdx,         tokenOffset,   idxHeadGrp,
-          kv_stride_page,       kv_stride_token, kv_stride_head};
+          vPoolChunk,     vPageUse,        tokenOffset,   idxHeadGrp,
+          kv_stride_page, kv_stride_token, kv_stride_head};
 #if ENABLE_4BIT_KV_CACHE
       HeadPtr<GMemCacheHeadSf const, tokensPerPage, nbPagesPerVTile> const srcSf{
           cacheList.vSfCacheVLLM, pageIdx,         tokenOffset,   idxHeadGrp,
@@ -2323,6 +2343,8 @@ CUBIN_EXPORT __global__
       wait_parity<grpLoadV>(pWarpGrpBar, getAndFlip<grpLoadV>(warpGrpBarParityNext));
 #endif
       constexpr uint32_t xIterSeqStride = cacheVTileSeqStride * nbVItersPerXIter;
+      // famp gemm0-once: a chunk reload reuses the current tile's page; do NOT advance the cursor.
+      if (!reloadCurrent)
       if constexpr (xIterSeqStride <= tokensPerPage) {
         uint32_t const nbXItersPerPage = exactDiv(tokensPerPage, xIterSeqStride);
         assert(nbXItersPerPage <= nbXItersPerCtaTile);
@@ -2405,7 +2427,9 @@ CUBIN_EXPORT __global__
     ThrdRegRowMax globalRowSum;
     globalRowSum.fill(0);
     // the accumulator (famp fp16-PV: half when FP16_PV, for the gemm1 PV spill relief)
-    Gemm1Acc acc{};
+    // famp gemm0-once: one acc per V chunk (nbVChunks==2 for the 512 wide head, else 1). gemm0/K
+    // is loaded+scored ONCE; gemm1 covers both V halves (cols [0:256] and [256:512]) in this loop.
+    Gemm1Acc acc[nbVChunks]{};
     if (grpLoadV) {
       unused(pWarpGrpBar->arrive());
     }
@@ -2518,7 +2542,9 @@ CUBIN_EXPORT __global__
                   ThrdRegRowMax const accRowScales = expf(globalRowMaxOld - globalRowMax);
                   globalRowSum = globalRowSum * accRowScales;
                   // @fixme: when tmpAcc is used, this can be delayed.
-                  rescaleAcc(warp, acc, accRowNeedRescaleMask, accRowScales);
+#pragma unroll
+                  for (uint32_t c = 0; c < nbVChunks; c++)
+                    rescaleAcc(warp, acc[c], accRowNeedRescaleMask, accRowScales);
                 }
                 if (!enableMicroFastPath || !skipXRowRescale) {
                   xRowScales = skipXRowRescale ? xRowScales : expf(xTileRowMax - globalRowMax);
@@ -2540,12 +2566,30 @@ CUBIN_EXPORT __global__
 
             // do computation from shared memory X and V tiles
 #if BEAM_WIDTH == 1
-            smemXVPartGemm<CacheElem>(warp, acc, skipXRowRescale, xRowNeedRescaleMask, xRowScales,
+            // chunk 0: V cols [0:headElems] -> acc[0] (the current V smem tile).
+            smemXVPartGemm<CacheElem>(warp, acc[0], skipXRowRescale, xRowNeedRescaleMask, xRowScales,
                                       smemXTile, idxVTile, smemVTile,
 #if ENABLE_4BIT_KV_CACHE
                                       smemVSfPart,
 #endif
                                       grpLoadV ? warpIdxInGrp : 0);
+            // famp gemm0-once wide head: reload the same tile's higher V halves (cols
+            // [headElems*c : headElems*(c+1)]) into the just-consumed V smem buffer and run gemm1
+            // into acc[c]. This re-reads V (already brought to L2 by chunk 0) but NOT K, so the
+            // per-decode traffic drops from 2*K+V (two launches) to K+V (one launch).
+#pragma unroll
+            for (uint32_t c = 1; c < nbVChunks; c++) {
+              loadVTilePart(seqIter, xIter, vIter, idxBeam, c, /*reloadCurrent=*/true);
+              ldgsts::commitGroup();
+              ldgsts::waitGroup<0>();
+              smemXVPartGemm<CacheElem>(warp, acc[c], skipXRowRescale, xRowNeedRescaleMask,
+                                        xRowScales, smemXTile, idxVTile,
+                                        getSmemVTile(idxCurrSMemVBuf),
+#if ENABLE_4BIT_KV_CACHE
+                                        smemVSfPart,
+#endif
+                                        grpLoadV ? warpIdxInGrp : 0);
+            }
 #else
             WarpAcc tmpAcc{};
             smemXVPartGemm<CacheElem>(warp, tmpAcc, skipXRowRescale, xRowNeedRescaleMask,
@@ -2554,7 +2598,7 @@ CUBIN_EXPORT __global__
                                       smemVSfPart,
 #endif
                                       grpLoadV ? warpIdxInGrp : 0);
-            pickAccRowsForBeamSearch(warp, acc, tmpAcc, isConvergedTile(seqIter), idxBeam,
+            pickAccRowsForBeamSearch(warp, acc[0], tmpAcc, isConvergedTile(seqIter), idxBeam,
                                      [](float& d, float s) { d += s; });
 #endif
             if (grpLoadV) {
@@ -2592,7 +2636,9 @@ CUBIN_EXPORT __global__
         auto const globalRowMaxNew = fmaxf(globalRowMax, otherRowMax);
         auto const scaleForThis = expf(globalRowMax - globalRowMaxNew);
         auto const scaleForOther = expf(otherRowMax - globalRowMaxNew);
-        rescaleAcc(warp, acc, fullRescaleMask, scaleForThis);
+#pragma unroll
+        for (uint32_t c = 0; c < nbVChunks; c++)
+          rescaleAcc(warp, acc[c], fullRescaleMask, scaleForThis);
         globalRowSum = globalRowSum * scaleForThis + otherRowSum * scaleForOther;
         globalRowMax = globalRowMaxNew;
       }
@@ -2615,9 +2661,10 @@ CUBIN_EXPORT __global__
 #if LOW_PREC_OUTPUT
       voScale *= rcpOutScale;
 #endif
-      rescaleAcc(warp, acc, fullRescaleMask, rcpRowSum * ThrdRegRowMax::filled(voScale));
+#pragma unroll
+      for (uint32_t c = 0; c < nbVChunks; c++)
+        rescaleAcc(warp, acc[c], fullRescaleMask, rcpRowSum * ThrdRegRowMax::filled(voScale));
     }
-    GemmOutRegTile const outTile = toFp16(acc);
 
     auto mergeAndSaveOutTile = [&](GemmOutRegTile const& tile, bool reorder) {
       if constexpr (gemm1NbWarpGrps == 1) {
@@ -2650,8 +2697,38 @@ CUBIN_EXPORT __global__
 #else
     bool reorderOutRows = inputElemSize == 2 && cacheElemSize == 1;
 #endif
-    SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(outTile, reorderOutRows);
-    if (isMultiBlock) {
+    // famp gemm0-once: write acc[c]-derived output to the head columns [headElems*c : ...]. The
+    // output head is validElemsPerVHead(512) wide, so chunk 1 is just a +headElems column shift.
+    auto writeOutChunk = [&](SharedMem::XSmemBuffer const* smemOutTile, uint32_t c) {
+      if (warpGrpIdx == 0) {
+#if SPEC_DEC
+        copyOutputToGlobalMem(warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize,
+                              (idxHeadGrp * headGrpSize), nbValidHeadTokens,
+                              uint2{warpTile.x * warpIdxInGrp + headElems * c,
+                                    nbValidRows * warpIdx.y + idxHeadTokenInGrp},
+                              *smemOutTile);
+#else
+        copyOutputToGlobalMem(warp, &output[nbQHeads * beamWidth * idxReq], nbQHeads, idxHeadGrp,
+                              uint2{warpTile.x * warpIdxInGrp + headElems * c,
+                                    nbValidRows * warpIdx.y},
+                              *smemOutTile);
+#endif
+      }
+    };
+
+    if (!isMultiBlock) {
+      // single-block: rescale, swizzle and store each V chunk in turn (smem.x is reused, so a
+      // CTA-wide sync separates the chunks). All gemm1 warps run this loop uniformly.
+#pragma unroll
+      for (uint32_t c = 0; c < nbVChunks; c++) {
+        GemmOutRegTile const outTile = toFp16(acc[c]);
+        SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(outTile, reorderOutRows);
+        writeOutChunk(smemOutTile, c);
+        if (c + 1 < nbVChunks) {
+          __syncthreads();
+        }
+      }
+    } else {
       static_assert(ctaShapeInWarps.y == 1, "not implemented");
 #if SPEC_DEC
       // Includes both kHeads and qTokens.
@@ -2671,7 +2748,7 @@ CUBIN_EXPORT __global__
 #endif
       uint32_t const idxBufBase = nbSubSeqPerSeq * idxSeq;
       uint32_t const idxBuf = idxBufBase + idxSubSeqInSeq;
-      // copy row max/sum
+      // row max/sum are chunk-independent (both V halves share the softmax); store once.
       TinyPtr<SMemWarpRowMax> const rowMaxBuffers = segmenter.newSeg<SMemWarpRowMax>(nbSubSeq);
       TinyPtr<SMemWarpRowMax> const rowSumBuffers = segmenter.newSeg<SMemWarpRowMax>(nbSubSeq);
       if (warpGrpIdx == 0 && warpIdxInGrp == 0) {
@@ -2679,12 +2756,19 @@ CUBIN_EXPORT __global__
         rowSumBuffers[idxBuf].storeFromReg<false>(warp, globalRowSum);
       }
       using ScratchBuf = Array2D<LdGrain, nbValidRows, SharedMem::XSmemBuffer::cols>;
+      // famp gemm0-once: one partial-output scratch region per V chunk.
       TinyPtr<Vec<ScratchBuf, gemm1WarpsPerGrp>> const scratchBuffers =
-          segmenter.newSeg<Vec<ScratchBuf, gemm1WarpsPerGrp>>(nbSubSeq);
-      // copy output to scratch
-      copyGrains<false, nbValidRows * ScratchBuf::cols, gemm1NbWarpGrps>(
-          warpGrpIdx, &scratchBuffers[idxBuf][warpIdxInGrp](0, 0), &(*smemOutTile)(0, 0));
-      __syncthreads();
+          segmenter.newSeg<Vec<ScratchBuf, gemm1WarpsPerGrp>>(nbSubSeq * nbVChunks);
+      // copy each chunk's partial output tile to its scratch region.
+#pragma unroll
+      for (uint32_t c = 0; c < nbVChunks; c++) {
+        GemmOutRegTile const outTile = toFp16(acc[c]);
+        SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(outTile, reorderOutRows);
+        copyGrains<false, nbValidRows * ScratchBuf::cols, gemm1NbWarpGrps>(
+            warpGrpIdx, &scratchBuffers[c * nbSubSeq + idxBuf][warpIdxInGrp](0, 0),
+            &(*smemOutTile)(0, 0));
+        __syncthreads();
+      }
       constexpr uint32_t nbTileBuffers = 2;
 
       struct MultiBlockSMem {
@@ -2704,7 +2788,7 @@ CUBIN_EXPORT __global__
 
       static_assert(sizeof(MultiBlockSMem) <= smemSize);
       MultiBlockSMem& mbsmem = reinterpret_cast<MultiBlockSMem&>(smem);
-      // increase the semaphore by 1
+      // increase the semaphore by 1 (once per CTA, independent of the number of V chunks).
       if (warpIdx.y == 0 && warpGrpIdx == 0 && warpIdxInGrp == 0 && laneId() == 0) {
         uint32_t old;
         uint32_t const lastOld = nbSubSeqPerSeq - 1;
@@ -2721,7 +2805,7 @@ CUBIN_EXPORT __global__
       if (isLastCta) {
         MultiBlockSMem::MBBuf& mbbuf = mbsmem.storage[warpIdx.y];
         SMemWarpRowMax& smemRowMax = reinterpret_cast<SMemWarpRowMax&>(smem);
-        // get row max.
+        // get row max (chunk-independent).
         if (warpIdx.x == 0) {
           ThrdRegRowMax const mergedRowMax =
               mergeRowMax<8>(warp, rowMaxBuffers + idxBufBase, nbSubSeqPerSeq);
@@ -2730,94 +2814,91 @@ CUBIN_EXPORT __global__
         __syncthreads();
         ThrdRegRowMax const mergedRowMax = smemRowMax.loadToReg<false>(warp);
 
-        // rescale and accumulate
         auto getTileBuf = [&](auto& buffers, uint32_t d) -> decltype(buffers[0][0][0])& {
           return buffers[warpGrpIdx][warpIdxInGrp][d];
         };
-        auto loadBufAsync = [&](uint32_t n) {
-          uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
-          SharedMem::XSmemBuffer& dstTile = getTileBuf(mbbuf.tiles, d);
-          SMemWarpRowMax& dstRowSum = getTileBuf(mbbuf.tileRowSums, d);
-          SMemWarpRowMax& dstRowMax = getTileBuf(mbbuf.tileRowMax, d);
-          copyGrains<true, sizeof(ScratchBuf) / grainBytes, 1, true>(
-              0, &dstTile(0, 0), &scratchBuffers[idxBufBase + n][warpIdxInGrp](0, 0));
-          constexpr uint32_t nbGrainsPerRowMaxBuf = exactDiv(sizeof(SMemWarpRowMax), grainBytes);
-          copyGrains<true, roundUp(nbGrainsPerRowMaxBuf, 32u), 1, nbGrainsPerRowMaxBuf % 32 == 0>(
-              0, reinterpret_cast<LdGrain*>(&dstRowSum),
-              reinterpret_cast<LdGrain const*>(&rowSumBuffers[idxBufBase + n]),
-              nbGrainsPerRowMaxBuf);
-          copyGrains<true, roundUp(nbGrainsPerRowMaxBuf, 32u), 1, nbGrainsPerRowMaxBuf % 32 == 0>(
-              0, reinterpret_cast<LdGrain*>(&dstRowMax),
-              reinterpret_cast<LdGrain const*>(&rowMaxBuffers[idxBufBase + n]),
-              nbGrainsPerRowMaxBuf);
-        };
-        loadBufAsync(warpGrpIdx);
-        ldgsts::commitGroup();
-        WarpAcc sumAcc{};
-        ThrdRegRowMax partialMergedRowSum{};
-        for (uint32_t n = warpGrpIdx; n < nbSubSeqPerSeq; n += gemm1NbWarpGrps) {
-          if (n + gemm1NbWarpGrps < nbSubSeqPerSeq) {
-            loadBufAsync(n + gemm1NbWarpGrps);
-          }
+        // rescale+accumulate the sub-seq partials for each V chunk, then store to output cols
+        // [headElems*c : ...]. All gemm1 warps run this loop uniformly.
+#pragma unroll
+        for (uint32_t c = 0; c < nbVChunks; c++) {
+          auto loadBufAsync = [&](uint32_t n) {
+            uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
+            SharedMem::XSmemBuffer& dstTile = getTileBuf(mbbuf.tiles, d);
+            SMemWarpRowMax& dstRowSum = getTileBuf(mbbuf.tileRowSums, d);
+            SMemWarpRowMax& dstRowMax = getTileBuf(mbbuf.tileRowMax, d);
+            copyGrains<true, sizeof(ScratchBuf) / grainBytes, 1, true>(
+                0, &dstTile(0, 0),
+                &scratchBuffers[c * nbSubSeq + idxBufBase + n][warpIdxInGrp](0, 0));
+            constexpr uint32_t nbGrainsPerRowMaxBuf = exactDiv(sizeof(SMemWarpRowMax), grainBytes);
+            copyGrains<true, roundUp(nbGrainsPerRowMaxBuf, 32u), 1, nbGrainsPerRowMaxBuf % 32 == 0>(
+                0, reinterpret_cast<LdGrain*>(&dstRowSum),
+                reinterpret_cast<LdGrain const*>(&rowSumBuffers[idxBufBase + n]),
+                nbGrainsPerRowMaxBuf);
+            copyGrains<true, roundUp(nbGrainsPerRowMaxBuf, 32u), 1, nbGrainsPerRowMaxBuf % 32 == 0>(
+                0, reinterpret_cast<LdGrain*>(&dstRowMax),
+                reinterpret_cast<LdGrain const*>(&rowMaxBuffers[idxBufBase + n]),
+                nbGrainsPerRowMaxBuf);
+          };
+          loadBufAsync(warpGrpIdx);
           ldgsts::commitGroup();
-          ldgsts::waitGroup<1>();
-          uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
-          WarpAcc tile = toWarpAcc(loadGemmOutTile(warp, mbbuf.tiles[warpGrpIdx][warpIdxInGrp][d]));
-          ThrdRegRowMax const tileRowMax = getTileBuf(mbbuf.tileRowMax, d).loadToReg<false>(warp);
-          ThrdRegRowMax const tileRowSum = getTileBuf(mbbuf.tileRowSums, d).loadToReg<false>(warp);
-          ThrdRegRowMax const tileRowScales = expf(tileRowMax - mergedRowMax);
-          ThrdRegRowMax const scaledTileRowSum = tileRowSum * tileRowScales;
-          partialMergedRowSum = partialMergedRowSum + scaledTileRowSum;
-          assert(std::isfinite(partialMergedRowSum[0]));
-          rescaleAcc(warp, tile, fullRescaleMask, scaledTileRowSum);
-          sumAcc = sumAcc + tile;
-        }
-
-        ThrdRegRowMax mergedRowSum{};
-        if (gemm1NbWarpGrps == 1) {
-          mergedRowSum = partialMergedRowSum;
-        } else {
-          if (warpIdxInGrp == 0) {
-            mbbuf.mergedRowSum[warpGrpIdx].storeFromReg<false>(warp, partialMergedRowSum);
+          WarpAcc sumAcc{};
+          ThrdRegRowMax partialMergedRowSum{};
+          for (uint32_t n = warpGrpIdx; n < nbSubSeqPerSeq; n += gemm1NbWarpGrps) {
+            if (n + gemm1NbWarpGrps < nbSubSeqPerSeq) {
+              loadBufAsync(n + gemm1NbWarpGrps);
+            }
+            ldgsts::commitGroup();
+            ldgsts::waitGroup<1>();
+            uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
+            WarpAcc tile =
+                toWarpAcc(loadGemmOutTile(warp, mbbuf.tiles[warpGrpIdx][warpIdxInGrp][d]));
+            ThrdRegRowMax const tileRowMax = getTileBuf(mbbuf.tileRowMax, d).loadToReg<false>(warp);
+            ThrdRegRowMax const tileRowSum = getTileBuf(mbbuf.tileRowSums, d).loadToReg<false>(warp);
+            ThrdRegRowMax const tileRowScales = expf(tileRowMax - mergedRowMax);
+            ThrdRegRowMax const scaledTileRowSum = tileRowSum * tileRowScales;
+            partialMergedRowSum = partialMergedRowSum + scaledTileRowSum;
+            assert(std::isfinite(partialMergedRowSum[0]));
+            rescaleAcc(warp, tile, fullRescaleMask, scaledTileRowSum);
+            sumAcc = sumAcc + tile;
           }
-          __syncthreads();
+
+          ThrdRegRowMax mergedRowSum{};
+          if (gemm1NbWarpGrps == 1) {
+            mergedRowSum = partialMergedRowSum;
+          } else {
+            if (warpIdxInGrp == 0) {
+              mbbuf.mergedRowSum[warpGrpIdx].storeFromReg<false>(warp, partialMergedRowSum);
+            }
+            __syncthreads();
 #ifndef NDEBUG
-          assert((mbbuf.mergedRowSum[warpGrpIdx].loadToReg<false>(warp) == partialMergedRowSum)[0]);
-          __syncthreads();
+            assert(
+                (mbbuf.mergedRowSum[warpGrpIdx].loadToReg<false>(warp) == partialMergedRowSum)[0]);
+            __syncthreads();
 #endif
 #pragma unroll
-          for (uint32_t i = 0; i < gemm1NbWarpGrps; i++) {
-            mergedRowSum = mergedRowSum + mbbuf.mergedRowSum[i].loadToReg<false>(warp);
-            assert(std::isfinite(mergedRowSum[0]));
+            for (uint32_t i = 0; i < gemm1NbWarpGrps; i++) {
+              mergedRowSum = mergedRowSum + mbbuf.mergedRowSum[i].loadToReg<false>(warp);
+              assert(std::isfinite(mergedRowSum[0]));
+            }
           }
-        }
-        if (attentionSinks != nullptr) {
-          // Attention sinks are per head.
+          if (attentionSinks != nullptr) {
+            // Attention sinks are per head.
 #if SPEC_DEC
-          addAttentionSinksSpecDec(mergedRowSum, mergedRowMax,
-                                   attentionSinks + headGrpSize * idxHeadGrp, headGrpSize);
+            addAttentionSinksSpecDec(mergedRowSum, mergedRowMax,
+                                     attentionSinks + headGrpSize * idxHeadGrp, headGrpSize);
 #else
-          addAttentionSinks(mergedRowSum, mergedRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+            addAttentionSinks(mergedRowSum, mergedRowMax,
+                              attentionSinks + headGrpSize * idxHeadGrp);
 #endif
+          }
+          __syncthreads();
+          rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
+          GemmOutRegTile const mergedOutTile = toFp16(sumAcc);
+          SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
+          writeOutChunk(smemOutTile, c);
+          __syncthreads();
         }
-        __syncthreads();
-        rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
-        GemmOutRegTile const mergedOutTile = toFp16(sumAcc);
-        smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
       }
-    }
-    if (warpGrpIdx == 0) {
-#if SPEC_DEC
-      copyOutputToGlobalMem(
-          warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize, (idxHeadGrp * headGrpSize),
-          nbValidHeadTokens,
-          uint2{warpTile.x * warpIdxInGrp, nbValidRows * warpIdx.y + idxHeadTokenInGrp},
-          *smemOutTile);
-#else
-      copyOutputToGlobalMem(warp, &output[nbQHeads * beamWidth * idxReq], nbQHeads, idxHeadGrp,
-                            uint2{warpTile.x * warpIdxInGrp, nbValidRows * warpIdx.y},
-                            *smemOutTile);
-#endif
     }
   }
 }
