@@ -104,6 +104,22 @@ fork value is *guaranteeing the captured wins don't silently regress on Ampere a
 sm_86 (3090) testable in the sandbox now. **sm_80 (A100) is a CI + tuning gap** — no A100 runner; any
 "sm_80 tuned" claim must wait for one. New CUDA kernels need smem-split tuning (sm_80 192KB / sm_86 100KB).
 
+## Shipped in v0.3 (2026-07-15) ✅
+- **fp16-accumulate PV prefill** (patch 0007 + the flashampere `fp16pv`/`bf16cvt` legs) — the pure-fp16
+  o_frag accumulator, +25% op-level / +1–4% long-context e2e TTFT. GeForce-RTX-30-gated at runtime
+  (pro Ampere = fp32-accum full rate, forced off), prefill-only, opt-in under `VLLM_FLASHAMPERE=1`.
+  (This closes the old "TO BUILD: fp16-accumulate PV" item — built, measured, accuracy-gated.)
+- **flashampere unified attention backend** (patch 0008, `Backend.CUSTOM`) + vendored XQA
+  (hd512 gemma-4 decode, opt-in `VLLM_FAMP_XQA_HD512`; MTP spec-verify) + vendored FA2 prefill
+  (`VLLM_FAMP_OWN_PREFILL`). int8-QK was REMOVED (net-negative everywhere; see NO-GO list).
+- **famp Marlin vendor** (`flashampere/marlin/`, patch 0009) — plugin-selected, bit-exact vs stock;
+  asym-AWQ (uint4+zp) int8-act un-gated on the famp kernel.
+- **DSpark/DFlash speculative decoding** — native `method="dspark"/"dflash"` serving backend
+  (confidence-head adaptive-verify not yet modeled; hybrid-GDN targets still on the dev-dflash branch).
+- **Model-arch auto-dispatch** (`flashampere/model_profiles.py`) — per-architecture famp routing
+  registry; all profiles currently conservative (stock/TRITON defaults) pending the FA↔TRITON
+  metadata bridge for the gemma prefill/decode split.
+
 ## Next investigation candidates (un-run dimensions from the modern-arch scope)
 Modern MoE on Ampere · sparse/long-context attention (NSA/Quest for hybrid full-attn layers) ·
 quant/KV/MTP breadth (lm_head-int4, hybrid KV #37121 over-alloc, MTP spec-decode). Run as focused

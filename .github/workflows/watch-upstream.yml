@@ -1,15 +1,13 @@
 name: watch-upstream
 
-# Polls vllm-project/vllm for a new stable release every 6h. In the vendored-fork model a new
-# upstream release is NOT a rebuild — it needs RE-VENDORING (clone the new tag + replay the edit
-# recipe via scripts/revendor.sh). So when the latest tag differs from the committed
-# UPSTREAM_VLLM_VERSION marker, open a re-vendor issue for a human (the recipe can drift and needs
-# review). There is no CI auto-build: after re-vendoring you build + push the image yourself locally
-# (scripts/build_image_source.sh) — a self-hosted GPU runner on a public repo is a security risk.
+# Polls vllm-project/vllm for a new stable release once a day. When the latest tag differs from
+# the committed UPSTREAM_VLLM_VERSION marker, open ONE reminder issue for that tag — deduped
+# against all issues (open AND closed), so closing the reminder never re-triggers it. No patch
+# replay, no CI build: migration to a new upstream is planned and built by hand.
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 6 * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -31,7 +29,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # /releases/latest excludes prereleases/drafts -> stable tag only (e.g. v0.23.0).
+          # /releases/latest excludes prereleases/drafts -> stable tag only (e.g. v0.25.1).
           TAG=$(gh api repos/vllm-project/vllm/releases/latest --jq .tag_name)
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Latest upstream stable vLLM: $TAG"
@@ -47,14 +45,17 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Open re-vendor issue for the new tag
+      - name: Open one reminder issue for the new tag (dedup incl. closed)
         if: steps.cmp.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.up.outputs.tag }}
         run: |
-          TITLE="re-vendor: upstream vLLM $TAG available (vendored is $(cat UPSTREAM_VLLM_VERSION))"
-          if [ -z "$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number')" ]; then
+          TITLE="upstream vLLM $TAG released"
+          # --state all: once the reminder exists (even closed), never open it again for this tag.
+          if [ -z "$(gh issue list --state all --search "\"$TITLE\" in:title" --json number --jq '.[0].number')" ]; then
             gh issue create --title "$TITLE" \
-              --body "Upstream vLLM \`$TAG\` is newer than the vendored \`$(cat UPSTREAM_VLLM_VERSION)\`. Re-vendor the fork: \`scripts/revendor.sh $TAG <flashinfer_tag>\` (replays the edit recipe; fails loudly if anchors drifted), review \`git diff\`, commit, then rebuild + push the image locally (\`OWNER=<you> scripts/build_image_source.sh\` — no CI auto-build). See patches/README.md."
+              --body "Upstream vLLM \`$TAG\` is newer than the vendored \`$(cat UPSTREAM_VLLM_VERSION)\`. One-time reminder — close after reading; it will not re-open for this tag."
+          else
+            echo "Reminder for $TAG already exists (open or closed) — skipping."
           fi

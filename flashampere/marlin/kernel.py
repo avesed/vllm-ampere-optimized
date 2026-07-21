@@ -26,8 +26,14 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_is_k_full,
     marlin_make_empty_g_idx,
     marlin_make_workspace_new,
+    marlin_pad_dim,
+    marlin_pad_qweight,
+    marlin_pad_scales,
+    marlin_padded_nk,
     marlin_permute_bias,
     marlin_permute_scales,
+    marlin_repacked_nk,
+    marlin_unpad_output,
     marlin_quant_input,
     marlin_sort_g_idx,
     marlin_zero_points,
@@ -85,12 +91,29 @@ class FampMarlinKernel(MPLinearKernel):
                 f"{MARLIN_SUPPORTED_GROUP_SIZES}",
             )
 
-        return check_marlin_supports_shape(
-            c.partition_weight_shape[1],  # out_features
-            c.partition_weight_shape[0],  # in_features
-            c.full_weight_shape[0],  # in_features
-            c.group_size,
-        )
+        if c.has_g_idx:
+            # Act-order couples K to the full-model group layout, so tile
+            # padding is not supported; keep the strict shape check.
+            return check_marlin_supports_shape(
+                c.partition_weight_shape[1],  # out_features
+                c.partition_weight_shape[0],  # in_features
+                c.full_weight_shape[0],  # in_features
+                c.group_size,
+            )
+
+        # A group straddling TP ranks cannot be fixed by padding.
+        if (
+            c.group_size != -1
+            and c.group_size < c.full_weight_shape[0]
+            and c.partition_weight_shape[0] % c.group_size != 0
+        ):
+            return False, (
+                f"in_features per partition {c.partition_weight_shape[0]} is "
+                f"not divisible by group_size = {c.group_size}."
+            )
+
+        # Tile misalignment is fixed by zero-padding at weight prep.
+        return True, None
 
     # note assumes that
     #  `weight_packed` is: {input_dim = 0, output_dim = 1, packed_dim = 0}
@@ -121,6 +144,13 @@ class FampMarlinKernel(MPLinearKernel):
         row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
         self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
 
+        size_k, size_n = c.partition_weight_shape
+        if c.has_g_idx:
+            # Act-order shapes were strictly validated in can_implement.
+            padded_n, padded_k = size_n, size_k
+        else:
+            padded_n, padded_k = marlin_padded_nk(size_n, size_k, c.group_size)
+
         # Allocate marlin workspace.
         self.workspace = marlin_make_workspace_new(device)
 
@@ -148,12 +178,16 @@ class FampMarlinKernel(MPLinearKernel):
             # SWAP: famp repack instead of ops.gptq_marlin_repack (-> torch.ops._C). POSITIONAL only;
             # the raw torch.ops.famp_marlin schema is (b_q_weight, perm, size_k, size_n, num_bits,
             # is_a_8bit) — identical to _C (verified famp_marlin_binding.cu) but positional avoids any
-            # kw-binding edge case on the raw op.
+            # kw-binding edge case on the raw op. Thread-tile padding (0.25.1): the packed weight is
+            # zero-padded to (padded_n, padded_k) BEFORE repack and the padded extents are what the
+            # repack (and later the gemm) sees.
             x.data = torch.ops.famp_marlin.gptq_marlin_repack(
-                x.data.contiguous(),
+                marlin_pad_qweight(
+                    x.data.contiguous(), size_n, size_k, padded_n, padded_k
+                ),
                 layer.g_idx_sort_indices,        # perm
-                c.partition_weight_shape[0],     # size_k
-                c.partition_weight_shape[1],     # size_n
+                padded_k,                        # size_k
+                padded_n,                        # size_n
                 c.weight_type.size_bits,         # num_bits
                 is_a_8bit,                       # is_a_8bit
             )
@@ -163,9 +197,16 @@ class FampMarlinKernel(MPLinearKernel):
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1)
             x.data = marlin_permute_scales(
-                x.data.contiguous(),
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
+                marlin_pad_scales(
+                    x.data.contiguous(),
+                    size_n,
+                    size_k,
+                    padded_n,
+                    padded_k,
+                    c.group_size,
+                ),
+                size_k=padded_k,
+                size_n=padded_n,
                 group_size=c.group_size,
                 is_a_8bit=is_a_8bit,
             )
@@ -196,21 +237,27 @@ class FampMarlinKernel(MPLinearKernel):
             layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
 
         if c.zero_points:
-            grouped_k = (
-                c.partition_weight_shape[0] // c.group_size if c.group_size != -1 else 1
-            )
+            grouped_k = size_k // c.group_size if c.group_size != -1 else 1
+            padded_grouped_k = padded_k // c.group_size if c.group_size != -1 else 1
             self._transform_param(
                 layer,
                 self.w_zp_name,
                 lambda x: marlin_zero_points(
-                    unpack_cols(
-                        x.t(),
-                        c.weight_type.size_bits,
-                        grouped_k,
-                        c.partition_weight_shape[1],
+                    marlin_pad_scales(
+                        unpack_cols(
+                            x.t(),
+                            c.weight_type.size_bits,
+                            grouped_k,
+                            size_n,
+                        ),
+                        size_n,
+                        size_k,
+                        padded_n,
+                        padded_k,
+                        c.group_size,
                     ),
-                    size_k=grouped_k,
-                    size_n=c.partition_weight_shape[1],
+                    size_k=padded_grouped_k,
+                    size_n=padded_n,
                     num_bits=c.weight_type.size_bits,
                     is_a_8bit=is_a_8bit,
                 ),
@@ -223,7 +270,9 @@ class FampMarlinKernel(MPLinearKernel):
         self._transform_param(layer, self.w_s_name, transform_w_s)
 
         if hasattr(layer, "bias") and layer.bias is not None:
-            layer.bias.data = marlin_permute_bias(layer.bias)
+            layer.bias.data = marlin_permute_bias(
+                marlin_pad_dim(layer.bias, size_n, padded_n)
+            )
 
     def apply_weights(
         self,
@@ -231,8 +280,11 @@ class FampMarlinKernel(MPLinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # INLINE of apply_gptq_marlin_linear (marlin_utils.py:584-631): do NOT call that helper — it
+        # INLINE of apply_gptq_marlin_linear (marlin_utils.py): do NOT call that helper — it
         # hardcodes ops.marlin_gemm -> torch.ops._C.marlin_gemm, so famp would never run the gemm.
+        # 0.25.1 thread-tile padding: the padded (n, k) the weight was repacked with is recovered
+        # from the packed shape, the activation is K-zero-padded to match, the gemm runs at the
+        # padded extents, and the padded output columns are stripped at the end.
         c = self.config
         w_q, w_s, w_zp, w_gidx = self._get_weight_params(layer)
 
@@ -250,10 +302,13 @@ class FampMarlinKernel(MPLinearKernel):
         reshaped_x = x.reshape(-1, x.shape[-1])
         out_shape = x.shape[:-1] + (output_size_per_partition,)
 
+        padded_n, padded_k = marlin_repacked_nk(w_q, wtype.size_bits)
+        reshaped_x = marlin_pad_dim(reshaped_x, input_size_per_partition, padded_k)
+
         use_atomic_add = should_use_atomic_add_reduce(
             m=reshaped_x.size(0),
-            n=output_size_per_partition,
-            k=reshaped_x.size(1),
+            n=padded_n,
+            k=padded_k,
             device=x.device,
             dtype=x.dtype,
         )
@@ -291,14 +346,15 @@ class FampMarlinKernel(MPLinearKernel):
             self.workspace,                   # workspace
             wtype.id,                         # b_type_id (INT, not ScalarType)
             reshaped_x.shape[0],              # size_m
-            output_size_per_partition,        # size_n
-            input_size_per_partition,         # size_k
+            padded_n,                         # size_n (tile-padded)
+            padded_k,                         # size_k (tile-padded)
             self.is_k_full,                   # is_k_full
             use_atomic_add,                   # use_atomic_add
             USE_FP32_REDUCE_DEFAULT,          # use_fp32_reduce
             False,                            # is_zp_float
         )
 
+        output = marlin_unpad_output(output, output_size_per_partition, padded_n)
         return output.reshape(out_shape)
 
 
@@ -387,6 +443,16 @@ def register_fampmarlin():
         idx,
     )
 
+    # 0.25.1 --linear-backend filtering: choose_mp_linear_kernel intersects _POSSIBLE_KERNELS with
+    # _LINEAR_BACKEND_KERNEL_MAP[backend] when --linear-backend is set. famp IS the marlin backend
+    # (byte-mirror), so join the 'marlin' set or an explicit --linear-backend=marlin would silently
+    # exclude FampMarlinKernel. set.add is idempotent; absent map (0.23) -> no-op.
+    try:
+        from vllm.model_executor.kernels import linear as _linear_mod
+        _linear_mod._LINEAR_BACKEND_KERNEL_MAP["marlin"].add(FampMarlinKernel)
+    except Exception:  # noqa: BLE001 — pre-0.25 tree without the filter map.
+        pass
+
     # Eager-load the .so now so a build/load failure cleanly disables famp (remove the insert) rather
     # than crashing the first request. @functools.cache makes this a no-op on subsequent layers.
     try:
@@ -394,3 +460,7 @@ def register_fampmarlin():
     except Exception as e:  # noqa: BLE001
         logger.warning("famp_marlin: .so load failed, reverting insertion: %s", e)
         kernels.remove(FampMarlinKernel)
+        try:
+            _linear_mod._LINEAR_BACKEND_KERNEL_MAP["marlin"].discard(FampMarlinKernel)
+        except Exception:  # noqa: BLE001
+            pass

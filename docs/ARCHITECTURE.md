@@ -5,26 +5,28 @@ The maintainer's mental model. Why this repo is shaped the way it is.
 ## Vendored fork, built from source
 
 This repo vendors the **complete** modified source — `vllm/` (upstream v0.23.0) and `flashinfer/`
-(v0.6.12) — with every edit baked in. It is **not** a patch-overlay, because the int8 work is
-**native**: `.cu`/`.cuh` kernels (the int8 8-row Marlin decode tile in patch 0002, the int8-QK
-FlashInfer IMMA path) that a pip-overlay onto an official wheel/image physically cannot carry. Native
-code ships only from a real source build — which is exactly why the source is vendored rather than
-patched at build time.
+(v0.6.12) — with every edit baked in, plus the fork-owned `flashampere/` package (attention backend +
+vendored XQA / FA2-prefill / Marlin kernels). It is **not** a patch-overlay, because the native work is
+`.cu`/`.cuh` kernels (the int8 8-row Marlin decode tile in patch 0002, the fp16-PV FlashInfer prefill
+patch 0007, the vendored famp_marlin GEMM and XQA kernels) that a pip-overlay onto an official
+wheel/image physically cannot carry. Native code ships only from a real source build — which is exactly
+why the source is vendored rather than patched at build time. (The old int8-QK attention backend was
+removed 2026-06-25 — measured net-negative; its kernel edits remain inert in the vendored `flashinfer/`
+tree because they share files with the fp16-PV patch.)
 
 `patches/` is no longer applied during a build — it is the **recipe** (`regenerate.py` for 0001 +
-`git apply` for 0002/0003 + `flashinfer_int8/apply_to_source.py`) that regenerates the vendored trees
-from a fresh upstream checkout, so an upstream bump stays reproducible and drift is detectable
-(`scripts/revendor.sh`; the github-hosted `patch-drift-check` canary replays it daily). See
-`patches/README.md`.
+`git apply` for the numbered patches + `flashinfer_int8/apply_to_source.py`) that regenerates the
+vendored trees from a fresh upstream checkout, so an upstream bump stays reproducible and drift is
+detectable (`scripts/revendor.sh`). See `patches/README.md`.
 
 ## One build path: local, from source
 
-The image is built **from the vendored source on a local GPU box** (`scripts/build_image_source.sh`:
-vLLM → sm_80+sm_86 fatbin, then the int8-QK FlashInfer overlaid) and pushed to ghcr **by the
-maintainer**. There is **no CI build**: a from-source vLLM CUDA build needs a GPU, and a self-hosted
+The image is built **from the vendored source on a local GPU box** (`scripts/build_image_source.sh`,
+three stages: vLLM → sm_80+sm_86 fatbin, the vendored FlashInfer overlay, then the famp_marlin `.so`
+compiled from `flashampere/marlin/csrc`) and pushed to ghcr **by the maintainer**. There is **no CI build**: a from-source vLLM CUDA build needs a GPU, and a self-hosted
 GPU runner on a **public** repo is a security risk — a malicious PR could run arbitrary code on the
-runner. The only CI is two github-hosted canaries (`watch-upstream`, `patch-drift-check`) that just
-open issues; they never build or push. See `docs/RELEASE.md`.
+runner. The only CI is one github-hosted canary (`watch-upstream`) that opens a one-time reminder issue
+per new upstream release; it never builds or pushes. See `docs/RELEASE.md`.
 
 ## Arch: `TORCH_CUDA_ARCH_LIST="8.0 8.6"` (all Ampere)
 
@@ -71,6 +73,8 @@ LRU; the two-arch object set fits where a full multi-arch set would thrash. On t
 
 ## Tag scheme
 
-- GH Release: `v<vllm>-ampere` (e.g. `v0.23.0-ampere`); wheel keeps the real vLLM version + abi3.
-- ghcr image: `ghcr.io/<owner>/vllm-ampere-optimized:<vllm>-ampere-<cu>` (+ moving `:latest`),
-  e.g. `:v0.23.0-ampere-cu130`. cu129 variant: `:v0.23.0-ampere-cu129`.
+- GH Release: fork versions `vX.Y` (v0.1 … v0.3 = current) — each release names the feature set;
+  the wheel keeps the real vLLM version + abi3.
+- ghcr image: fork tag `:X.Y` + moving `:latest`, plus the upstream-pinned variant
+  `ghcr.io/<owner>/vllm-ampere-optimized:<vllm>-ampere-<cu>` (e.g. `:v0.23.0-ampere-cu130`;
+  cu129 variant: `:v0.23.0-ampere-cu129`).

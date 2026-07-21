@@ -1,7 +1,7 @@
 # Patching runbook
 
-What to do when `patch-drift-check` opens a "patch drift" issue (the series stopped applying to a
-new upstream tag).
+What to do when the patch series stops applying to a new upstream tag (surfaces when
+`scripts/revendor.sh` fails loudly during a re-vendor).
 
 ## Refresh the patch against the new tag
 
@@ -19,8 +19,8 @@ python patches/regenerate.py vllm
   corresponding `old`/`new` string in `patches/regenerate.py`, and rerun until clean, then emit
   the diff as above.
 
-Commit the refreshed `.patch` (and any `regenerate.py` anchor edits). The `patch-drift-check` canary
-(and your next local `scripts/revendor.sh`) will then pass the `git apply --check` gate.
+Commit the refreshed `.patch` (and any `regenerate.py` anchor edits). Your next local
+`scripts/revendor.sh` will then pass the `git apply --check` gate.
 
 ## Why `git apply --3way`, not `git am`
 

@@ -81,6 +81,7 @@ docker buildx build vllm $BUILDER \
   --build-arg max_jobs="$JOBS" \
   --build-arg nvcc_threads=4 \
   --build-arg RUN_WHEEL_CHECK=false \
+  --build-arg VLLM_SCM_VERSION="${VLLM_TAG#v}" \
   --build-arg VLLM_BUILD_COMMIT="${GITHUB_SHA:-unknown}" \
   --build-arg VLLM_IMAGE_TAG="${VLLM_TAG}-ampere-${CU}" \
   --provenance=false \
