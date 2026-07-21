@@ -44,24 +44,31 @@ class FampProfile:
 
 # Keyed by ``model_config.architecture`` (the resolved primary ``architectures[0]``).
 PROFILES: dict[str, FampProfile] = {
-    # -- Gemma4 (e.g. 12B): heterogeneous heads hd256 (sliding) / hd512 (global full-attn). famp's
-    #    hd512 prefill is +7-9% over TRITON, but famp's hd512 XQA decode is -4..-14% (net slower for
-    #    decode-heavy serving). The ideal split (famp prefill + TRITON decode, same layer) needs
-    #    FA<->TRITON metadata bridging and is not ready. So default = TRITON (validated 5/5, fastest
-    #    decode). To opt into the famp prefill path, set VLLM_FLASHAMPERE=1 + VLLM_FAMP_OWN_PREFILL=1
-    #    + VLLM_FAMP_XQA_HD512=1 explicitly. Flip flashampere=True here once the prefill/decode hybrid lands.
+    # -- Gemma4 (e.g. 12B/31B): heterogeneous heads hd256 (sliding) / hd512 (global full-attn).
+    #    flashampere=True: famp OWNS the hd512 full-attn layers (prefill via own-prefill fp16-PV =
+    #    1.9-2.9x TRITON; decode via XQA gemm0-once single-K-read = 1.5-2.8x TRITON, cos=1.0). The
+    #    per-head-size supports_combination gate keeps the hd256 SLIDING layers on TRITON/FLEX (they
+    #    carry the bidirectional image mm_prefix, which famp declines). backend gate: famp is only
+    #    selectable for hd512 (mm_prefix cleared there); text + image both correct. (The old "decode
+    #    -14%" was the two-launch e2e; the gemm0-once single-K-read kernel reversed it decisively.)
     "Gemma4UnifiedForConditionalGeneration": FampProfile(
-        flashampere=False,
+        flashampere=True,
+        own_prefill=True,
+        xqa_hd512=True,
         marlin="W4A16 data-free RTN validated coherent; W4A8-int8 NO-GO (L0 down_proj outlier -> SmoothQuant)",
-        note="hd512 full-attn; default TRITON (decode fastest). famp prefill +8% via explicit flags; hybrid pending",
+        note="hd512 full-attn -> famp (prefill 1.9-2.9x + XQA gemm0-once decode 1.5-2.8x vs TRITON); hd256 sliding -> TRITON",
     ),
     "Gemma4ForConditionalGeneration": FampProfile(
-        flashampere=False,
-        note="hd512 full-attn (Gemma4 conditional-generation); default TRITON; hybrid pending",
+        flashampere=True,
+        own_prefill=True,
+        xqa_hd512=True,
+        note="hd512 full-attn -> famp (prefill+XQA-decode); hd256 sliding -> TRITON",
     ),
     "Gemma4ForCausalLM": FampProfile(
-        flashampere=False,
-        note="hd512 full-attn (Gemma4 text-only); default TRITON; hybrid pending",
+        flashampere=True,
+        own_prefill=True,
+        xqa_hd512=True,
+        note="hd512 full-attn text-only -> famp (prefill+XQA-decode); hd256 sliding -> TRITON",
     ),
 
     # -- Qwen3.6-27B dense (hd128). famp MARLIN validated (W4A16 bit-exact vs stock; W4A8-int8

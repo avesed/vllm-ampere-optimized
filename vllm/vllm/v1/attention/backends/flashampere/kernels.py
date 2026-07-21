@@ -369,7 +369,10 @@ class _XqaHd512DecodeState:
         self.q_scale = float(impl.scale) * math.sqrt(self.D)
         self.qdtype, self.kvdtype = query.dtype, kv_cache.dtype
         self.sm_count = torch.cuda.get_device_properties(dev).multi_processor_count
-        self.scratch = torch.zeros(256 << 20, dtype=torch.uint8, device=dev)
+        # gemm0-once stores one multiblock-reduction scratch region PER V chunk (nbVChunks=2 for
+        # the hd512 wide head), so the wide-head path needs 2x the previous footprint. One buffer
+        # per head_size (shared across layers via _STATES), so +256MB total is negligible.
+        self.scratch = torch.zeros(512 << 20, dtype=torch.uint8, device=dev)
         self.module = None
         self.bufs: dict[int, tuple] = {}                  # B -> (sem, seq_u32)
 
@@ -427,8 +430,12 @@ class _XqaHd512DecodeState:
                 sem, self.scratch, False,                 # semaphores, workspace, enable_pdl
             )
 
-        _launch(out4, value_cache)                        # chunk 0: V cols [0,256) -> out cols [0,256)
-        _launch(out4[..., self.half:], value_cache[..., self.half:])  # chunk 1: +256 ptr offset
+        # gemm0-once: ONE launch — the kernel loads K once and computes BOTH V chunks internally
+        # (V cols [0,256)->out[0,256) and [256,512)->out[256,512)) via the dual accumulator +
+        # sync-reload. Single K read (1x K + 1x V) instead of the old two-launch 2x-K; cos=1.0,
+        # measured 1.5-2.8x faster than TRITON hd512 3D decode. (The scratch is sized 2x for the
+        # wide head's per-chunk multiblock reduction.)
+        _launch(out4, value_cache)
         FIRE["calls"] += 1
         return output
 

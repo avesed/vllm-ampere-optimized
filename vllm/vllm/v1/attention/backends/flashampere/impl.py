@@ -119,12 +119,18 @@ class FlashAmpereImpl(FlashAttentionImpl):
     ) -> torch.Tensor:
         m = attn_metadata
         # Universal hard fallbacks -> stock FA (cannot be expressed in the structural key).
+        # NB: the _nonplain_metadata sink is scoped to head_size<=256. For hd512 (Gemma4 full-attn)
+        # stock FA REJECTS the head size (>256), so sinking would crash — and it must not: Gemma4
+        # CLEARS mm_prefix for the full-attn (hd512) layers (_clear_mm_prefix_for_full_attn_layers),
+        # so they are plain causal, which the famp hd512 legs handle. hd512 therefore always routes
+        # to decode_hd512 / fp16pv_prefill below, never to FA. (The hd256 sliding layers keep the
+        # guard -> stock FA/TRITON handles their real mm_prefix/SWA.)
         if (
             m is None
             or output_scale is not None
             or output_block_scale is not None
             or getattr(self, "dcp_world_size", 1) > 1
-            or self._nonplain_metadata(m)
+            or (self._nonplain_metadata(m) and self.head_size <= 256)
         ):
             return super().forward(
                 layer, query, key, value, kv_cache, m, output,
