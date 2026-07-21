@@ -1182,6 +1182,13 @@ package_data = {
         "third_party/fmha_sm100/cutlass/include/**/*.hpp",
         "third_party/fmha_sm100/cutlass/tools/util/include/**/*.h",
         "third_party/fmha_sm100/cutlass/tools/util/include/**/*.hpp",
+        # [Ampere fork] flashampere runtime-JIT kernels (XQA hd512 decode + vendored
+        # FlashInfer fp16-PV prefill). Compiled at runtime via ninja, so the .cu/.cuh/.h
+        # source must ship in the wheel (mirrors DeepGEMM/fmha_sm100 above).
+        "v1/attention/backends/flashampere/xqa/csrc/**/*.cu",
+        "v1/attention/backends/flashampere/xqa/csrc/**/*.cuh",
+        "v1/attention/backends/flashampere/xqa/csrc/**/*.h",
+        "v1/attention/backends/flashampere/prefill/include/**/*.cuh",
     ]
 }
 

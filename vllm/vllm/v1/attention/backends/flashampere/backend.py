@@ -63,6 +63,43 @@ class FlashAmpereBackend(FlashAttentionBackend):
         # selectable for Gemma4's hd512 full-attn layers (text-serving / prefill-bench).
         return True
 
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size,
+        dtype,
+        kv_cache_dtype,
+        block_size,
+        use_mla,
+        has_sink,
+        use_sparse,
+        use_mm_prefix,
+        device_capability,
+    ):
+        # FA's supports_combination rejects use_mm_prefix unless FA4 (no FA4 on Ampere), which
+        # inheritance would apply to CUSTOM for BOTH head sizes of a Gemma4 VL model. But Gemma4
+        # CLEARS mm_prefix for its hd512 FULL-ATTN layers (gemma4_mm._clear_mm_prefix_for_full_attn_
+        # layers) -> those layers are plain causal, which the famp hd512 legs own (XQA gemm0-once
+        # decode 1.5-2.8x faster than TRITON; fp16-PV prefill 1.9-2.9x). So allow the combination
+        # for head_size>256 only; the hd256 SLIDING layers keep FA's rejection (super) -> they fall
+        # to TRITON/FLEX, which correctly carry their bidirectional image mm_prefix. Keep FA's sink
+        # gate. hd512 has no stock fallback anyway (FA rejects >256), so famp must own it.
+        if use_mm_prefix and head_size > 256:
+            if has_sink and device_capability < DeviceCapability(9, 0):
+                return "sink not supported on compute capability < 9.0"
+            return None
+        return super().supports_combination(
+            head_size,
+            dtype,
+            kv_cache_dtype,
+            block_size,
+            use_mla,
+            has_sink,
+            use_sparse,
+            use_mm_prefix,
+            device_capability,
+        )
+
 
 def register_flashampere() -> None:
     """vllm.general_plugins entry-point: install FlashAmpere into Backend.CUSTOM in every process.
