@@ -505,12 +505,12 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 FROM base AS build
 ARG TARGETPLATFORM
 
-# [Ampere fork] The vendored tree ships without .git, so setuptools-scm cannot derive the version
-# and falls back to a stale guess (e.g. v0.23.1.dev0). Pin the vLLM package version explicitly;
-# the package-specific pretend var overrides any generic SETUPTOOLS_SCM_PRETEND_VERSION. Passed as
-# the plain upstream tag without the leading 'v' (e.g. 0.25.1) by scripts/build_image_source.sh.
+# [Ampere fork] The vendored tree ships without .git, so setuptools-scm derives a stale version
+# (e.g. v0.23.1.dev0). setup.py's get_vllm_version() honors VLLM_VERSION_OVERRIDE first, so pin the
+# vLLM package version through that native hook. Passed as the plain upstream tag without the
+# leading 'v' (e.g. 0.25.1) by scripts/build_image_source.sh.
 ARG VLLM_SCM_VERSION=""
-ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=${VLLM_SCM_VERSION}
+ENV VLLM_VERSION_OVERRIDE=${VLLM_SCM_VERSION}
 
 ARG PIP_INDEX_URL UV_INDEX_URL
 ARG PIP_EXTRA_INDEX_URL UV_EXTRA_INDEX_URL
