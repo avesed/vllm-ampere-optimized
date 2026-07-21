@@ -169,11 +169,21 @@ def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: 
         k = k_src.to(torch.float16)
         v = v_src.to(torch.float16)
         if Lq == 1:
-            # q=1 row (decode in a mixed hd>256 batch, or a rare 1-token prefill): FI single_prefill
-            # rejects q_len=1, so q-pad to 2 and take the LAST row (causal bottom-right -> attends all
-            # ctx incl. this step's just-cached K/V). Same q-pad-2 trick as the hd512 decode path.
-            o = _fi_prefill(q.repeat(2, 1, 1), k, v, causal=True, sm=sm,
-                            o_dtype=torch.float16, use_fp16_pv=True)[1:2]
+            # q=1 row (a decode row folded into a mixed hd>256 batch by continuous batching, or a
+            # rare 1-token prefill). FI single_prefill rejects q_len=1; the old q-pad-2 trick CRASHES
+            # for short KV ("Unsupported max_mma_kv: 0", e.g. ctx=0 -> kv_len=1). Use torch SDPA — it
+            # is exact for any kv_len and the single query attends to ALL its cached KV (no causal
+            # mask: the query is the last position). Pure-DECODE batches never reach here (they take
+            # the fast paged XQA gemm0-once path in decode_hd512); this is the rare mixed-batch row,
+            # so per-row SDPA is acceptable (split-batch [q=1->XQA, q>1->fp16pv] is the follow-up).
+            import torch.nn.functional as _F
+            qh = q.reshape(1, H, D).transpose(0, 1).unsqueeze(0)        # [1, H, 1, D]
+            kh = k.reshape(-1, Hkv, D).transpose(0, 1).unsqueeze(0)     # [1, Hkv, kv, D]
+            vh = v.reshape(-1, Hkv, D).transpose(0, 1).unsqueeze(0)
+            o = _F.scaled_dot_product_attention(
+                qh, kh, vh, scale=sm, is_causal=False, enable_gqa=(H != Hkv)
+            )                                                           # [1, H, 1, D]
+            o = o.squeeze(0).transpose(0, 1).reshape(1, H, D)
         else:
             o = _fi_prefill(q, k, v, causal=causal, sm=sm, o_dtype=torch.float16, use_fp16_pv=True)
         output[s:e] = o.reshape(output[s:e].shape).to(output.dtype)
