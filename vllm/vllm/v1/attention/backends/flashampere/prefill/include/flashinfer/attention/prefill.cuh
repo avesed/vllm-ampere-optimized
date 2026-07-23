@@ -25,6 +25,8 @@
 #endif
 #include <cuda_runtime.h>
 
+#include <cstdlib>
+
 #include <flashinfer/cp_async.cuh>
 #include <flashinfer/fastdiv.cuh>
 #ifdef FP16_QK_REDUCTION_SUPPORTED
@@ -2162,6 +2164,21 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   int64_t packed_qo_len = qo_len * group_size;
   uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO);
+  // famp: on GA10x (sm86, 99KB smem/CTA cap) the 64-row Q tile beats 128 for short/mid prefill —
+  // NUM_MMA_Q=1 shortens the per-fragment MMA dependency chain and doubles CTA-level parallelism.
+  // Measured on RTX 3090 hd128: +6..23% for packed_qo_len<=16k, ~0..-2% above (crossover 16k-32k),
+  // so switch below the guaranteed-win zone only. hd256 unmeasured -> untouched.
+  // FAMP_CTA_TILE_Q overrides for experiments.
+  if (cta_tile_q > 64 && HEAD_DIM_VO == 128 && packed_qo_len <= 16384) {
+    int _dev = 0, _major = 0, _minor = 0;
+    FLASHINFER_CUDA_CALL(cudaGetDevice(&_dev));
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&_major, cudaDevAttrComputeCapabilityMajor, _dev));
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&_minor, cudaDevAttrComputeCapabilityMinor, _dev));
+    if (_major == 8 && _minor >= 6) cta_tile_q = 64;
+  }
+  if (const char* _ftq = std::getenv("FAMP_CTA_TILE_Q")) {
+    cta_tile_q = static_cast<uint32_t>(std::atoi(_ftq));
+  }
 
   DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
     constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);

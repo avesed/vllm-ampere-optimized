@@ -82,11 +82,18 @@ class FlashAmpereImpl(FlashAttentionImpl):
           - sliding_window on the METADATA (batch-level override of the impl's static window),
           - rswa_prefix_lens / rswa_window / rswa_window_tensor (Reference-SWA masking).
         Any of these set/non-default -> sink to stock FA (bit-faithful; FA implements them).
-        getattr defaults keep this a no-op on 0.23-era metadata (fields absent)."""
+        getattr defaults keep this a no-op on 0.23-era metadata (fields absent).
+        NB: 0.25.1 populates sliding_window=(-1, -1) unconditionally as the no-window sentinel —
+        normalize it before the check, else every batch reads nonplain and the legs go dead."""
+        sw = getattr(m, "sliding_window", None)
+        if isinstance(sw, (tuple, list)):
+            sw = None if tuple(sw) == (-1, -1) else sw
+        elif sw == -1:
+            sw = None
         return (
             isinstance(getattr(m, "causal", True), torch.Tensor)
             or getattr(m, "mm_prefix_range_tensor", None) is not None
-            or getattr(m, "sliding_window", None) is not None
+            or sw is not None
             or getattr(m, "rswa_prefix_lens", None) is not None
             or getattr(m, "rswa_window", None) is not None
             or getattr(m, "rswa_window_tensor", None) is not None

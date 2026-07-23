@@ -19,14 +19,37 @@ from __future__ import annotations
 
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
-from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+from vllm.v1.attention.backends.flash_attn import (
+    FlashAttentionBackend,
+    FlashAttentionMetadataBuilder,
+)
 
 from .impl import FlashAmpereImpl
 
 logger = init_logger(__name__)
 
 
+class FlashAmpereMetadataBuilder(FlashAttentionMetadataBuilder):
+    """FA builder + the CPU metadata twins the famp legs need for sync-free dispatch.
+
+    FlashAttentionMetadata carries only GPU query_start_loc/seq_lens; the legs used to
+    .tolist() them = 2 device syncs per LAYER per step (paid even when the mixed-batch
+    decline then sank the call to stock FA). CommonAttentionMetadata already holds the CPU
+    twins, but the impl never sees it — attach them here (once per STEP, no extra sync:
+    query_start_loc_cpu is a builder input; seq_lens_cpu a lazily-cached property)."""
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build: bool = False):
+        md = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        md.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        md.seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        return md
+
+
 class FlashAmpereBackend(FlashAttentionBackend):
+    @staticmethod
+    def get_builder_cls() -> type[FlashAmpereMetadataBuilder]:
+        return FlashAmpereMetadataBuilder
+
     @staticmethod
     def get_name() -> str:
         # Registered into the CUSTOM slot; AttentionBackendEnum["CUSTOM"] resolves cleanly.
