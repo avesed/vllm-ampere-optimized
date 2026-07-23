@@ -21,8 +21,8 @@ from typing import NamedTuple
 
 # Head dims each prefill leg accelerates. fp16-PV (fp16pv fp16-served / bf16cvt bf16-served) targets
 # the Qwen3.x hd256 full-attn layers; SageAttn targets the smaller dense hd's. Extend to widen.
-FP16PV_HEADS: tuple[int, ...] = (256, 512)  # fp16-served (q dtype == fp16); 512 = Gemma4 full-attn
-BF16CVT_HEADS: tuple[int, ...] = (256, 512)  # bf16-served (runtime upcast to fp16); 512 = Gemma4 full-attn
+FP16PV_HEADS: tuple[int, ...] = (128, 256, 512)  # fp16-served; 512=Gemma4; 128=BATCH path only
+BF16CVT_HEADS: tuple[int, ...] = (128, 256, 512)  # bf16-served (upcast); hd128 legacy leg declines
 XQA_VERIFY_HEADS: tuple[int, ...] = (64, 128, 256)  # MTP spec-verify (XQA headElems 64/128/256)
 SAGE_HEADS: tuple[int, ...] = (64, 96, 128)
 
