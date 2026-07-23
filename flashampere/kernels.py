@@ -118,6 +118,13 @@ class _BatchPrefillState:
         # _Hd512DecodeState._build_meta: fixed-size dest + trash slot, sliced by a CPU-known total).
         self._col = None
         self._buf = None
+        # paged_run fast-path template (recorded per step on the first layer): the FI wrapper's
+        # per-layer python (arg assembly + checks, ~200us/layer) does not hide under short kernels
+        # and was the residual e2e loss. Layers 2..N swap q/k/v/out into the recorded args by
+        # position and call module.paged_run directly (one ffi call).
+        self._tmpl: list | None = None
+        self._kw: dict | None = None
+        self._pos: tuple[int, int, int, int] | None = None
 
     def _get_wrapper(self):
         if self.wrapper is None:
@@ -134,6 +141,7 @@ class _BatchPrefillState:
         w = self._get_wrapper()
         if self._planned_meta_id == id(m):
             return w
+        self._tmpl = None  # new step -> re-record the paged_run arg template on the first layer
         ps = self.ps
         sl = sl_cpu.to(torch.int32)
         npg_cpu = (sl + ps - 1) // ps
@@ -166,6 +174,46 @@ class _BatchPrefillState:
         self._planned_meta_id = id(m)
         return w
 
+    def run_fast(self, w, q, kv_cache, out):
+        """First layer of a step: full wrapper.run with a paged_run recorder (correct-by-
+        construction args, whatever the FI patch level passes). Later layers: swap the four
+        per-layer tensors into the recorded template by identity/data_ptr and call the module's
+        paged_run directly. Falls back to wrapper.run whenever positions can't be located."""
+        mod = w._cached_module
+        kc, vc = kv_cache.unbind(1)
+        if self._tmpl is not None and self._pos is not None:
+            iq, ik, iv, io = self._pos
+            t = self._tmpl
+            t[iq], t[ik], t[iv], t[io] = q, kc, vc, out
+            out.zero_()  # match FI's torch.zeros out-init (split-KV merge contract)
+            mod.paged_run(*t, **self._kw)
+            return out
+        rec: dict = {}
+        orig = mod.paged_run
+        def _recorder(*a, **kw):
+            rec["a"], rec["kw"] = list(a), dict(kw)
+            return orig(*a, **kw)
+        mod.paged_run = _recorder
+        try:
+            out.zero_()
+            o = w.run(q, kv_cache, out=out)
+        finally:
+            mod.paged_run = orig
+        a = rec.get("a")
+        if a is not None:
+            def _find(x):
+                for i, v in enumerate(a):
+                    if v is x or (
+                        isinstance(v, torch.Tensor) and isinstance(x, torch.Tensor)
+                        and v.data_ptr() == x.data_ptr() and v.shape == x.shape
+                    ):
+                        return i
+                return -1
+            iq, ik, iv, io = _find(q), _find(kc), _find(vc), _find(out)
+            if -1 not in (iq, ik, iv, io):
+                self._tmpl, self._kw, self._pos = a, rec.get("kw") or {}, (iq, ik, iv, io)
+        return o
+
 
 _BP_STATES: dict[tuple, _BatchPrefillState] = {}
 
@@ -182,8 +230,7 @@ def _batch_prefill_run(impl, layer, query, key, value, kv_cache, m, output, qsl_
         st = _BP_STATES[skey] = _BatchPrefillState(impl, kv_cache, query.device)
     w = st.plan_step(m, qsl_cpu, sl_cpu)
     q = query.reshape(-1, impl.num_heads, impl.head_size)
-    o = w.run(q, kv_cache)
-    output.copy_(o.reshape(output.shape))
+    st.run_fast(w, q, kv_cache, output.reshape(q.shape))
     FIRE["calls"] += 1
     FIRE["batch"] += 1
     _log_fired_once("batch_prefill", int(q.shape[0]), -1, impl.head_size)
