@@ -68,9 +68,12 @@ class FlashAmpereImpl(FlashAttentionImpl):
         try:
             from vllm.config import get_current_vllm_config
 
-            self._fc_max_num_seqs = get_current_vllm_config().scheduler_config.max_num_seqs
+            _sc = get_current_vllm_config().scheduler_config
+            self._fc_max_num_seqs = _sc.max_num_seqs
+            self._fc_max_num_batched_tokens = _sc.max_num_batched_tokens
         except Exception:
             self._fc_max_num_seqs = None
+            self._fc_max_num_batched_tokens = None
 
     @staticmethod
     def _nonplain_metadata(m) -> bool:

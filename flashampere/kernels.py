@@ -49,6 +49,16 @@ _FP16_MAX = 65504.0
 # Per-PROCESS one-time "fired here" latch -> a per-rank log line under TP/PP (separate procs).
 _FIRED_LOGGED = False
 
+# Batch-prefill fast path: skip the defensive out.zero_() before paged_run (FI's run() inits out
+# with torch.zeros; the fa2 kernel/merge writes every row, so the zero is believed redundant —
+# A/B knob until validated, then default flips).
+_BP_ZERO = os.environ.get("FAMP_BP_NOZERO", "0") not in ("1", "true", "True")
+
+# Batch-prefill engagement floor: steps with fewer total query tokens than this (prefix-cache
+# hits, tiny tail chunks) stay on stock FA — the batch path's per-step plan() costs more than
+# its kernel win on few-ms ops. Measured crossover O(hundreds) of tokens on RTX 3090.
+_BP_MIN_TOKENS = int(os.environ.get("FAMP_BP_MIN_TOKENS", "512"))
+
 is_quantized_kv_cache = _fa.is_quantized_kv_cache
 
 
@@ -113,18 +123,19 @@ class _BatchPrefillState:
         self.kvdtype = kv_cache.dtype
         self.ws = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=dev)
         self.wrapper = None
-        self._planned_meta_id: int | None = None
-        # Scatter-compact constants for the sync-free indices flatten (same trick as
-        # _Hd512DecodeState._build_meta: fixed-size dest + trash slot, sliced by a CPU-known total).
-        self._col = None
-        self._buf = None
-        # paged_run fast-path template (recorded per step on the first layer): the FI wrapper's
-        # per-layer python (arg assembly + checks, ~200us/layer) does not hide under short kernels
-        # and was the residual e2e loss. Layers 2..N swap q/k/v/out into the recorded args by
-        # position and call module.paged_run directly (one ffi call).
+        # Scatter-compact machinery for the sync-free indices flatten (sized lazily; mb =
+        # block_table columns is unknown until the first step).
+        self._col = self._scatter = None
+        # paged_run template, recorded ONCE EVER: plan() hands the wrapper NEW plan-input tensors
+        # + plan_info each step -> plan_step refreshes those recorded slots; run_fast swaps only
+        # q/k/v/out per layer. NB non-graph wrapper on purpose: cuda-graph mode schedules every
+        # step at the locked worst-case row ceiling (args[6]=max_total_num_rows) -> padded grids,
+        # measured e2e loss; eager prefill wants exact per-step grids.
         self._tmpl: list | None = None
         self._kw: dict | None = None
-        self._pos: tuple[int, int, int, int] | None = None
+        self._pos: tuple[int, int, int, int] | None = None       # q, k, v, out arg slots
+        self._plan_slots: tuple[tuple[int, str], ...] | None = None  # (slot, wrapper attr)
+        self._planned: tuple | None = None
 
     def _get_wrapper(self):
         if self.wrapper is None:
@@ -137,62 +148,77 @@ class _BatchPrefillState:
         return self.wrapper
 
     def plan_step(self, m, qsl_cpu, sl_cpu):
-        """Plan once per step (id(m) = per-step metadata identity); later layers reuse."""
-        w = self._get_wrapper()
-        if self._planned_meta_id == id(m):
-            return w
-        self._tmpl = None  # new step -> re-record the paged_run arg template on the first layer
-        ps = self.ps
-        sl = sl_cpu.to(torch.int32)
-        npg_cpu = (sl + ps - 1) // ps
-        kv_indptr_cpu = torch.zeros(sl.numel() + 1, dtype=torch.int32)
-        kv_indptr_cpu[1:] = torch.cumsum(npg_cpu, 0).to(torch.int32)
-        klp_cpu = (sl - (npg_cpu - 1) * ps).to(torch.int32)
-        # Flatten the first npg[i] block ids of each block_table row WITHOUT a device sync:
-        # scatter valid entries to compacted positions in a fixed-size buffer (+1 trash slot),
-        # then slice by the CPU-known total page count.
-        bt = m.block_table
-        B, mb = bt.shape[0], bt.shape[1]
-        dev = bt.device
-        if self._col is None or self._col.numel() < B * mb:
-            self._col = torch.arange(mb, device=dev).unsqueeze(0).expand(B, -1).reshape(-1)
-            self._buf = torch.zeros(B * mb + 1, dtype=torch.int32, device=dev)
-        npg_dev = (m.seq_lens + ps - 1) // ps                                  # [B] GPU
-        col = self._col[: B * mb]
-        valid = col < npg_dev.unsqueeze(1).expand(-1, mb).reshape(-1)
-        out_pos = torch.cumsum(valid.to(torch.int64), 0) - 1
-        dest = torch.where(valid, out_pos, torch.full_like(out_pos, self._buf.numel() - 1))
-        self._buf.zero_()
-        self._buf.scatter_(0, dest, bt.reshape(-1).to(torch.int32))
-        total = int(kv_indptr_cpu[-1])
-        indices = self._buf[:total]
-        w.plan(
-            qsl_cpu.to(torch.int32), kv_indptr_cpu, indices, klp_cpu,
-            self.Hq, self.Hkv, self.D, ps, causal=True, sm_scale=self.sm,
-            window_left=-1, q_data_type=torch.float16, kv_data_type=self.kvdtype,
-        )
-        self._planned_meta_id = id(m)
+        """Plan once per step; refresh the template's plan-dependent slots. Any plan shortfall
+        declines the step to stock FA instead of raising."""
+        B = sl_cpu.numel()
+        # id(m) alone is unsafe (CPython reuses freed addresses across steps) -> add a cheap
+        # content fingerprint from the CPU twins (no device sync).
+        key = (id(m), B, int(qsl_cpu[-1]), int(sl_cpu.sum()))
+        if self._planned == key:
+            return self.wrapper
+        try:
+            w = self._get_wrapper()
+            ps = self.ps
+            sl = sl_cpu.to(torch.int32)
+            npg_cpu = (sl + ps - 1) // ps
+            kv_indptr_cpu = torch.zeros(B + 1, dtype=torch.int32)
+            kv_indptr_cpu[1:] = torch.cumsum(npg_cpu, 0).to(torch.int32)
+            klp_cpu = (sl - (npg_cpu - 1) * ps).to(torch.int32)
+            # Flatten the first npg[i] block ids of each block_table row WITHOUT a device sync:
+            # scatter valid entries to compacted positions (+1 trash slot), slice by the
+            # CPU-known total page count.
+            bt = m.block_table
+            mb = bt.shape[1]
+            dev = bt.device
+            if self._col is None or self._col.numel() < B * mb:
+                n = max(B, 8)
+                self._col = torch.arange(mb, device=dev).repeat(n)
+                self._scatter = torch.zeros(n * mb + 1, dtype=torch.int32, device=dev)
+            npg_dev = (m.seq_lens + ps - 1) // ps                              # [B] GPU
+            col = self._col[: B * mb]
+            valid = col < npg_dev.unsqueeze(1).expand(-1, mb).reshape(-1)
+            out_pos = torch.cumsum(valid.to(torch.int64), 0) - 1
+            dest = torch.where(valid, out_pos, torch.full_like(out_pos, self._scatter.numel() - 1))
+            self._scatter.zero_()
+            self._scatter.scatter_(0, dest, bt.reshape(-1).to(torch.int32))
+            total = int(kv_indptr_cpu[-1])
+            w.plan(
+                qsl_cpu.to(torch.int32), kv_indptr_cpu, self._scatter[:total], klp_cpu,
+                self.Hq, self.Hkv, self.D, ps, causal=True, sm_scale=self.sm,
+                window_left=-1, q_data_type=torch.float16, kv_data_type=self.kvdtype,
+            )
+        except KernelDecline:
+            raise
+        except Exception as e:
+            logger.warning_once("famp batch_prefill plan declined: %s", e)
+            raise KernelDecline from e
+        if self._tmpl is not None and self._plan_slots is not None:
+            t = self._tmpl
+            for i, attr in self._plan_slots:
+                t[i] = getattr(w, attr)
+        self._planned = key
         return w
 
     def run_fast(self, w, q, kv_cache, out):
-        """First layer of a step: full wrapper.run with a paged_run recorder (correct-by-
-        construction args, whatever the FI patch level passes). Later layers: swap the four
-        per-layer tensors into the recorded template by identity/data_ptr and call the module's
-        paged_run directly. Falls back to wrapper.run whenever positions can't be located."""
+        """Record ONCE EVER: the first call goes through the full wrapper.run under a paged_run
+        recorder (args correct-by-construction for whatever the FI patch level passes). Every
+        subsequent layer of every step is one direct module.paged_run ffi call: plan-dependent
+        slots are refreshed in plan_step, q/k/v/out swapped here by recorded position."""
         mod = w._cached_module
         kc, vc = kv_cache.unbind(1)
         if self._tmpl is not None and self._pos is not None:
             iq, ik, iv, io = self._pos
             t = self._tmpl
             t[iq], t[ik], t[iv], t[io] = q, kc, vc, out
-            out.zero_()  # match FI's torch.zeros out-init (split-KV merge contract)
+            if _BP_ZERO:
+                out.zero_()  # FI's torch.zeros out-init; FAMP_BP_NOZERO=1 skips it (A/B knob)
             mod.paged_run(*t, **self._kw)
             return out
         rec: dict = {}
         orig = mod.paged_run
-        def _recorder(*a, **kw):
-            rec["a"], rec["kw"] = list(a), dict(kw)
-            return orig(*a, **kw)
+        def _recorder(*args_, **kw_):
+            rec["a"], rec["kw"] = list(args_), dict(kw_)
+            return orig(*args_, **kw_)
         mod.paged_run = _recorder
         try:
             out.zero_()
@@ -210,8 +236,22 @@ class _BatchPrefillState:
                         return i
                 return -1
             iq, ik, iv, io = _find(q), _find(kc), _find(vc), _find(out)
-            if -1 not in (iq, ik, iv, io):
-                self._tmpl, self._kw, self._pos = a, rec.get("kw") or {}, (iq, ik, iv, io)
+            # Slots the wrapper REPLACES on every plan(): collect ALL occurrences per attr (the
+            # extended fa2 tail repeats qo/kv indptr) so each step's refresh covers every copy.
+            slots: list[tuple[int, str]] = []
+            ok = True
+            for attr in ("_plan_info", "_qo_indptr_buf", "_paged_kv_indptr_buf",
+                         "_paged_kv_indices_buf", "_paged_kv_last_page_len_buf"):
+                obj = getattr(w, attr, None)
+                found = [j for j, v in enumerate(a) if v is obj] if obj is not None else []
+                if not found:
+                    ok = False
+                    break
+                slots.extend((j, attr) for j in found)
+            if ok and -1 not in (iq, ik, iv, io):
+                self._tmpl, self._kw = a, rec.get("kw") or {}
+                self._pos = (iq, ik, iv, io)
+                self._plan_slots = tuple(slots)
         return o
 
 
@@ -287,6 +327,9 @@ def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: 
         and _sl_cpu is not None
         and qlens
         and min(qlens) > 1
+        # Small-q steps (prefix-cache hits, tail chunks) are a few-ms op where the per-step
+        # plan() tax exceeds the kernel win — leave those to stock FA. Full chunks engage.
+        and int(_qsl_cpu[-1]) >= _BP_MIN_TOKENS
     ):
         return _batch_prefill_run(
             impl, layer, query, key, value, kv_cache, m, output, _qsl_cpu, _sl_cpu, leg
