@@ -138,6 +138,7 @@ def main():
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--gpu-mem", type=float, default=0.92)
+    ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
 
@@ -174,6 +175,10 @@ def main():
         dtype="float16",
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
+        tensor_parallel_size=args.tp,
+        # Ampere fork convention: custom-AR crashes at init with expandable_segments
+        # (custom_all_reduce.cuh:455 'invalid argument') and garbles non-English on 2x3090.
+        disable_custom_all_reduce=True,
         gpu_memory_utilization=args.gpu_mem,
         enforce_eager=False,
         seed=args.seed,
