@@ -3882,6 +3882,15 @@ class GPUModelRunner(
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
         )
+        # Shape alone misclassifies a prefill whose prompt length equals
+        # uniform_decode_query_len; require every request to be past prefill.
+        if uniform_decode and force_uniform_decode is None:
+            uniform_decode = bool(
+                (
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                    >= self.input_batch.num_prompt_tokens[:num_reqs]
+                ).all()
+            )
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
         has_encoder_output = (
