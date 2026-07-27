@@ -17,6 +17,8 @@ change attention for every model.
 """
 from __future__ import annotations
 
+import torch
+
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.flash_attn import (
@@ -43,6 +45,68 @@ class FlashAmpereMetadataBuilder(FlashAttentionMetadataBuilder):
         md.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         md.seq_lens_cpu = common_attn_metadata.seq_lens_cpu
         return md
+
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._prewarm_xqa_verify(vllm_config, device)
+
+    def _prewarm_xqa_verify(self, vllm_config, device) -> None:
+        # 0.25.1 warmup dummy runs are non-spec (draft=0 -> Phase.DECODE), so the first
+        # VERIFY-shaped call per shape lands inside FULL-graph capture, where xqa_verify
+        # must decline (no JIT/alloc while capturing) -> base-FA gets baked into every
+        # captured graph and the leg never fires. Pre-build the module + per-batch
+        # buffers here: builder init runs eagerly in each worker before capture and has
+        # the full config. No-op unless the leg is enabled and spec-decode is on.
+        try:
+            from .impl import _caps
+            from . import xqa_verify as _xv
+
+            spec = vllm_config.speculative_config
+            if (
+                not _caps().enabled("xqa_verify")
+                or spec is None
+                or not spec.num_speculative_tokens
+                or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            ):
+                return
+            q_seq_len = 1 + spec.num_speculative_tokens
+            head_dim = self.headdim
+            q_dtype = self.model_config.dtype
+            if not _xv.is_supported_head_dim(head_dim) or q_dtype not in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                return
+            # Mirror the dispatcher's uniform-decode req ladder:
+            # num_reqs = min(num_tokens_padded // q_seq_len, max_num_seqs).
+            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+            sizes = self.compilation_config.cudagraph_capture_sizes or []
+            num_reqs_list = sorted(
+                {
+                    min(s // q_seq_len, max_num_seqs)
+                    for s in sizes
+                    if s >= q_seq_len and s % q_seq_len == 0
+                }
+            )
+            if not num_reqs_list:
+                return
+            _xv.prewarm(
+                q_dtype=q_dtype,
+                kv_dtype=self.kv_cache_dtype,
+                page_size=self.block_size,
+                head_dim=head_dim,
+                grp=self.num_heads_q // self.num_heads_kv,
+                q_seq_len=q_seq_len,
+                num_reqs_list=num_reqs_list,
+                Hkv=self.num_heads_kv,
+                device=device,
+            )
+        except Exception:
+            logger.warning(
+                "flashampere: xqa_verify prewarm failed; the VERIFY leg will decline "
+                "at capture and spec-verify will run on base FA",
+                exc_info=True,
+            )
 
 
 class FlashAmpereBackend(FlashAttentionBackend):
