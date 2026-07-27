@@ -354,7 +354,9 @@ class DFlashQwen3Model(nn.Module):
         # embedding table at that slot id. Some (e.g. MiMo DFlash) ship a
         # separate mask embedding tensor; when present it is loaded and
         # substituted for embed_tokens[mask_token_id] at embedding time.
-        self.mask_token_id = drafter_config.get("mask_token_id")
+        self.mask_token_id = drafter_config.get(
+            "mask_token_id", getattr(self.config, "mask_token_id", None)
+        )
         self.mask_embedding = nn.Parameter(
             torch.zeros(self.config.hidden_size, dtype=vllm_config.model_config.dtype),
             requires_grad=False,
@@ -687,7 +689,13 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         # re-coupling adjacent draft-block positions (fixes parallel-draft accept decay).
         # markov_rank=0 => plain DFlash: head disabled, no params, no behavior change.
         dflash_cfg = getattr(self.config, "dflash_config", None) or {}
-        self.markov_rank = int(dflash_cfg.get("markov_rank", 0) or 0)
+        # Upstream/DeepSeek-official DSpark configs carry markov_rank at the
+        # top level; fork exports carry it in dflash_config. Accept both.
+        self.markov_rank = int(
+            dflash_cfg.get("markov_rank")
+            or getattr(self.config, "markov_rank", 0)
+            or 0
+        )
         if self.markov_rank > 0:
             self.markov_w1 = nn.Embedding(target_vocab_size, self.markov_rank)
             self.markov_w2 = nn.Linear(self.markov_rank, target_vocab_size, bias=False)
