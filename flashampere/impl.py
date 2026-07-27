@@ -7,6 +7,8 @@ capability.py. The base FA forward already carries the MTP-verify fwd_kvcache fi
 (VLLM_FA2_KVCACHE_VERIFY), so VERIFY and DECODE sink to it unchanged."""
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
@@ -68,9 +70,12 @@ class FlashAmpereImpl(FlashAttentionImpl):
         try:
             from vllm.config import get_current_vllm_config
 
-            self._fc_max_num_seqs = get_current_vllm_config().scheduler_config.max_num_seqs
+            _sc = get_current_vllm_config().scheduler_config
+            self._fc_max_num_seqs = _sc.max_num_seqs
+            self._fc_max_num_batched_tokens = _sc.max_num_batched_tokens
         except Exception:
             self._fc_max_num_seqs = None
+            self._fc_max_num_batched_tokens = None
 
     @staticmethod
     def _nonplain_metadata(m) -> bool:
@@ -188,6 +193,13 @@ class FlashAmpereImpl(FlashAttentionImpl):
         # ever fires defensively (incl. spec-decode capture, where verify already sank above).
         capturing = torch.cuda.is_current_stream_capturing()
 
+        if os.environ.get("FAMP_DEBUG_DISPATCH"):
+            _ent = [e.name for e in resolve(key_t)]
+            logger.info(
+                "famp-debug phase=%s hd=%s qdt=%s entries=%s enabled=%s",
+                phase, self.head_size, query.dtype, _ent,
+                [n for n in _ent if self._caps.enabled(n)],
+            )
         for entry in resolve(key_t):
             if capturing and not entry.capture_safe:
                 continue
