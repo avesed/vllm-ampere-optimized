@@ -884,14 +884,46 @@ class SpeculativeConfig:
                     )
 
                 # DSpark heads served on the V1 DFlash-family path declare a
-                # registered draft arch (DFlashDraftModel / Gemma4DSparkModel)
-                # and are wrapped in EAGLEConfig like dflash; upstream's
-                # Qwen3DSparkModel and in-target DeepSeek-V4 dspark surfaces
-                # are left untouched for the V2 model runner.
+                # registered draft arch and are wrapped in EAGLEConfig like
+                # dflash. Upstream/DeepSeek-official exports declare
+                # Qwen3DSparkModel; V1 serves them via the same DFlash-family
+                # class (normalized below), so one checkpoint format works on
+                # both this fork and upstream vLLM. In-target DeepSeek-V4
+                # dspark surfaces are left untouched for the V2 model runner.
                 dspark_v1_head = self.method == "dspark" and any(
-                    arch in ("DFlashDraftModel", "Gemma4DSparkModel")
+                    arch
+                    in ("DFlashDraftModel", "Gemma4DSparkModel", "Qwen3DSparkModel")
                     for arch in self.draft_model_config.architectures
                 )
+                if (
+                    dspark_v1_head
+                    and "Qwen3DSparkModel" in self.draft_model_config.architectures
+                ):
+                    # Normalize the upstream arch to the V1 DFlash-family class
+                    # (registry maps Qwen3DSparkModel to the V2-only class).
+                    self.draft_model_config.hf_config.architectures = [
+                        "DFlashDraftModel"
+                    ]
+                    # Some upstream exports carry the dflash keys at the top
+                    # level only; synthesize dflash_config so every downstream
+                    # reader sees the canonical layout.
+                    if not getattr(
+                        self.draft_model_config.hf_config, "dflash_config", None
+                    ):
+                        self.draft_model_config.hf_config.dflash_config = {
+                            k: v
+                            for k in (
+                                "markov_rank",
+                                "mask_token_id",
+                                "target_layer_ids",
+                            )
+                            if (
+                                v := getattr(
+                                    self.draft_model_config.hf_config, k, None
+                                )
+                            )
+                            is not None
+                        }
 
                 # Replace hf_config for EAGLE draft_model
                 if self.method in ("eagle", "eagle3", "dflash") or dspark_v1_head:
