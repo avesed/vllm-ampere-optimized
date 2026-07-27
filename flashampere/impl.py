@@ -7,6 +7,8 @@ capability.py. The base FA forward already carries the MTP-verify fwd_kvcache fi
 (VLLM_FA2_KVCACHE_VERIFY), so VERIFY and DECODE sink to it unchanged."""
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
@@ -68,9 +70,12 @@ class FlashAmpereImpl(FlashAttentionImpl):
         try:
             from vllm.config import get_current_vllm_config
 
-            self._fc_max_num_seqs = get_current_vllm_config().scheduler_config.max_num_seqs
+            _sc = get_current_vllm_config().scheduler_config
+            self._fc_max_num_seqs = _sc.max_num_seqs
+            self._fc_max_num_batched_tokens = _sc.max_num_batched_tokens
         except Exception:
             self._fc_max_num_seqs = None
+            self._fc_max_num_batched_tokens = None
 
     @staticmethod
     def _nonplain_metadata(m) -> bool:
@@ -82,11 +87,18 @@ class FlashAmpereImpl(FlashAttentionImpl):
           - sliding_window on the METADATA (batch-level override of the impl's static window),
           - rswa_prefix_lens / rswa_window / rswa_window_tensor (Reference-SWA masking).
         Any of these set/non-default -> sink to stock FA (bit-faithful; FA implements them).
-        getattr defaults keep this a no-op on 0.23-era metadata (fields absent)."""
+        getattr defaults keep this a no-op on 0.23-era metadata (fields absent).
+        NB: 0.25.1 populates sliding_window=(-1, -1) unconditionally as the no-window sentinel —
+        normalize it before the check, else every batch reads nonplain and the legs go dead."""
+        sw = getattr(m, "sliding_window", None)
+        if isinstance(sw, (tuple, list)):
+            sw = None if tuple(sw) == (-1, -1) else sw
+        elif sw == -1:
+            sw = None
         return (
             isinstance(getattr(m, "causal", True), torch.Tensor)
             or getattr(m, "mm_prefix_range_tensor", None) is not None
-            or getattr(m, "sliding_window", None) is not None
+            or sw is not None
             or getattr(m, "rswa_prefix_lens", None) is not None
             or getattr(m, "rswa_window", None) is not None
             or getattr(m, "rswa_window_tensor", None) is not None
@@ -181,6 +193,13 @@ class FlashAmpereImpl(FlashAttentionImpl):
         # ever fires defensively (incl. spec-decode capture, where verify already sank above).
         capturing = torch.cuda.is_current_stream_capturing()
 
+        if os.environ.get("FAMP_DEBUG_DISPATCH"):
+            _ent = [e.name for e in resolve(key_t)]
+            logger.info(
+                "famp-debug phase=%s hd=%s qdt=%s entries=%s enabled=%s",
+                phase, self.head_size, query.dtype, _ent,
+                [n for n in _ent if self._caps.enabled(n)],
+            )
         for entry in resolve(key_t):
             if capturing and not entry.capture_safe:
                 continue

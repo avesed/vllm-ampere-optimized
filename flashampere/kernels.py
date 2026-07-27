@@ -37,7 +37,7 @@ except Exception as e:  # pragma: no cover - import guard
     logger.warning("flashinfer not importable (%s); flashampere prefill legs delegate to FA.", e)
 
 # Fire counter (read by the validation harness): totals + per-leg breakdown.
-FIRE = {"calls": 0, "seqs": 0, "fresh": 0, "cached": 0, "fp16pv": 0, "bf16cvt": 0}
+FIRE = {"calls": 0, "seqs": 0, "fresh": 0, "cached": 0, "fp16pv": 0, "bf16cvt": 0, "batch": 0}
 
 # bf16->fp16 upcast is lossless for attention inputs in the fp16 NORMAL range (fp16 carries 10
 # mantissa bits vs bf16's 7), but bf16's wider exponent can hold values above fp16 max (65504).
@@ -48,6 +48,16 @@ _FP16_MAX = 65504.0
 
 # Per-PROCESS one-time "fired here" latch -> a per-rank log line under TP/PP (separate procs).
 _FIRED_LOGGED = False
+
+# Batch-prefill fast path: skip the defensive out.zero_() before paged_run (FI's run() inits out
+# with torch.zeros; the fa2 kernel/merge writes every row, so the zero is believed redundant —
+# A/B knob until validated, then default flips).
+_BP_ZERO = os.environ.get("FAMP_BP_NOZERO", "0") not in ("1", "true", "True")
+
+# Batch-prefill engagement floor: steps with fewer total query tokens than this (prefix-cache
+# hits, tiny tail chunks) stay on stock FA — the batch path's per-step plan() costs more than
+# its kernel win on few-ms ops. Measured crossover O(hundreds) of tokens on RTX 3090.
+_BP_MIN_TOKENS = int(os.environ.get("FAMP_BP_MIN_TOKENS", "512"))
 
 is_quantized_kv_cache = _fa.is_quantized_kv_cache
 
@@ -99,6 +109,174 @@ def _log_fired_once(leg: str, Lq: int, ctx: int, D: int) -> None:
     )
 
 
+class _BatchPrefillState:
+    """De-taxed PREFILL: ONE batched paged-KV BatchPrefill run per layer on famp's vendored
+    fp16-PV kernel (wrapper._jit_module injection), planned ONCE per step from the CPU metadata
+    twins — no per-request loop, no paged->contiguous gather, no KV cast, zero device syncs.
+    Phase-1 scope: fp16-served only (FA_PV16 needs DTypeQ==half and an fp16 KV cache); eager
+    (prefill is not captured). One state per (layer head-config, page size)."""
+
+    def __init__(self, impl, kv_cache, dev):
+        self.Hq, self.Hkv, self.D = impl.num_heads, impl.num_kv_heads, impl.head_size
+        self.sm = impl.scale
+        self.ps = kv_cache.shape[2]
+        self.kvdtype = kv_cache.dtype
+        self.ws = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=dev)
+        self.wrapper = None
+        # Scatter-compact machinery for the sync-free indices flatten (sized lazily; mb =
+        # block_table columns is unknown until the first step).
+        self._col = self._scatter = None
+        # paged_run template, recorded ONCE EVER: plan() hands the wrapper NEW plan-input tensors
+        # + plan_info each step -> plan_step refreshes those recorded slots; run_fast swaps only
+        # q/k/v/out per layer. NB non-graph wrapper on purpose: cuda-graph mode schedules every
+        # step at the locked worst-case row ceiling (args[6]=max_total_num_rows) -> padded grids,
+        # measured e2e loss; eager prefill wants exact per-step grids.
+        self._tmpl: list | None = None
+        self._kw: dict | None = None
+        self._pos: tuple[int, int, int, int] | None = None       # q, k, v, out arg slots
+        self._plan_slots: tuple[tuple[int, str], ...] | None = None  # (slot, wrapper attr)
+        self._planned: tuple | None = None
+
+    def _get_wrapper(self):
+        if self.wrapper is None:
+            from .prefill._jit_batch_prefill import install_famp_batch_prefill
+
+            # By-key spec shim: plan() resolves the standard module path to famp's vendored
+            # fp16-PV kernel for exactly this config; other keys stay stock.
+            install_famp_batch_prefill(torch.float16, self.kvdtype, torch.float16, self.D)
+            self.wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.ws, "NHD")
+        return self.wrapper
+
+    def plan_step(self, m, qsl_cpu, sl_cpu):
+        """Plan once per step; refresh the template's plan-dependent slots. Any plan shortfall
+        declines the step to stock FA instead of raising."""
+        B = sl_cpu.numel()
+        # id(m) alone is unsafe (CPython reuses freed addresses across steps) -> add a cheap
+        # content fingerprint from the CPU twins (no device sync).
+        key = (id(m), B, int(qsl_cpu[-1]), int(sl_cpu.sum()))
+        if self._planned == key:
+            return self.wrapper
+        try:
+            w = self._get_wrapper()
+            ps = self.ps
+            sl = sl_cpu.to(torch.int32)
+            npg_cpu = (sl + ps - 1) // ps
+            kv_indptr_cpu = torch.zeros(B + 1, dtype=torch.int32)
+            kv_indptr_cpu[1:] = torch.cumsum(npg_cpu, 0).to(torch.int32)
+            klp_cpu = (sl - (npg_cpu - 1) * ps).to(torch.int32)
+            # Flatten the first npg[i] block ids of each block_table row WITHOUT a device sync:
+            # scatter valid entries to compacted positions (+1 trash slot), slice by the
+            # CPU-known total page count.
+            bt = m.block_table
+            mb = bt.shape[1]
+            dev = bt.device
+            if self._col is None or self._col.numel() < B * mb:
+                n = max(B, 8)
+                self._col = torch.arange(mb, device=dev).repeat(n)
+                self._scatter = torch.zeros(n * mb + 1, dtype=torch.int32, device=dev)
+            npg_dev = (m.seq_lens + ps - 1) // ps                              # [B] GPU
+            col = self._col[: B * mb]
+            valid = col < npg_dev.unsqueeze(1).expand(-1, mb).reshape(-1)
+            out_pos = torch.cumsum(valid.to(torch.int64), 0) - 1
+            dest = torch.where(valid, out_pos, torch.full_like(out_pos, self._scatter.numel() - 1))
+            self._scatter.zero_()
+            self._scatter.scatter_(0, dest, bt.reshape(-1).to(torch.int32))
+            total = int(kv_indptr_cpu[-1])
+            w.plan(
+                qsl_cpu.to(torch.int32), kv_indptr_cpu, self._scatter[:total], klp_cpu,
+                self.Hq, self.Hkv, self.D, ps, causal=True, sm_scale=self.sm,
+                window_left=-1, q_data_type=torch.float16, kv_data_type=self.kvdtype,
+            )
+        except KernelDecline:
+            raise
+        except Exception as e:
+            logger.warning_once("famp batch_prefill plan declined: %s", e)
+            raise KernelDecline from e
+        if self._tmpl is not None and self._plan_slots is not None:
+            t = self._tmpl
+            for i, attr in self._plan_slots:
+                t[i] = getattr(w, attr)
+        self._planned = key
+        return w
+
+    def run_fast(self, w, q, kv_cache, out):
+        """Record ONCE EVER: the first call goes through the full wrapper.run under a paged_run
+        recorder (args correct-by-construction for whatever the FI patch level passes). Every
+        subsequent layer of every step is one direct module.paged_run ffi call: plan-dependent
+        slots are refreshed in plan_step, q/k/v/out swapped here by recorded position."""
+        mod = w._cached_module
+        kc, vc = kv_cache.unbind(1)
+        if self._tmpl is not None and self._pos is not None:
+            iq, ik, iv, io = self._pos
+            t = self._tmpl
+            t[iq], t[ik], t[iv], t[io] = q, kc, vc, out
+            if _BP_ZERO:
+                out.zero_()  # FI's torch.zeros out-init; FAMP_BP_NOZERO=1 skips it (A/B knob)
+            mod.paged_run(*t, **self._kw)
+            return out
+        rec: dict = {}
+        orig = mod.paged_run
+        def _recorder(*args_, **kw_):
+            rec["a"], rec["kw"] = list(args_), dict(kw_)
+            return orig(*args_, **kw_)
+        mod.paged_run = _recorder
+        try:
+            out.zero_()
+            o = w.run(q, kv_cache, out=out)
+        finally:
+            mod.paged_run = orig
+        a = rec.get("a")
+        if a is not None:
+            def _find(x):
+                for i, v in enumerate(a):
+                    if v is x or (
+                        isinstance(v, torch.Tensor) and isinstance(x, torch.Tensor)
+                        and v.data_ptr() == x.data_ptr() and v.shape == x.shape
+                    ):
+                        return i
+                return -1
+            iq, ik, iv, io = _find(q), _find(kc), _find(vc), _find(out)
+            # Slots the wrapper REPLACES on every plan(): collect ALL occurrences per attr (the
+            # extended fa2 tail repeats qo/kv indptr) so each step's refresh covers every copy.
+            slots: list[tuple[int, str]] = []
+            ok = True
+            for attr in ("_plan_info", "_qo_indptr_buf", "_paged_kv_indptr_buf",
+                         "_paged_kv_indices_buf", "_paged_kv_last_page_len_buf"):
+                obj = getattr(w, attr, None)
+                found = [j for j, v in enumerate(a) if v is obj] if obj is not None else []
+                if not found:
+                    ok = False
+                    break
+                slots.extend((j, attr) for j in found)
+            if ok and -1 not in (iq, ik, iv, io):
+                self._tmpl, self._kw = a, rec.get("kw") or {}
+                self._pos = (iq, ik, iv, io)
+                self._plan_slots = tuple(slots)
+        return o
+
+
+_BP_STATES: dict[tuple, _BatchPrefillState] = {}
+
+
+def _batch_prefill_run(impl, layer, query, key, value, kv_cache, m, output, qsl_cpu, sl_cpu, leg):
+    key_cache, value_cache = kv_cache.unbind(1)
+    _reshape_and_cache_flash(
+        key, value, key_cache, value_cache,
+        m.slot_mapping, impl.kv_cache_dtype, layer._k_scale, layer._v_scale,
+    )
+    skey = (impl.num_heads, impl.num_kv_heads, impl.head_size, kv_cache.dtype, kv_cache.shape[2])
+    st = _BP_STATES.get(skey)
+    if st is None:
+        st = _BP_STATES[skey] = _BatchPrefillState(impl, kv_cache, query.device)
+    w = st.plan_step(m, qsl_cpu, sl_cpu)
+    q = query.reshape(-1, impl.num_heads, impl.head_size)
+    st.run_fast(w, q, kv_cache, output.reshape(q.shape))
+    FIRE["calls"] += 1
+    FIRE["batch"] += 1
+    _log_fired_once("batch_prefill", int(q.shape[0]), -1, impl.head_size)
+    return output
+
+
 def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: str = "fp16pv"):
     """fp16-PV prefill — gather/loop + fp16 FlashInfer with use_fp16_pv_reduction. Casts Q/K/V to fp16
     and runs FlashInfer with use_fp16_pv_reduction (DTypeProb=half). Serves BOTH:
@@ -114,10 +292,18 @@ def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: 
     if not _HAS_FI:
         raise KernelDecline
     guard_fp16 = leg == "bf16cvt"  # bf16 source: range-check Q/K/V before upcast (else inf on cast)
-    cu_list = m.query_start_loc.tolist()
+    # CPU twins attached by FlashAmpereMetadataBuilder -> zero device syncs here (and none paid
+    # when the mixed-batch check below declines). Device-tensor .tolist() is the legacy fallback.
+    _qsl_cpu = getattr(m, "query_start_loc_cpu", None)
+    _sl_cpu = getattr(m, "seq_lens_cpu", None)
+    if _qsl_cpu is not None and _sl_cpu is not None:
+        cu_list = _qsl_cpu.tolist()
+        seq_lens_cpu = _sl_cpu.tolist()
+    else:
+        cu_list = m.query_start_loc.tolist()
+        seq_lens_cpu = m.seq_lens.tolist()
     n_req = len(cu_list) - 1
     qlens = [int(cu_list[i + 1] - cu_list[i]) for i in range(n_req)]
-    seq_lens_cpu = m.seq_lens.tolist()
     # A decode row (q=1, ctx>0) mixed into a prefill batch (continuous batching) is the one shape FI
     # single_prefill can't do (q_len=1 -> max_mma_kv=0). For hd<=256 we DECLINE so stock FA handles
     # the whole mixed batch optimally. For hd>256 (Gemma4 512) FA has NO path (head_size>256 reject),
@@ -126,6 +312,32 @@ def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: 
         for i in range(n_req):
             if qlens[i] == 1 and seq_lens_cpu[i] > 1:
                 raise KernelDecline
+
+    # De-taxed batched path (opt-in VLLM_FAMP_BATCH_PREFILL=1): one paged BatchPrefill run on the
+    # vendored fp16-PV kernel — no gather/loop/casts. Phase-1 scope: fp16-served (FA_PV16 needs
+    # half Q AND half KV cache), hd<=256, CPU metadata present, no q_len=1 rows (paged q-tile floor).
+    batch_on = os.environ.get("VLLM_FAMP_BATCH_PREFILL", "0") in ("1", "true", "True")
+    if (
+        batch_on
+        and leg == "fp16pv"
+        and impl.head_size <= 256
+        and query.dtype == torch.float16
+        and kv_cache.dtype == torch.float16
+        and _qsl_cpu is not None
+        and _sl_cpu is not None
+        and qlens
+        and min(qlens) > 1
+        # Small-q steps (prefix-cache hits, tail chunks) are a few-ms op where the per-step
+        # plan() tax exceeds the kernel win — leave those to stock FA. Full chunks engage.
+        and int(_qsl_cpu[-1]) >= _BP_MIN_TOKENS
+    ):
+        return _batch_prefill_run(
+            impl, layer, query, key, value, kv_cache, m, output, _qsl_cpu, _sl_cpu, leg
+        )
+    # hd<256 through the LEGACY per-request leg measured e2e-NEGATIVE (leg tax > kernel win,
+    # −14..−48% TTFT on Qwen3-8B) — only the de-taxed batch path above may take those heads.
+    if impl.head_size < 256:
+        raise KernelDecline
 
     key_cache, value_cache = kv_cache.unbind(1)
     _reshape_and_cache_flash(
@@ -162,8 +374,17 @@ def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: 
         # (NaN fails the <=), so the leg never forwards a non-finite tensor into the cubin. Never
         # fires for real O(1-50) post-norm activations; pure insurance.
         if guard_fp16:
-            mx = max(float(q_src.abs().amax()), float(k_src.abs().amax()), float(v_src.abs().amax()))
-            if not (mx <= _FP16_MAX):
+            # One fused inf-norm per operand (no materialized .abs()) + a SINGLE device sync for
+            # all three (was 3 abs+amax kernels + 3 .item() syncs = the largest leg overhead,
+            # 41-46% measured). NaN still fails the <= (vector_norm propagates it).
+            mx = torch.maximum(
+                torch.maximum(
+                    torch.linalg.vector_norm(q_src, ord=float("inf")),
+                    torch.linalg.vector_norm(k_src, ord=float("inf")),
+                ),
+                torch.linalg.vector_norm(v_src, ord=float("inf")),
+            )
+            if not (float(mx) <= _FP16_MAX):
                 raise KernelDecline
         q = q_src.to(torch.float16)
         k = k_src.to(torch.float16)

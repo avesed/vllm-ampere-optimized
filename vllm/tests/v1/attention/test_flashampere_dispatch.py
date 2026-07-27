@@ -81,8 +81,13 @@ def test_fp16pv_legs_are_dtype_exclusive():
 
 
 def test_sage_owns_small_head_dims():
-    for hd in (64, 96, 128):
+    # hd64/96: sage only. hd128 joined the fp16-PV head sets for the BATCH prefill path
+    # (the legacy per-request leg declines hd<256 at runtime) -> fp16-PV row precedes sage.
+    for hd in (64, 96):
         assert _names(_key(Phase.PREFILL, hd)) == ("sage",), hd
+    assert _names(_key(Phase.PREFILL, 128, q_src=QSrc.HALF)) == ("fp16pv", "sage")
+    assert _names(_key(Phase.PREFILL, 128, q_src=QSrc.BF16)) == ("bf16cvt", "sage")
+    assert _names(_key(Phase.PREFILL, 128, q_src=QSrc.OTHER)) == ("sage",)
 
 
 def test_unsupported_head_dims_sink():
