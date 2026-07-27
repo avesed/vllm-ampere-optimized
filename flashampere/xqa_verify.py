@@ -99,6 +99,62 @@ def is_supported_head_dim(head_dim: int) -> bool:
     return head_dim in (64, 128, 256)  # XQA headElems (mha.h static_assert)
 
 
+def is_supported_page_size(page_size: int) -> bool:
+    # XQA tokensPerPage template instantiations. Mamba-aligned hybrids (GDN) use
+    # ~800-token attention pages -> the leg is structurally unsupported there.
+    return page_size in (16, 32, 64, 128, 256)
+
+
+_DECLINED_CAPTURE_WARNED = False
+_DECLINED_PAGE_LOGGED = False
+
+
+def _log_unsupported_page(page_size: int) -> None:
+    global _DECLINED_PAGE_LOGGED
+    if not _DECLINED_PAGE_LOGGED:
+        _DECLINED_PAGE_LOGGED = True
+        logger.info(
+            "FLASHAMPERE xqa_verify disabled: page_size=%d unsupported by XQA "
+            "(needs one of 16/32/64/128/256; mamba-aligned hybrid geometry) -> "
+            "spec-verify runs on base FA", page_size,
+        )
+
+
+def _decline_page(page_size: int) -> None:
+    _log_unsupported_page(page_size)
+    raise KernelDecline
+
+
+def prewarm(
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    page_size: int,
+    head_dim: int,
+    grp: int,
+    q_seq_len: int,
+    num_reqs_list: list[int],
+    Hkv: int,
+    device: torch.device,
+) -> None:
+    """Build the XQA module + per-batch buffers eagerly, BEFORE cudagraph capture.
+
+    0.25.1 warmup dummy runs build non-spec metadata (draft=0 -> Phase.DECODE), so no
+    VERIFY-shaped eager call ever reaches xqa_verify before FULL-graph capture; the
+    first call per shape then lands inside capture and the :126 guard declines ->
+    base-FA is baked into every captured graph and the leg silently never fires.
+    Called from FlashAmpereMetadataBuilder.__init__ (pre-capture, eager, has config)."""
+    if not is_supported_page_size(page_size):
+        _log_unsupported_page(page_size)  # expected on mamba-aligned hybrids
+        return
+    _module(q_dtype, kv_dtype, page_size, head_dim, grp, q_seq_len)
+    for n in num_reqs_list:
+        _buffers(n, q_seq_len, Hkv, device)
+    logger.info(
+        "FLASHAMPERE xqa_verify prewarmed (q_seq_len=%d head_dim=%d grp=%d page=%d "
+        "num_reqs=%s)", q_seq_len, head_dim, grp, page_size, num_reqs_list,
+    )
+
+
 def xqa_verify(impl, layer, query, key, value, kv_cache, m, output):
     """MTP verify (uniform q=1+K) through famp's vendored XQA. CUDAGRAPH-SAFE."""
     num_reqs = m.seq_lens.shape[0]
@@ -111,6 +167,8 @@ def xqa_verify(impl, layer, query, key, value, kv_cache, m, output):
         raise KernelDecline
 
     key_cache, value_cache = kv_cache.unbind(1)  # [num_blocks, page_size, Hkv, D] (NHD == XQA NHD)
+    if not is_supported_page_size(key_cache.shape[1]):
+        _decline_page(key_cache.shape[1])  # before the KV write; base FA does its own
     _fa.reshape_and_cache_flash(
         key, value, key_cache, value_cache,
         m.slot_mapping, impl.kv_cache_dtype, layer._k_scale, layer._v_scale,
@@ -124,6 +182,15 @@ def xqa_verify(impl, layer, query, key, value, kv_cache, m, output):
     mod_key = (query.dtype, key_cache.dtype, page_size, D, H // Hkv, q_seq_len)
     buf_key = (num_reqs, q_seq_len, Hkv, dev)
     if (mod_key not in _MODULES or buf_key not in _BUFS) and torch.cuda.is_current_stream_capturing():
+        global _DECLINED_CAPTURE_WARNED
+        if not _DECLINED_CAPTURE_WARNED:
+            _DECLINED_CAPTURE_WARNED = True
+            logger.warning(
+                "FLASHAMPERE xqa_verify declined during capture (mod=%s bufs=%s not "
+                "prewarmed) -> base-FA baked into this graph; prewarm missed this "
+                "shape (mod_key=%s buf_key=%s)",
+                mod_key in _MODULES, buf_key in _BUFS, mod_key, buf_key,
+            )
         raise KernelDecline
 
     try:
@@ -132,8 +199,12 @@ def xqa_verify(impl, layer, query, key, value, kv_cache, m, output):
         raise KernelDecline from e
     sem, seq_u32, mask = _buffers(num_reqs, q_seq_len, Hkv, dev)
 
-    q5 = query.view(num_reqs, 1, q_seq_len, H, D)       # view of the (persistent) query buffer
-    out5 = output.view(num_reqs, 1, q_seq_len, H, D)
+    # The query/output buffers can be cudagraph-padded past the batch's actual tokens
+    # (metadata says nt, the tensor holds the padded graph size) -> slice before the
+    # view; a full-size slice is a no-op view, so this is capture-safe.
+    nt = num_reqs * q_seq_len
+    q5 = query[:nt].view(num_reqs, 1, q_seq_len, H, D)
+    out5 = output[:nt].view(num_reqs, 1, q_seq_len, H, D)
     # Fixed grid for cudagraph: max_seq_len = block_table capacity (constant per captured shape);
     # the kernel handles actual per-request seq_lens (GPU) <= this.
     max_seq_len = int(m.block_table.shape[1]) * page_size
