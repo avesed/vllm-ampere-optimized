@@ -54,8 +54,13 @@ def override_config(config):
     global _config
     old_config = _config
     _config = config
-    yield
-    _config = old_config
+    # Ampere fork: restore in a finally — an exception inside the with-block (e.g. a Triton
+    # OutOfResources while sweeping tile configs) otherwise leaks the failing config into
+    # every later call in the process.
+    try:
+        yield
+    finally:
+        _config = old_config
 
 
 def get_config() -> dict[str, Any] | None:

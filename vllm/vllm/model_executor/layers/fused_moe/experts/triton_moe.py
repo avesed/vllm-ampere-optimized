@@ -231,6 +231,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             torch.bfloat16,
             torch.float8_e4m3fn,
             torch.float8_e4m3fnuz,
+            torch.int8,  # Ampere fork: int8-activation MoE (prepare quantizes upstream)
         ]
 
         # We declared expects_unquantized_inputs (LoRA + DP/EP all2all), so the
@@ -279,6 +280,10 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             or hidden_states.dtype == torch.float8_e4m3fnuz
         ):
             compute_type = tl.bfloat16
+        elif hidden_states.dtype == torch.int8:
+            # Ampere fork: int8 activations are pre-quantized by the prepare step; the GEMM
+            # accumulates in int32 and dequantizes, so compute_type is the OUTPUT dtype.
+            compute_type = tl.float16 if output.dtype == torch.float16 else tl.bfloat16
         else:
             raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
 
@@ -614,6 +619,7 @@ class TritonWNA16Experts(TritonExperts):
             torch.bfloat16,
             torch.float8_e4m3fn,
             torch.float8_e4m3fnuz,
+            torch.int8,  # Ampere fork: int8-activation MoE (prepare quantizes upstream)
         ]
 
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
@@ -643,6 +649,10 @@ class TritonWNA16Experts(TritonExperts):
             or hidden_states.dtype == torch.float8_e4m3fnuz
         ):
             compute_type = tl.bfloat16
+        elif hidden_states.dtype == torch.int8:
+            # Ampere fork: int8 activations are pre-quantized by the prepare step; the GEMM
+            # accumulates in int32 and dequantizes, so compute_type is the OUTPUT dtype.
+            compute_type = tl.float16 if output.dtype == torch.float16 else tl.bfloat16
         else:
             raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
 

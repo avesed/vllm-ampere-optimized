@@ -3,7 +3,7 @@
 # Clones fresh upstream into the vendored vllm/ + flashinfer/ trees and replays the edit recipe:
 #   vLLM:       patches/regenerate.py (0001 W4A8, anchor-based) + git apply 0002 (native marlin)
 #               + 0003 (AOT compile cache-key) + 0005 (int8-act MoE) + 0006 (CLI alias)
-#               + 0009 (famp-marlin config)
+#               + 0009 (famp-marlin config) + 0010 (int8-act W8A8 MoE enable)
 #               (the old patch-0004 int8qk standalone was REMOVED: int8-QK is net-negative)
 #               NOTE: 0007 (fp16-PV flashinfer) + 0008 (flashampere backend) are baked into the
 #               vendored trees but NOT yet replayed here — re-apply/verify them by hand on a re-vendor.
@@ -32,6 +32,7 @@ git apply -p1 --directory=vllm patches/0003-aot-compile-cache-quant-scheme-key.p
 git apply -p1 --directory=vllm patches/0005-int8act-moe-perexpert-ampere.patch # 0005 int8-act MoE per-expert scale (kernel un-gate + python)
 git apply -p1 --directory=vllm patches/0006-marlin-input-dtype-cli-alias.patch # 0006 --marlin-input-dtype CLI alias for VLLM_MARLIN_INPUT_DTYPE
 git apply -p1 --directory=vllm patches/0009-famp-marlin-config.patch # 0009 widen the int8-act override to FampMarlinKernel (vendored famp_marlin, built FROM SOURCE in build_image_source.sh stage 3)
+git apply -p1 --directory=vllm patches/0010-int8act-moe-w8a8-enable-ampere.patch # 0010 enable int8-activation W8A8 MoE (compressed-tensors) + tuned RTX 3090 config
 
 echo "== re-vendor FlashInfer $FI_TAG =="
 rm -rf flashinfer

@@ -1,0 +1,282 @@
+diff --git a/vllm/model_executor/layers/fused_moe/__init__.py b/vllm/model_executor/layers/fused_moe/__init__.py
+index 8f43427..7e8eabc 100644
+--- a/vllm/model_executor/layers/fused_moe/__init__.py
++++ b/vllm/model_executor/layers/fused_moe/__init__.py
+@@ -54,8 +54,13 @@ def override_config(config):
+     global _config
+     old_config = _config
+     _config = config
+-    yield
+-    _config = old_config
++    # Ampere fork: restore in a finally — an exception inside the with-block (e.g. a Triton
++    # OutOfResources while sweeping tile configs) otherwise leaks the failing config into
++    # every later call in the process.
++    try:
++        yield
++    finally:
++        _config = old_config
+ 
+ 
+ def get_config() -> dict[str, Any] | None:
+diff --git a/vllm/model_executor/layers/fused_moe/config.py b/vllm/model_executor/layers/fused_moe/config.py
+index ad2ed51..52d788b 100644
+--- a/vllm/model_executor/layers/fused_moe/config.py
++++ b/vllm/model_executor/layers/fused_moe/config.py
+@@ -37,6 +37,7 @@ def _get_config_dtype_str(
+     dtype: torch.dtype,
+     use_fp8_w8a8: bool = False,
+     use_fp8_w8a16: bool = False,
++    use_int8_w8a8: bool = False,
+     use_int8_w8a16: bool = False,
+     use_int4_w4a16: bool = False,
+     ocp_mx_scheme: str | None = None,
+@@ -50,6 +51,10 @@ def _get_config_dtype_str(
+         return "fp8_w8a8"
+     elif use_fp8_w8a16:
+         return "fp8_w8a16"
++    elif use_int8_w8a8:
++        # Ampere fork: without this arm the lookup asks for the bf16-named config file,
++        # so both our tuned JSON and upstream's own int8_w8a8 ones are unreachable.
++        return "int8_w8a8"
+     elif use_int8_w8a16:
+         return "int8_w8a16"
+     elif use_int4_w4a16:
+@@ -443,6 +448,7 @@ class FusedMoEQuantConfig:
+         return _get_config_dtype_str(
+             use_fp8_w8a8=self.use_fp8_w8a8,
+             use_fp8_w8a16=self.use_fp8_w8a16,
++            use_int8_w8a8=self.use_int8_w8a8,
+             use_int8_w8a16=self.use_int8_w8a16,
+             use_int4_w4a16=self.use_int4_w4a16,
+             ocp_mx_scheme=self.ocp_mx_scheme,
+diff --git a/vllm/model_executor/layers/fused_moe/configs/E=256,N=256,device_name=NVIDIA_GeForce_RTX_3090,dtype=int8_w8a8.json b/vllm/model_executor/layers/fused_moe/configs/E=256,N=256,device_name=NVIDIA_GeForce_RTX_3090,dtype=int8_w8a8.json
+new file mode 100644
+index 0000000..a5018ae
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/configs/E=256,N=256,device_name=NVIDIA_GeForce_RTX_3090,dtype=int8_w8a8.json
+@@ -0,0 +1,154 @@
++{
++    "1": {
++        "BLOCK_SIZE_M": 16,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 128,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 4,
++        "num_stages": 4
++    },
++    "2": {
++        "BLOCK_SIZE_M": 16,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 128,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 4,
++        "num_stages": 4
++    },
++    "4": {
++        "BLOCK_SIZE_M": 16,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 128,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 4,
++        "num_stages": 4
++    },
++    "8": {
++        "BLOCK_SIZE_M": 16,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 128,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 4,
++        "num_stages": 4
++    },
++    "16": {
++        "BLOCK_SIZE_M": 16,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 128,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 4,
++        "num_stages": 4
++    },
++    "24": {
++        "BLOCK_SIZE_M": 16,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 128,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 4,
++        "num_stages": 4
++    },
++    "32": {
++        "BLOCK_SIZE_M": 16,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 128,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 4,
++        "num_stages": 4
++    },
++    "48": {
++        "BLOCK_SIZE_M": 32,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 128,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 4,
++        "num_stages": 3
++    },
++    "64": {
++        "BLOCK_SIZE_M": 32,
++        "BLOCK_SIZE_N": 64,
++        "BLOCK_SIZE_K": 128,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 4,
++        "num_stages": 3
++    },
++    "96": {
++        "BLOCK_SIZE_M": 32,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 64,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 4,
++        "num_stages": 3
++    },
++    "128": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 64,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 4,
++        "num_stages": 3
++    },
++    "256": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 64,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 8,
++        "num_stages": 3
++    },
++    "512": {
++        "BLOCK_SIZE_M": 64,
++        "BLOCK_SIZE_N": 128,
++        "BLOCK_SIZE_K": 64,
++        "GROUP_SIZE_M": 1,
++        "num_warps": 8,
++        "num_stages": 3
++    },
++    "1024": {
++        "BLOCK_SIZE_K": 128,
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 64,
++        "GROUP_SIZE_M": 16,
++        "num_stages": 3,
++        "num_warps": 4
++    },
++    "1536": {
++        "BLOCK_SIZE_K": 128,
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 64,
++        "GROUP_SIZE_M": 16,
++        "num_stages": 3,
++        "num_warps": 4
++    },
++    "2048": {
++        "BLOCK_SIZE_K": 128,
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 64,
++        "GROUP_SIZE_M": 16,
++        "num_stages": 3,
++        "num_warps": 4
++    },
++    "3072": {
++        "BLOCK_SIZE_K": 128,
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 64,
++        "GROUP_SIZE_M": 1,
++        "num_stages": 2,
++        "num_warps": 4
++    },
++    "4096": {
++        "BLOCK_SIZE_K": 64,
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "GROUP_SIZE_M": 1,
++        "num_stages": 3,
++        "num_warps": 4
++    },
++    "8192": {
++        "BLOCK_SIZE_K": 64,
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 128,
++        "GROUP_SIZE_M": 1,
++        "num_stages": 4,
++        "num_warps": 4
++    }
++}
+\ No newline at end of file
+diff --git a/vllm/model_executor/layers/fused_moe/experts/triton_moe.py b/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
+index 3196667..029386e 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/triton_moe.py
+@@ -231,6 +231,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+             torch.bfloat16,
+             torch.float8_e4m3fn,
+             torch.float8_e4m3fnuz,
++            torch.int8,  # Ampere fork: int8-activation MoE (prepare quantizes upstream)
+         ]
+ 
+         # We declared expects_unquantized_inputs (LoRA + DP/EP all2all), so the
+@@ -279,6 +280,10 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
+             or hidden_states.dtype == torch.float8_e4m3fnuz
+         ):
+             compute_type = tl.bfloat16
++        elif hidden_states.dtype == torch.int8:
++            # Ampere fork: int8 activations are pre-quantized by the prepare step; the GEMM
++            # accumulates in int32 and dequantizes, so compute_type is the OUTPUT dtype.
++            compute_type = tl.float16 if output.dtype == torch.float16 else tl.bfloat16
+         else:
+             raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+ 
+@@ -614,6 +619,7 @@ class TritonWNA16Experts(TritonExperts):
+             torch.bfloat16,
+             torch.float8_e4m3fn,
+             torch.float8_e4m3fnuz,
++            torch.int8,  # Ampere fork: int8-activation MoE (prepare quantizes upstream)
+         ]
+ 
+         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
+@@ -643,6 +649,10 @@ class TritonWNA16Experts(TritonExperts):
+             or hidden_states.dtype == torch.float8_e4m3fnuz
+         ):
+             compute_type = tl.bfloat16
++        elif hidden_states.dtype == torch.int8:
++            # Ampere fork: int8 activations are pre-quantized by the prepare step; the GEMM
++            # accumulates in int32 and dequantizes, so compute_type is the OUTPUT dtype.
++            compute_type = tl.float16 if output.dtype == torch.float16 else tl.bfloat16
+         else:
+             raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index 269b6e3..704b44e 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -1648,6 +1648,7 @@ def fused_experts_impl(
+ 
+     config_dtype = _get_config_dtype_str(
+         use_fp8_w8a8=use_fp8_w8a8,
++        use_int8_w8a8=use_int8_w8a8,
+         use_int8_w8a16=use_int8_w8a16,
+         use_int4_w4a16=use_int4_w4a16,
+         dtype=hidden_states.dtype,
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/int8.py b/vllm/model_executor/layers/fused_moe/oracle/int8.py
+index 5a2b4c3..c7224a3 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/int8.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/int8.py
+@@ -204,7 +204,10 @@ def make_int8_moe_quant_config(
+         assert isinstance(layer, RoutedExperts)
+         return get_humming_moe_quant_config(layer)
+ 
+-    if a1_scale is None or a2_scale is None:
++    # Ampere fork: a dynamic per-token scheme has no STATIC a1/a2 scale by design (the
++    # scale is produced at runtime), so keying the W8A16 downgrade off `a1_scale is None`
++    # silently dropped per_act_token_quant and ran int8 weights against bf16 activations.
++    if a1_scale is None and a2_scale is None and not per_act_token_quant:
+         return int8_w8a16_moe_quant_config(
+             w1_scale=w1_scale,
+             w2_scale=w2_scale,

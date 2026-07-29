@@ -204,7 +204,10 @@ def make_int8_moe_quant_config(
         assert isinstance(layer, RoutedExperts)
         return get_humming_moe_quant_config(layer)
 
-    if a1_scale is None or a2_scale is None:
+    # Ampere fork: a dynamic per-token scheme has no STATIC a1/a2 scale by design (the
+    # scale is produced at runtime), so keying the W8A16 downgrade off `a1_scale is None`
+    # silently dropped per_act_token_quant and ran int8 weights against bf16 activations.
+    if a1_scale is None and a2_scale is None and not per_act_token_quant:
         return int8_w8a16_moe_quant_config(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
