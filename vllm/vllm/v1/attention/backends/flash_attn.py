@@ -979,7 +979,10 @@ class FlashAttentionImpl(AttentionImpl):
                     and self.alibi_slopes is None
                     and self.logits_soft_cap == 0
                     and self.sinks is None
-                    and q_descale is None
+                    # No q_descale term: flash_attn_supports_quant_query_input() is
+                    # True on every CUDA device, so q_descale is never None here. The
+                    # query is only really quantized when the KV cache is fp8/nvfp4,
+                    # which the next term already excludes.
                     and not is_quantized_kv_cache(self.kv_cache_dtype)
                     and not self.batch_invariant_enabled
                 ):
