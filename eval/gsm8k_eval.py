@@ -67,11 +67,30 @@ def _boxed_number(text: str) -> str | None:
                     break
             buf.append(c)
             i += 1
-        content = "".join(buf).replace(",", "").replace("$", "").replace("\\", " ")
-        nums = _NUM.findall(content)
+        # LaTeX thousands separators (\boxed{25{,}000}, \boxed{25\,000}) must not split the
+        # number, or 25000 extracts as "000".
+        nums = _NUM.findall(_delatex("".join(buf)))
         if nums:
             last = nums[-1].rstrip(".")
     return last
+
+
+def _delatex(text: str) -> str:
+    """Strip LaTeX grouping/spacing so 57{,}500 and 57\\,500 read as one number, not 57 and 500."""
+    text = text.replace(",", "").replace("$", "")
+    # \frac{a}{b} is a value, not two numbers — evaluate it before braces are stripped.
+    text = re.sub(
+        r"\\[dt]?frac\s*\{\s*(-?[\d.]+)\s*\}\s*\{\s*(-?[\d.]+)\s*\}",
+        lambda m: (f"{float(m.group(1)) / float(m.group(2)):.6f}".rstrip("0").rstrip(".")
+                   if float(m.group(2)) else " "),
+        text,
+    )
+    text = re.sub(r"\\[a-zA-Z]+", " ", text)
+    # An EMPTY group is a thousands separator and must join (57{,}500 -> 57500); any other brace
+    # separates operands and must not (\frac{400}{11} leftovers must never fuse into 40011).
+    text = re.sub(r"\{\s*\}", "", text)
+    text = text.replace("{", " ").replace("}", " ").replace("\\", " ")
+    return re.sub(r"(?<=\d)[\s~]+(?=\d{3}(?!\d))", "", text)
 
 
 def pred_number(completion: str) -> str | None:
@@ -80,8 +99,7 @@ def pred_number(completion: str) -> str | None:
     boxed = _boxed_number(ans)
     if boxed is not None:
         return boxed
-    ans = ans.replace(",", "")
-    nums = _NUM.findall(ans)
+    nums = _NUM.findall(_delatex(ans))
     return nums[-1].rstrip(".") if nums else None
 
 
@@ -98,7 +116,14 @@ def numbers_match(pred: str | None, gold: str | None) -> bool:
 # Dataset — read the cached openai/gsm8k 'main' test parquet (no internet needed).
 # --------------------------------------------------------------------------- #
 def load_gsm8k_test(n: int):
-    candidates = glob.glob(
+    # GSM8K_JSONL lets a machine without pyarrow (e.g. the docker host running the API eval) read a
+    # pre-converted {"question","answer"} JSONL instead of the parquet.
+    jsonl = os.environ.get("GSM8K_JSONL")
+    if jsonl:
+        rows = [json.loads(ln) for ln in open(jsonl) if ln.strip()]
+        print(f"[data] loaded {len(rows)} gsm8k test rows from {jsonl}", flush=True)
+        return rows[:n]
+    candidates = glob.glob(os.environ.get("GSM8K_PARQUET", "")) + glob.glob(
         os.path.expanduser(
             "~/.cache/huggingface/hub/datasets--openai--gsm8k/snapshots/"
             "*/main/test-00000-of-00001.parquet"

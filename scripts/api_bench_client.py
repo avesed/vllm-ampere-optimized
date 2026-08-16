@@ -22,7 +22,7 @@ def spec_metrics():
     out = {}
     try:
         for ln in requests.get(f"{BASE}/metrics", timeout=10).text.splitlines():
-            for k in ("vllm:spec_decode_num_drafts_total", "vllm:spec_decode_num_accepted_tokens_total"):
+            for k in ("vllm:spec_decode_num_draft_tokens_total", "vllm:spec_decode_num_accepted_tokens_total"):
                 if ln.startswith(k + " ") or ln.startswith(k + "{"):
                     out[k] = out.get(k, 0.0) + float(ln.split()[-1])
     except Exception:
@@ -66,9 +66,10 @@ def one(model, prompt, k, label, warmup=False):
     ttft = (tfirst - t0) * 1000 if tfirst else 0
     dec = (ctoks - 1) / (tlast - tfirst) if (ctoks and ctoks > 1 and tlast and tfirst) else 0
     pref = ptoks / (ttft / 1000) if (ptoks and ttft) else 0
-    nd = m1.get("vllm:spec_decode_num_drafts_total", 0) - m0.get("vllm:spec_decode_num_drafts_total", 0)
+    # num_draft_tokens counts K tokens per draft step, so steps = draft_tokens / K.
+    ndt = m1.get("vllm:spec_decode_num_draft_tokens_total", 0) - m0.get("vllm:spec_decode_num_draft_tokens_total", 0)
     na = m1.get("vllm:spec_decode_num_accepted_tokens_total", 0) - m0.get("vllm:spec_decode_num_accepted_tokens_total", 0)
-    acc = (1 + na / nd) if (k > 0 and nd) else 1.0
+    acc = (1 + na * k / ndt) if (k > 0 and ndt) else 1.0
     print(f"RESULT {label} plen={ptoks}: decode={dec:.1f} tok/s | prefill={pref:.0f} tok/s "
           f"(TTFT={ttft:.0f}ms) | accept_len={acc:.2f}", flush=True)
 
