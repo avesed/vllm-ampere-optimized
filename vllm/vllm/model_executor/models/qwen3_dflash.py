@@ -31,14 +31,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
 from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+    get_eagle3_aux_layers_from_config,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -49,6 +48,7 @@ from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
 from .utils import (
     AutoWeightsLoader,
+    WeightsMapper,
     get_draft_quant_config,
     maybe_prefix,
     process_eagle_weight,
@@ -56,6 +56,122 @@ from .utils import (
 
 logger = init_logger(__name__)
 
+
+_SLIDING_ATTENTION = "sliding_attention"
+
+
+def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
+    """Resolve explicit causality before falling back to legacy layer defaults."""
+    is_causal = getattr(config, "is_causal", None)
+    if is_causal is not None:
+        return bool(is_causal)
+    override = (getattr(config, "dflash_config", None) or {}).get("causal")
+    if override is not None:
+        return bool(override)
+    layer_types = getattr(config, "layer_types", None)
+    return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
+
+
+def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
+    """Whether the draft needs a non-causal-capable backend, resolved from config
+    (config mirror of the model's ``get_draft_attn_causal``, usable pre-build)."""
+    return not all(
+        _dflash_layer_causal(config, i) for i in range(config.num_hidden_layers)
+    )
+
+
+def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
+    """The target's RoPE layout, from its first attention layer.
+
+    A DFlash head must rotate Q/K the way the target it was distilled against
+    does, and a mismatch is silent — acceptance collapses but nothing errors and
+    the output stays correct. Draft checkpoints do not carry this, so take it
+    from the target. None if the target uses no RoPE.
+    """
+    language_model = (
+        target_model.get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
+    for module in language_model.modules():
+        style = getattr(module, "is_neox_style", None)
+        if isinstance(style, bool):
+            return style
+    return None
+
+
+def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
+    spec_config = vllm_config.speculative_config
+    config = spec_config.draft_model_config.hf_config
+    aux_layers = get_eagle3_aux_layers_from_config(spec_config)
+    num_features_to_use = len(aux_layers) if aux_layers else config.num_hidden_layers
+    target_hidden_size = (
+        getattr(config, "target_hidden_size", None) or config.hidden_size
+    )
+    return target_hidden_size * num_features_to_use
+
+
+def _resolve_layer_attention(
+    config: Qwen3Config, layer_idx: int
+) -> tuple[int | None, bool]:
+    """Resolve ``(sliding_window, causal)`` for one DFlash draft layer.
+
+    +----------------------+-------------------------+--------------------------------+
+    | Config               | ``layer_type``          | *``causal``                    |
+    +======================+=========================+================================+
+    | ``layer_types``      | SWA if ``use_swa``      | True if ``layer_types[i]=SWA`` |
+    |                      | else ``layer_types[i]`` | else False                     |
+    +----------------------+-------------------------+--------------------------------+
+    | ``layer_types=None`` | SWA                     | False                          |
+    | + ``use_swa=True``   |                         |                                |
+    +----------------------+-------------------------+--------------------------------+
+    | ``layer_types=None`` | Full                    | False                          |
+    | + ``use_swa=False``  |                         |                                |
+    +----------------------+-------------------------+--------------------------------+
+    * If ``dflash_config.causal`` is set, its value overrides ``causal`` for all layers.
+
+    This is to support a varied ecosystem of checkpoints, including:
+    - XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash (sets "use_swa", assumes non-causal)
+    - z-lab/gemma-4-31B-it-DFlash (has mixed layer types, assumes causal only for SWA)
+    - z-lab/Qwen3.5-9B-DFlash ("standard" DFlash, all full attn, assumes non-causal)
+    """
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    layer_types = getattr(config, "layer_types", None)
+    use_swa = dflash_config.get("use_swa", False)
+
+    any_sliding = False
+    if layer_types is not None:
+        num_sliding = sum(lt == _SLIDING_ATTENTION for lt in layer_types)
+        any_sliding = num_sliding > 0
+        # Mixed sliding/full attention needs multiple KV groups (V2 runner only).
+        if (
+            0 < num_sliding < len(layer_types)
+            and not get_current_vllm_config().use_v2_model_runner
+        ):
+            raise NotImplementedError(
+                "DFlash drafters with mixed sliding/full attention require "
+                "the V2 model runner; relaunch with "
+                "VLLM_USE_V2_MODEL_RUNNER=1."
+            )
+
+    # ``use_swa`` forces SWA on every layer, even an all-full ``layer_types``.
+    if layer_types is None or (use_swa and not any_sliding):
+        is_sliding = use_swa
+    else:
+        is_sliding = layer_types[layer_idx] == _SLIDING_ATTENTION
+
+    sliding_window = None
+    if is_sliding:
+        sliding_window = dflash_config.get(
+            "swa_window_size", getattr(config, "sliding_window", None)
+        )
+        if sliding_window is None:
+            raise ValueError(
+                "DFlash sliding attention requires a window size configured in "
+                "dflash_config.swa_window_size or the top-level sliding_window."
+            )
+
+    return sliding_window, _dflash_layer_causal(config, layer_idx)
 
 _DFLASH_VALID_LAYER_TYPES = frozenset({"full_attention", "sliding_attention"})
 
@@ -127,6 +243,7 @@ class DFlashAttention(Attention):
         return spec
 
 
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -145,6 +262,8 @@ class DFlashQwen3Attention(nn.Module):
         rms_norm_eps: float = 1e-06,
         attention_bias: bool = False,
         add_swa_attention_sink_bias: bool = False,
+        causal: bool = False,
+        is_neox_style: bool = True,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         sliding_window: int | None = None,
@@ -189,6 +308,7 @@ class DFlashQwen3Attention(nn.Module):
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=max_position,
+            is_neox_style=is_neox_style,
             rope_parameters=rope_parameters,
         )
         self.attention_sink_bias = (
@@ -208,6 +328,7 @@ class DFlashQwen3Attention(nn.Module):
             attn_type=attn_type,
             sinks=self.attention_sink_bias,
         )
+        self.causal = causal
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -269,6 +390,20 @@ class DFlashQwen3DecoderLayer(nn.Module):
             getattr(config, "add_swa_attention_sink_bias", False),
         )
 
+        # Causality and RoPE layout, upstream `_dflash_layer_causal` semantics
+        # resolved from layer_type (this layer is built with its type, not its
+        # index). RoPE layout is copied off the target at load time by the draft
+        # loader (`dflash_target_rope_is_neox_style`): checkpoints do not carry
+        # it, and a head distilled from an interleaved-RoPE target that rotates
+        # neox-style drafts wrong Q/K with no error raised.
+        is_causal = getattr(config, "is_causal", None)
+        if is_causal is None:
+            is_causal = dflash_config.get("causal")
+        causal = (
+            bool(is_causal) if is_causal is not None else layer_type == _SLIDING_ATTENTION
+        )
+        is_neox_style = getattr(config, "is_neox_style", True)
+
         self.self_attn = DFlashQwen3Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -277,6 +412,8 @@ class DFlashQwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=getattr(config, "attention_bias", False),
             add_swa_attention_sink_bias=add_swa_attention_sink_bias,
+            causal=causal,
+            is_neox_style=is_neox_style,
             head_dim=getattr(config, "head_dim", None),
             cache_config=cache_config,
             quant_config=quant_config,
@@ -321,6 +458,26 @@ class DFlashQwen3DecoderLayer(nn.Module):
 
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
+    decoder_layer_cls = DFlashQwen3DecoderLayer
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            "midlayer.": "layers.0.",
+            # Muse-Glimmer-30B-assistant names the aux-hidden-state encoder
+            # `encoder.fc` / `encoder.output_norm_enc`; this head calls them
+            # `fc` / `hidden_norm`. Same tensors and shapes, different names.
+            "encoder.output_norm_enc.": "hidden_norm.",
+            "encoder.fc.": "fc.",
+        },
+        orig_to_new_stacked={
+            ".q_proj": (".qkv_proj", "q"),
+            ".k_proj": (".qkv_proj", "k"),
+            ".v_proj": (".qkv_proj", "v"),
+            ".gate_proj": (".gate_up_proj", 0),
+            ".up_proj": (".gate_up_proj", 1),
+        },
+    )
+
     def __init__(
         self,
         *,
@@ -366,7 +523,7 @@ class DFlashQwen3Model(nn.Module):
         self.layer_types = _get_dflash_layer_types(self.config)
         self.layers = nn.ModuleList(
             [
-                DFlashQwen3DecoderLayer(
+                self.decoder_layer_cls(
                     current_vllm_config,
                     config=self.config,
                     cache_config=current_vllm_config.cache_config,
@@ -383,17 +540,10 @@ class DFlashQwen3Model(nn.Module):
             if layer.layer_type == "sliding_attention"
         }
         if self.use_aux_hidden_state:
-            num_features_to_use = self.config.num_hidden_layers
-            if "target_layer_ids" in drafter_config:
-                num_features_to_use = len(drafter_config["target_layer_ids"])
-            elif "layer_ids" in drafter_config:
-                num_features_to_use = len(drafter_config["layer_ids"])
-            if hasattr(self.config, "target_hidden_size"):
-                fc_input_size = self.config.target_hidden_size * num_features_to_use
-            else:
-                fc_input_size = self.config.hidden_size * num_features_to_use
             self.fc = ReplicatedLinear(
-                input_size=fc_input_size,
+                input_size=_get_dflash_fc_input_size(
+                    vllm_config,
+                ),
                 output_size=self.config.hidden_size,
                 bias=False,
                 params_dtype=vllm_config.model_config.dtype,
@@ -604,54 +754,31 @@ class DFlashQwen3Model(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        tp_rank = get_tensor_model_parallel_rank()
+    def _preprocess(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
         tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
         for name, loaded_weight in weights:
-            if "midlayer." in name:
-                name = name.replace("midlayer.", "layers.0.")
-            if "scale" in name:
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
             if "attention_sink_bias" in name:
-                if name not in params_dict:
-                    continue
                 # Sink bias is per-head; shard it across TP ranks like the
                 # attention heads themselves.
-                param = params_dict[name]
                 heads_per_rank = loaded_weight.shape[0] // tp_size
-                head_start = tp_rank * heads_per_rank
-                narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
-                param.data.copy_(narrow_weight)
-                loaded_params.add(name)
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+                loaded_weight = loaded_weight.narrow(
+                    0, tp_rank * heads_per_rank, heads_per_rank
+                )
+            yield name, loaded_weight
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(
+            self._preprocess(weights), mapper=self.hf_to_vllm_mapper
+        )
 
 
 class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+    model_cls = DFlashQwen3Model
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
@@ -661,7 +788,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
-        self.model = DFlashQwen3Model(
+        self.model = self.model_cls(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
             start_layer_id=target_layer_num,
@@ -741,6 +868,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
     ) -> torch.Tensor:
         return self.model(input_ids, positions, inputs_embeds)
 
+    def get_draft_kv_cache_layer_names(self) -> list[str]:
+        return [layer.self_attn.attn.layer_name for layer in self.model.layers]
+
+    def get_draft_attn_causal(self) -> list[bool]:
+        """Per-layer attention causality, aligned with
+        get_draft_kv_cache_layer_names."""
+        return [layer.self_attn.causal for layer in self.model.layers]
+
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
@@ -785,6 +920,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
             hidden_states = hidden_states.unsqueeze(0)
+        expected = self.model.fc.input_size
+        if hidden_states.shape[-1] != expected:
+            raise ValueError(
+                f"DFlash drafter expects {expected} concatenated aux hidden "
+                f"features but received {hidden_states.shape[-1]}. This usually "
+                "means the draft model's target_layer_ids reference layers that "
+                "do not exist in the target model (incompatible draft/target pair)."
+            )
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)
