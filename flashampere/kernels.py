@@ -21,6 +21,7 @@ import os
 import torch
 
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 from vllm.v1.attention.backends import flash_attn as _fa
 
 from .dispatch import KernelDecline
@@ -65,6 +66,22 @@ is_quantized_kv_cache = _fa.is_quantized_kv_cache
 def _reshape_and_cache_flash(*args, **kwargs):
     # Bound lazily (FA's varlen kernel binds reshape_and_cache_flash only on a real CUDA build).
     return _fa.reshape_and_cache_flash(*args, **kwargs)
+
+
+def _split_kv(kv_cache: torch.Tensor, head_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpack the paged cache: (B, H, N, 2*D) -> two (B, N, H, D) views, NHD as our kernels want.
+
+    vLLM 0.26 packed K and V into the content dim (upstream #44455), so the halves are no longer
+    the contiguous slabs the old leading-dim split returned: K and V now interleave per (block,
+    head, token) and only the head_size dim stays contiguous. Every famp KV consumer goes through
+    here so the layout lives in one place. Mirrors FlashAttentionImpl, including its
+    degenerate-stride fix for num_kv_heads=1 under TP.
+    """
+    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_size, dim=-1)
+    return (
+        canonicalize_singleton_dim_strides(key_cache),
+        canonicalize_singleton_dim_strides(value_cache),
+    )
 
 
 def _gather_one(cache: torch.Tensor, blk: torch.Tensor, n_blocks: int, seq_len: int) -> torch.Tensor:
@@ -205,7 +222,7 @@ class _BatchPrefillState:
         subsequent layer of every step is one direct module.paged_run ffi call: plan-dependent
         slots are refreshed in plan_step, q/k/v/out swapped here by recorded position."""
         mod = w._cached_module
-        kc, vc = kv_cache.unbind(1)
+        kc, vc = _split_kv(kv_cache, self.D)
         if self._tmpl is not None and self._pos is not None:
             iq, ik, iv, io = self._pos
             t = self._tmpl
@@ -259,7 +276,7 @@ _BP_STATES: dict[tuple, _BatchPrefillState] = {}
 
 
 def _batch_prefill_run(impl, layer, query, key, value, kv_cache, m, output, qsl_cpu, sl_cpu, leg):
-    key_cache, value_cache = kv_cache.unbind(1)
+    key_cache, value_cache = _split_kv(kv_cache, impl.head_size)
     _reshape_and_cache_flash(
         key, value, key_cache, value_cache,
         m.slot_mapping, impl.kv_cache_dtype, layer._k_scale, layer._v_scale,
@@ -339,7 +356,7 @@ def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: 
     if impl.head_size < 256:
         raise KernelDecline
 
-    key_cache, value_cache = kv_cache.unbind(1)
+    key_cache, value_cache = _split_kv(kv_cache, impl.head_size)
     _reshape_and_cache_flash(
         key, value, key_cache, value_cache,
         m.slot_mapping, impl.kv_cache_dtype, layer._k_scale, layer._v_scale,
@@ -421,7 +438,7 @@ def _decode_hd512_eager(impl, layer, query, key, value, kv_cache, m, output):
     the paged BatchPrefill wrapper is unavailable. Casts the (small) gathered KV to fp16."""
     if not _HAS_FI:
         raise KernelDecline
-    key_cache, value_cache = kv_cache.unbind(1)
+    key_cache, value_cache = _split_kv(kv_cache, impl.head_size)
     _reshape_and_cache_flash(
         key, value, key_cache, value_cache,
         m.slot_mapping, impl.kv_cache_dtype, layer._k_scale, layer._v_scale,
@@ -538,7 +555,7 @@ class _Hd512DecodeState:
         return w
 
     def run(self, impl, layer, query, key, value, kv_cache, m, output):
-        key_cache, value_cache = kv_cache.unbind(1)
+        key_cache, value_cache = _split_kv(kv_cache, impl.head_size)
         _reshape_and_cache_flash(
             key, value, key_cache, value_cache,
             m.slot_mapping, impl.kv_cache_dtype, layer._k_scale, layer._v_scale,
@@ -626,7 +643,7 @@ class _XqaHd512DecodeState:
         return b
 
     def run(self, impl, layer, query, key, value, kv_cache, m, output):
-        key_cache, value_cache = kv_cache.unbind(1)       # [num_blocks, page_size, Hkv, D] (NHD)
+        key_cache, value_cache = _split_kv(kv_cache, impl.head_size)  # [num_blocks, page_size, Hkv, D] (NHD)
         _reshape_and_cache_flash(
             key, value, key_cache, value_cache,
             m.slot_mapping, impl.kv_cache_dtype, layer._k_scale, layer._v_scale,
