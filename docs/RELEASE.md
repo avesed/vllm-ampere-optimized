@@ -15,13 +15,14 @@ watch-upstream.yml (cron, daily)
 
 maintainer, locally:
   1. scripts/revendor.sh <vllm_tag> <flashinfer_tag>   # only if upstream bumped; else skip
-       └─ clones fresh upstream into vllm/ + flashinfer/, replays the recipe
-          (regenerate.py 0001 + git apply 0002/0003/0005/0006/0009 + apply_to_source.py); drift FAILS LOUDLY
+       └─ 3-way MERGES the vendored trees onto the new tags in .revendor/ (no patch replay -- the
+          tree IS the fork). Conflicts stop it loudly; resolve, git add, then --sync-back.
+  1b. scripts/revendor.sh --sync-back                   # copy merged trees in + bump UPSTREAM_VLLM_VERSION
   2. git diff && git commit                             # review + commit the vendored trees
   3. OWNER=<you> scripts/build_image_source.sh          # from-source sm_80+sm_86 build → push ghcr :<tag>-ampere-<cu> + :latest
   4. (optional) scripts/smoke_test.sh <img> ; scripts/ampere_kernel_ci.sh <img> "$(cat UPSTREAM_VLLM_VERSION)"
-       W4A16_CKPT=<w4a16> W4A8_CKPT=<w4a8> scripts/int8_cudagraph_regression.sh <img>   # asserts patch 0003
-  5. echo <tag> > UPSTREAM_VLLM_VERSION && git commit   # bump the marker (revendor.sh already does this)
+       W4A16_CKPT=<w4a16> W4A8_CKPT=<w4a8> scripts/int8_cudagraph_regression.sh <img>   # asserts the AOT cache-key fix
+  5. echo <tag> > UPSTREAM_VLLM_VERSION && git commit   # bump the marker (--sync-back already does this)
 
 ```
 

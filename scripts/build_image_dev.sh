@@ -21,7 +21,7 @@ cd "$ROOT"
 : "${OWNER:?set OWNER}"
 
 FA_CMAKE="vllm/cmake/external_projects/vllm_flash_attn.cmake"
-[ -f "$FA_CMAKE" ] || { echo "::error::vendored $FA_CMAKE missing (run revendor first)"; exit 1; }
+[ -f "$FA_CMAKE" ] || { echo "::error::vendored $FA_CMAKE missing (incomplete vllm/ tree)"; exit 1; }
 
 # --- disable FA3 for this build only (backup + restore on exit) ---
 cp "$FA_CMAKE" "$FA_CMAKE.devbak"

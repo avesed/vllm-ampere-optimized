@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Build the COMPLETE Ampere int8 fork image FROM SOURCE from the VENDORED trees — no upstream
-# clone, no apply_patches (the vendored vllm/ + flashinfer/ ARE the fork, all edits baked in):
-#   stage 1: vLLM (W4A8 Marlin + int8-8row decode + int8qk_backend, baked into vllm/) from source
+# clone, no patch-apply step of any kind (the vendored vllm/ + flashinfer/ ARE the fork, every edit
+# is already in them):
+#   stage 1: vLLM (W4A8 Marlin routing + flashampere backend, baked into vllm/) from source
 #            via upstream vllm/docker/Dockerfile -> sm_80 + sm_86 fatbin.
-#   stage 2: overlay the vendored int8-QK flashinfer/ (docker/Dockerfile.flashinfer-int8).
+#   stage 2: overlay the vendored fp16-PV flashinfer/ (docker/Dockerfile.flashinfer-int8).
 # Push the final image to ghcr (:<tag>-ampere-<cu> + :latest).
 #
 # THIS IS THE RELEASE TOOL: run it YOURSELF on a local CUDA box and it pushes to ghcr. There is no CI
@@ -45,7 +46,7 @@ BUILDER="${BUILDER:---builder default}"; [ -n "${GITHUB_ACTIONS:-}" ] && BUILDER
 [ -f flashinfer/include/flashinfer/mma.cuh ] || { echo "::error::vendored flashinfer/ source missing"; exit 1; }
 
 # The upstream vLLM Dockerfile bind-mounts vllm/.git (setuptools-scm version + build commit), but the
-# vendored vllm/ has no .git (revendor strips it). Synthesize an ephemeral one tagged VLLM_TAG so the
+# vendored vllm/ has no .git (it is a plain source tree). Synthesize an ephemeral one tagged VLLM_TAG so the
 # build + the git-derived version resolve. Build-time only; never committed to the fork.
 if [ ! -d vllm/.git ]; then
   echo "== synthesizing ephemeral vllm/.git tagged ${VLLM_TAG} (for the Dockerfile's git-version mount) =="
@@ -97,8 +98,8 @@ docker buildx build . $BUILDER \
   --tag "$FI_IMG" --load
 
 # stage 3: compile the vendored famp_marlin FROM SOURCE on the from-source image (NOT an overlay on an
-# upstream wheel) + register the FampMarlinKernel plugin. P4 (the int8-act config widening) ships in the
-# vendored vllm/ via patches/0007.
+# upstream wheel) + register the FampMarlinKernel plugin. The int8-act config widening is already in the
+# vendored vllm/ tree (recorded as patches/0009).
 echo "== stage 3/3: compile vendored famp_marlin (sm: $FAMP_MARLIN_ARCH) + register plugin ($([ "$PUSH" = 1 ] && echo 'push to ghcr' || echo 'load locally')) =="
 docker buildx build . $BUILDER \
   --file docker/Dockerfile.famp-marlin \
