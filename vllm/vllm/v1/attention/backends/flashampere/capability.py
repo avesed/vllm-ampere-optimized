@@ -119,6 +119,28 @@ def detect(
     )
 
 
+_CAPS: "FlashAmpereCaps | None" = None
+
+
+def caps() -> "FlashAmpereCaps":
+    """Process-global caps (one GPU per process): detect once, reuse everywhere.
+
+    Shared by the backend (which must decide what it can claim before any impl exists) and the
+    impl, so both see the same probe result.
+    """
+    global _CAPS
+    if _CAPS is None:
+        inputs = gather_inputs()
+        probed = detect(**inputs)
+        if not inputs["cc_major"]:
+            # Device not resolvable yet (this can run during backend selection, before device
+            # init). Answer from the probe but do NOT memoize, or the worker would inherit a
+            # cap=OTHER verdict and every leg would stay off for the process lifetime.
+            return probed
+        _CAPS = probed
+    return _CAPS
+
+
 def gather_inputs() -> dict:
     """Collect the real runtime inputs for detect() (called once at backend init)."""
     cc_major = 0

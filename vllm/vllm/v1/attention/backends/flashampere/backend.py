@@ -26,6 +26,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 
+from . import capability
 from .impl import FlashAmpereImpl
 
 logger = init_logger(__name__)
@@ -139,7 +140,13 @@ class FlashAmpereBackend(FlashAttentionBackend):
         # prefill-only through famp for now; covered for prefill-bench / enforce-eager.)
         if head_size % 8 != 0:
             return False
-        return head_size <= 512
+        if head_size > 256:
+            # Every hd>256 leg needs the vendored fp16-PV kernel, and there is NO fallback here:
+            # super() is FA2, which raises "head dimension at most 256" and kills the engine on the
+            # first request. So when the kernel is absent (stock FlashInfer), decline the layer and
+            # let selection fall to TRITON, which does support hd512.
+            return capability.caps().has_fp16pv_kernel
+        return True
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
@@ -172,6 +179,8 @@ class FlashAmpereBackend(FlashAttentionBackend):
         # to TRITON/FLEX, which correctly carry their bidirectional image mm_prefix. Keep FA's sink
         # gate. hd512 has no stock fallback anyway (FA rejects >256), so famp must own it.
         if use_mm_prefix and head_size > 256:
+            if not capability.caps().has_fp16pv_kernel:
+                return "flashampere hd>256 needs the vendored fp16-PV FlashInfer kernel"
             if has_sink and device_capability < DeviceCapability(9, 0):
                 return "sink not supported on compute capability < 9.0"
             return None
