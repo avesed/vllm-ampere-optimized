@@ -28,8 +28,13 @@ IMAGE="ghcr.io/${OWNER,,}/vllm-ampere-optimized"       # ghcr path must be lower
 CU="cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')"
 # parallel compile TUs (bounds build RAM). Default = min(nproc, 8) for safety on unknown hosts; set
 # JOBS env to override (honored up to nproc) on a big build box with RAM headroom.
+# The default cap of 8 is a floor for small boxes, not a target: on a 64-core host it turns the
+# CUDA compile into a ~4.7h serial-ish crawl. Override with JOBS=<n> (and NVCC_THREADS, which only
+# needs to cover the arch count -- 2 is enough for an Ampere-only list). Watch RAM: heavy template
+# units run ~2GB per job.
 if [ -n "${JOBS:-}" ]; then NPROC=$(nproc); [ "$JOBS" -gt "$NPROC" ] && JOBS=$NPROC
 else JOBS=$(nproc); [ "$JOBS" -gt 8 ] && JOBS=8; fi
+NVCC_THREADS="${NVCC_THREADS:-4}"
 # GHA registry cache only works inside GitHub Actions; locally use docker's own layer cache.
 GHA_CACHE=""; [ -n "${GITHUB_ACTIONS:-}" ] && GHA_CACHE="--cache-from type=gha --cache-to type=gha,mode=max"
 # PUSH=1 (default) pushes the final image to ghcr; PUSH=0 builds it into the LOCAL docker (--load) for
@@ -80,7 +85,7 @@ docker buildx build vllm $BUILDER \
   --build-arg CUDA_VERSION="$CUDA_VERSION" \
   --build-arg torch_cuda_arch_list="$TORCH_CUDA_ARCH_LIST" \
   --build-arg max_jobs="$JOBS" \
-  --build-arg nvcc_threads=4 \
+  --build-arg nvcc_threads="$NVCC_THREADS" \
   --build-arg RUN_WHEEL_CHECK=false \
   --build-arg VLLM_SCM_VERSION="${VLLM_TAG#v}" \
   --build-arg VLLM_BUILD_COMMIT="${GITHUB_SHA:-unknown}" \
