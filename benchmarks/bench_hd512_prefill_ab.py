@@ -6,6 +6,14 @@ halving the O accumulator (fp16-PV). Since 0.6.12 could not run hd512 on Ampere 
 only became possible with the newer FlashInfer. It decides whether famp still needs to carry its
 own hd512 prefill kernel.
 
+⚠ TIMINGS FROM THIS HARNESS ARE NOT TRUSTWORTHY -- use bench_batch_prefill_ab.py for verdicts.
+Measured 2026-08-30: this harness reports famp ~2x SLOWER than stock at hd256/L=2048, while the
+batch/paged harness reports famp 1.22x FASTER for the same kernel, dtype and shape. The two differ
+in how the kernel is reached (this one calls famp's own `_prefill.single_prefill` marshalling with a
+64 MB tmp buffer and no `plan()`); serving goes through the batch/paged wrapper. The CORRECTNESS
+signal here is still useful (it is what showed famp's hd512 kernel is wrong on FlashInfer 0.6.16),
+the milliseconds are not.
+
 Legs:
   A  stock  flashinfer.single_prefill_with_kv_cache
   B  famp   vendored kernel, FA_USE_FP16_PV=0  (relaxed register heuristic, fp32 accumulate)
