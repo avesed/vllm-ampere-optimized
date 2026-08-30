@@ -94,19 +94,18 @@ def _gather_one(cache: torch.Tensor, blk: torch.Tensor, n_blocks: int, seq_len: 
 
 
 def _fi_prefill(q, k, v, *, causal, sm, o_dtype, use_fp16_pv=False):
-    """Single fp16 prefill (fp16-PV when requested). Default: FlashInfer single_prefill (the
-    use_fp16_pv_reduction param exists only on patch-0007 flashinfer; the caller gates it via
-    caps.has_fp16pv_kernel). Opt-in VLLM_FAMP_OWN_PREFILL=1: the famp-VENDORED prefill kernel
-    (own prefill.cuh + own run() marshalling) which drops the patched-flashinfer dependency —
-    validated cos=1.0 vs FI fp16-PV; default-off until e2e-validated (the fallback contract)."""
-    if os.environ.get("VLLM_FAMP_OWN_PREFILL", "0") in ("1", "true", "True"):
-        from .prefill import single_prefill as _own_prefill
-        return _own_prefill(q, k, v, causal=causal, sm_scale=sm, o_dtype=o_dtype, use_fp16_pv=use_fp16_pv)
-    kw = {"use_fp16_pv_reduction": True} if use_fp16_pv else {}
-    return flashinfer.single_prefill_with_kv_cache(
-        q, k, v, causal=causal, backend="fa2", o_dtype=o_dtype,
-        pos_encoding_mode="NONE", sm_scale=sm, **kw,
-    )
+    """Single fp16 prefill (fp16-PV when requested), always through famp's OWN vendored kernel.
+
+    This used to call flashinfer's single_prefill with use_fp16_pv_reduction=True, a parameter that
+    exists only on a patched flashinfer. famp carries its own prefill.cuh and adds the
+    -DFA_USE_FP16_PV cflag itself, so it needs flashinfer only as a JIT toolchain -- and the fp16-PV
+    win was measured that way, against a STOCK flashinfer 0.6.16 (hd256 batch prefill +19-23%). Going
+    through our own kernel unconditionally is what lets the vendored flashinfer stay plain upstream.
+    """
+    from .prefill import single_prefill as _own_prefill
+
+    return _own_prefill(q, k, v, causal=causal, sm_scale=sm, o_dtype=o_dtype,
+                        use_fp16_pv=use_fp16_pv)
 
 
 def _log_fired_once(leg: str, Lq: int, ctx: int, D: int) -> None:

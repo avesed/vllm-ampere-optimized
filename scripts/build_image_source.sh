@@ -4,7 +4,7 @@
 # is already in them):
 #   stage 1: vLLM (W4A8 Marlin routing + flashampere backend, baked into vllm/) from source
 #            via upstream vllm/docker/Dockerfile -> sm_80 + sm_86 fatbin.
-#   stage 2: overlay the vendored fp16-PV flashinfer/ (docker/Dockerfile.flashinfer-int8).
+#   stage 2: (skipped by default) overlay the vendored flashinfer/ -- now plain upstream.
 # Push the final image to ghcr (:<tag>-ampere-<cu> + :latest).
 #
 # THIS IS THE RELEASE TOOL: run it YOURSELF on a local CUDA box and it pushes to ghcr. There is no CI
@@ -89,13 +89,22 @@ docker buildx build vllm $BUILDER \
   $GHA_CACHE \
   --tag "$VLLM_IMG" --load
 
-echo "== stage 2/3: overlay vendored int8-QK flashinfer (load locally; the final push is stage 3) =="
-docker buildx build . $BUILDER \
-  --file docker/Dockerfile.flashinfer-int8 \
-  --build-arg BASE="$VLLM_IMG" \
-  --platform linux/amd64 \
-  --provenance=false \
-  --tag "$FI_IMG" --load
+# stage 2 exists to put a MODIFIED flashinfer into the image. The vendored flashinfer is now plain
+# upstream (identical to the version vLLM pins), because famp carries its own prefill.cuh and needs
+# flashinfer only as a JIT toolchain -- so the overlay is a no-op at best, and overlaying source over
+# an installed wheel is a risk at worst. Skipped by default; OVERLAY_FLASHINFER=1 forces it back.
+if [ "${OVERLAY_FLASHINFER:-0}" = "1" ]; then
+  echo "== stage 2/3: overlay vendored flashinfer (load locally; the final push is stage 3) =="
+  docker buildx build . $BUILDER \
+    --file docker/Dockerfile.flashinfer-int8 \
+    --build-arg BASE="$VLLM_IMG" \
+    --platform linux/amd64 \
+    --provenance=false \
+    --tag "$FI_IMG" --load
+else
+  echo "== stage 2/3: SKIPPED (vendored flashinfer is plain upstream; OVERLAY_FLASHINFER=1 to force) =="
+  FI_IMG="$VLLM_IMG"
+fi
 
 # stage 3: compile the vendored famp_marlin FROM SOURCE on the from-source image (NOT an overlay on an
 # upstream wheel) + register the FampMarlinKernel plugin. The int8-act config widening is already in the

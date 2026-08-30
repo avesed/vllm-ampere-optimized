@@ -45,7 +45,13 @@ prefill (paged + ragged). Validated real RTX 3090: cos 0.9999 vs fp16 single- AN
 head_dim 128/256, GQA, causal/non-causal, paged+ragged, qo<kv append); head_dim 64 guarded unsupported
 (k64B swizzle); e2e Qwen3.5-9B-W4A8 64k +1.9% / 128k chunked +2.0% TTFT. See `flashinfer_int8/NOTES.md`.
 
-**FlashInfer** (`flashinfer/`) — `0007-fp16-accum-pv-gated-flashinfer.patch`: **gated, half-only fp16-accumulate
+**FlashInfer** (`flashinfer/`) — `0007-fp16-accum-pv-gated-flashinfer.patch`: **⚠ RETIRED 2026-08-30 — the
+vendored `flashinfer/` is now PLAIN UPSTREAM.** famp carries its own copy of `prefill.cuh`
+(`flashampere/prefill/include/`) and passes `-DFA_USE_FP16_PV` itself, using FlashInfer only as a JIT
+toolchain; the fp16-PV win was measured that way against a stock FlashInfer 0.6.16 (hd256 batch prefill
++19-23%). So nothing needs a patched FlashInfer any more, `capability` probes famp's own header instead
+of FlashInfer's signature, and the dead int8-QK edits went with it. Kept below for the record: **gated,
+half-only fp16-accumulate
 PV** for the prefill kernel, productionized from the experimental `flashinfer_fp16pv/` below. Edits
 `include/.../prefill.cuh` (`compute_sfm_v` PV-MMA → `f16f16f16` into a uint32[4] `o_acc` behind
 `if constexpr (FA_PV16<KTraits>)`, materialize→float `o_frag` epilogue; `FA_PV16 = (FA_USE_FP16_PV!=0) &&

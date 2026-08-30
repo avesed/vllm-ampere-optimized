@@ -44,7 +44,6 @@ dtype_map = {
 }
 
 dtype_map_kv = {
-    torch.int8: "int8_t",
     torch.float16: "half",
     torch.bfloat16: "nv_bfloat16",
     torch.float8_e4m3fn: "__nv_fp8_e4m3",

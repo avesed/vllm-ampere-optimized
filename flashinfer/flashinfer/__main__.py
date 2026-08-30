@@ -90,6 +90,25 @@ except Exception:
     found_nvcc = False
 
 
+@cli.command("collect-env")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text")
+def collect_env_cmd(as_json):
+    """Dump a full environment report for bug reports.
+
+    Covers versions (flashinfer/torch/vllm/sglang/cudnn/...), GPU and driver
+    properties, and loaded-vs-installed GPU library disambiguation. Paste the
+    output into GitHub issues.
+    """
+    from .collect_env import collect_env_info, format_report
+    import json as json_mod
+
+    report = collect_env_info()
+    if as_json:
+        click.echo(json_mod.dumps(report, indent=2))
+    else:
+        click.echo(format_report(report))
+
+
 @cli.command("show-config")
 def show_config_cmd():
     """Show configuration"""
@@ -381,6 +400,63 @@ def export_compile_commands_cmd(path, output):
         )
     except Exception as e:
         click.secho(f"❌ Failed to write compile commands: {e}", fg="red")
+
+
+@cli.command("generate-tactics-blocklist")
+@click.option(
+    "--output",
+    "-o",
+    default=None,
+    help="Output JSON path. Default: tactics_<gpu_name>.json",
+)
+@click.option(
+    "--quant-modes",
+    multiple=True,
+    help=(
+        "Quant mode(s) to probe; repeat the flag to pass several. "
+        "Defaults to all. Choices: NvFP4xNvFP4, Fp8-Block, NvFP4-CUTLASS, "
+        "Fp8-PerTensor-CUTLASS, BF16-CUTLASS, BF16-Relu2-CUTLASS"
+    ),
+)
+@click.option("--num-tokens", type=int, default=64, show_default=True)
+@click.option("--num-experts", type=int, default=256, show_default=True)
+@click.option("--hidden-size", type=int, default=7168, show_default=True)
+@click.option("--intermediate-size", type=int, default=2048, show_default=True)
+@click.option("--top-k", type=int, default=8, show_default=True)
+@click.option(
+    "--device", default="cuda:0", show_default=True, help="CUDA device to probe"
+)
+def generate_tactics_blocklist_cmd(
+    output,
+    quant_modes,
+    num_tokens,
+    num_experts,
+    hidden_size,
+    intermediate_size,
+    top_k,
+    device,
+):
+    """Probe the local GPU and write an offline tactics blocklist JSON.
+
+    The autotuner consumes the file at runtime via the
+    FLASHINFER_TACTICS_BLOCKLIST environment variable, skipping known-invalid
+    tactics before profiling. Requires a GPU.
+    """
+    from .tactics_blocklist_gen import generate
+
+    try:
+        generate(
+            output=output,
+            quant_modes=list(quant_modes) or None,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            device=device,
+        )
+    except ValueError as e:
+        raise click.BadParameter(str(e)) from e
 
 
 @cli.command("replay")
