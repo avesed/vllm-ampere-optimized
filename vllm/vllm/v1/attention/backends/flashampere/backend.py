@@ -141,11 +141,17 @@ class FlashAmpereBackend(FlashAttentionBackend):
         if head_size % 8 != 0:
             return False
         if head_size > 256:
-            # Every hd>256 leg needs the vendored fp16-PV kernel, and there is NO fallback here:
-            # super() is FA2, which raises "head dimension at most 256" and kills the engine on the
-            # first request. So when the kernel is absent (stock FlashInfer), decline the layer and
-            # let selection fall to TRITON, which does support hd512.
-            return capability.caps().has_fp16pv_kernel
+            # famp no longer claims large heads. Two independent reasons, both measured on a 3090
+            # against FlashInfer 0.6.16 (which enabled FA2 large-head on SM80+ in #3739):
+            #   1. CORRECTNESS -- famp's vendored 0.6.12 prefill.cuh has no VO-split
+            #      (NUM_MMA_D_VO_TILE) while the 0.6.16 headers it compiles against assume one, so
+            #      hd512 prefill returns cos~0.25/nan. The same header is cos 1.0 at hd<=256.
+            #   2. PERFORMANCE -- stock is simply better here now. hd512 decode over 90 points
+            #      (bs 1-64 x ctx 2k-16k x fp16/bf16): famp's XQA is 0.68-0.86x of stock's decode
+            #      and plateaus at ~65-70% of DRAM roofline where stock reaches 90-94%.
+            # There is also no safe sink: super() is FA2, which raises "head dimension at most 256".
+            # Declining lets selection pick FlashInfer/TRITON, which handle hd512 correctly.
+            return False
         return True
 
     @classmethod

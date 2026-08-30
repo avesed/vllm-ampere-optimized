@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""flashampere must not claim head_size > 256 without the kernel that can serve it.
+"""flashampere must not claim head_size > 256.
 
-famp extends past FA's 256 ceiling only through its vendored fp16-PV FlashInfer prefill. If that
-kernel is missing (stock FlashInfer) and famp still claims the layer, the call falls through to
-super() = FA2, which raises "FlashAttention forward only supports head dimension at most 256" and
-kills the engine core on the first request -- observed on gemma-4 (hd512 global layers) against a
-stock vLLM 0.28 image. Declining instead lets backend selection pick TRITON, which supports hd512.
+Three reasons, all measured on a 3090 against FlashInfer 0.6.16:
+  - famp's vendored 0.6.12 prefill.cuh returns cos~0.25/nan at hd512 there (no VO-split);
+  - stock beats famp's XQA at hd512 decode (0.68-0.86x over 90 points);
+  - there is no safe sink anyway -- super() is FA2, which raises "head dimension at most 256"
+    and kills the engine core on the first request (observed on gemma-4 against a stock 0.28 image).
 """
 
 import pytest
@@ -48,8 +48,10 @@ def test_hd512_declined_without_the_fp16pv_kernel(caps_without_kernel):
     assert FlashAmpereBackend.supports_head_size(320) is False
 
 
-def test_hd512_claimed_when_the_kernel_is_present(caps_with_kernel):
-    assert FlashAmpereBackend.supports_head_size(512) is True
+def test_hd512_declined_even_with_the_kernel_present(caps_with_kernel):
+    # The fp16-PV probe must not re-open the large-head path: on 0.6.16 that kernel is wrong at
+    # hd512, so a True probe would put garbage into production rather than a crash.
+    assert FlashAmpereBackend.supports_head_size(512) is False
 
 
 def test_head_sizes_up_to_256_are_unaffected(caps_without_kernel):
