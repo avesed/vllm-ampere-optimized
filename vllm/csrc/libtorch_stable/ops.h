@@ -400,7 +400,11 @@ void fused_kda_decode(
     torch::stable::Tensor& out, std::optional<double> lower_bound,
     std::optional<torch::stable::Tensor> output_gate,
     std::optional<torch::stable::Tensor> norm_weight, double norm_eps);
+#endif
 
+// Declared under the GDN guard, not the KDA one: the binding uses
+// VLLM_ENABLE_FUSED_GDN_DECODE, and an Ampere-only arch list enables GDN but not KDA.
+#ifdef VLLM_ENABLE_FUSED_GDN_DECODE
 void fused_gdn_decode_post_conv_mtp(
     torch::stable::Tensor const& mixed_qkv, torch::stable::Tensor const& a,
     torch::stable::Tensor const& b, torch::stable::Tensor const& a_log,
