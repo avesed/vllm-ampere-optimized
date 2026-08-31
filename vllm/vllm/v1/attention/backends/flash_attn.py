@@ -1139,7 +1139,7 @@ class FlashAttentionImpl(AttentionImpl):
                     and num_actual_tokens == num_reqs * q_len
                     and causal is True
                     and dynamic_causal is None
-                    and mm_prefix_ranges is None
+                    and mm_prefix_query_ranges is None
                     and attn_metadata.rswa_prefix_lens is None
                     and (
                         sliding_window_size is None
