@@ -11,6 +11,7 @@ from vllm.v1.attention.backends.mla.prefill.base import (
     MLADimensions,
     MLAPrefillBackend,
 )
+from vllm.v1.attention.backends.utils import log2_lse_to_ln
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
@@ -90,6 +91,8 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
         self._query_seq_lens = (
             prefill_metadata.query_start_loc[1:] - prefill_metadata.query_start_loc[:-1]
         )
+        assert prefill_metadata.query_lens_cpu is not None
+        self._query_seq_lens_cpu = prefill_metadata.query_lens_cpu
 
     def supports_out(self) -> bool:
         # Output head dim is v.shape[-1] == v_head_dim, so `out` is unpadded.
@@ -134,11 +137,13 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             is_causal=True,
             return_lse=return_softmax_lse,
             out=out,
+            q_seq_lens_cpu=self._query_seq_lens_cpu,
+            kv_seq_lens_cpu=self._query_seq_lens_cpu,
         )
 
         if isinstance(ret, tuple):
             # Convert from (q_len, num_heads) to (num_heads, q_len)
-            return ret[0], ret[1].transpose(0, 1)
+            return ret[0], log2_lse_to_ln(ret[1].transpose(0, 1))
         return ret
 
     def run_prefill_context_chunk(
@@ -179,7 +184,9 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             is_causal=False,
             return_lse=True,
             out=out,
+            q_seq_lens_cpu=self._query_seq_lens_cpu[chunk.request_slice],
+            kv_seq_lens_cpu=chunk.seq_lens,
         )
 
         # Convert from (q_len, num_heads) to (num_heads, q_len)
-        return attn_out, lse.transpose(0, 1)
+        return attn_out, log2_lse_to_ln(lse.transpose(0, 1))

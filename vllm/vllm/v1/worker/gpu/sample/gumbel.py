@@ -13,6 +13,12 @@ from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 # attribute is `None`, and `tl.constexpr(...)` would crash at import time.
 _TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-10
 
+# Offset salt keeping the draft's Gumbel noise disjoint from the target's.
+# Verification is a probability-ratio test, not a Gumbel coupling, so a proposal
+# and the residual it is resampled from must not share a noise vector.
+# Positions are int64 and never approach 2**30, so the streams cannot collide.
+_DRAFT_NOISE_SALT = tl.constexpr(1 << 30) if HAS_TRITON else (1 << 30)
+
 
 @triton.jit
 def _temperature_kernel(
@@ -89,6 +95,7 @@ def gumbel_noised_argmax(
     seed,
     pos,
     temp,
+    IS_DRAFTING: tl.constexpr,
     USE_FP64: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr = True,
 ):
@@ -108,6 +115,8 @@ def gumbel_noised_argmax(
     if USE_FP64:
         logits = logits.to(tl.float64)
     if temp != 0.0:
+        if IS_DRAFTING:
+            pos = pos + _DRAFT_NOISE_SALT
         gumbel_seed = tl.randint(seed, pos)
         if USE_FP64:
             u = tl_rand64(gumbel_seed, keys, includes_zero=False)
@@ -131,10 +140,13 @@ def gumbel_block_argmax(
     temp_ptr,
     seeds_ptr,
     pos_ptr,
+    # [max_num_reqs, num_cols, vocab_size]
     logits_cache_ptr,
-    logits_cache_stride,
+    logits_cache_stride_0,
+    logits_cache_stride_1,
     logits_cache_col_ptr,
     vocab_size,
+    IS_DRAFTING: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr = False,
@@ -155,8 +167,8 @@ def gumbel_block_argmax(
             col = tl.load(logits_cache_col_ptr)
         tl.store(
             logits_cache_ptr
-            + req_state_idx * logits_cache_stride
-            + col * vocab_size
+            + req_state_idx * logits_cache_stride_0
+            + col * logits_cache_stride_1
             + block,
             logits,
             mask=mask & is_valid_req,
@@ -171,6 +183,7 @@ def gumbel_block_argmax(
         seed,
         pos,
         temp,
+        IS_DRAFTING=IS_DRAFTING,
         USE_FP64=USE_FP64,
         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
     )
@@ -182,8 +195,10 @@ def _gumbel_sample_kernel(
     local_argmax_stride,
     local_max_ptr,
     local_max_stride,
+    # [max_num_reqs, num_cols, vocab_size]
     logits_cache_ptr,
-    logits_cache_stride,
+    logits_cache_stride_0,
+    logits_cache_stride_1,
     logits_cache_col_ptr,
     logits_ptr,
     logits_stride,
@@ -193,6 +208,7 @@ def _gumbel_sample_kernel(
     temp_ptr,
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
+    IS_DRAFTING: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr,
@@ -218,9 +234,11 @@ def _gumbel_sample_kernel(
         seeds_ptr,
         pos_ptr,
         logits_cache_ptr,
-        logits_cache_stride,
+        logits_cache_stride_0,
+        logits_cache_stride_1,
         logits_cache_col_ptr,
         vocab_size,
+        IS_DRAFTING=IS_DRAFTING,
         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
         USE_FP64=USE_FP64,
         PER_TOKEN_COL=PER_TOKEN_COL,
@@ -237,6 +255,7 @@ def gumbel_sample(
     seed: torch.Tensor,  # [max_num_reqs]
     pos: torch.Tensor,  # [num_tokens]
     apply_temperature: bool,
+    is_drafting: bool,
     logits_cache: torch.Tensor | None = None,  # [max_num_reqs, num_cols, vocab_size]
     logits_cache_col: torch.Tensor | None = None,  # scalar or [num_tokens]
     use_fp64: bool = False,
@@ -247,6 +266,12 @@ def gumbel_sample(
     if logits_cache_col is not None:
         logits_cache_col = logits_cache_col.contiguous()
     num_tokens, vocab_size = logits.shape
+    if logits_cache is not None:
+        assert logits_cache.size(-1) >= vocab_size, (
+            f"draft logits cache vocab dim ({logits_cache.size(-1)}) is narrower "
+            f"than the sampled logits ({vocab_size}). Cached logits would be "
+            "truncated."
+        )
     BLOCK_SIZE = 1024
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
     local_argmax = logits.new_empty(num_tokens, num_blocks, dtype=torch.int64)
@@ -260,6 +285,7 @@ def gumbel_sample(
         local_max.stride(0),
         logits_cache,
         logits_cache.stride(0) if logits_cache is not None else 0,
+        logits_cache.stride(1) if logits_cache is not None else 0,
         logits_cache_col,
         logits,
         logits.stride(0),
@@ -269,6 +295,7 @@ def gumbel_sample(
         temperature,
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
+        IS_DRAFTING=is_drafting,
         APPLY_TEMPERATURE=apply_temperature,
         USE_FP64=use_fp64,
         PER_TOKEN_COL=per_token_col,

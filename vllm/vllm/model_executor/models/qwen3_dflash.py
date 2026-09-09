@@ -80,26 +80,6 @@ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
     )
 
 
-def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
-    """The target's RoPE layout, from its first attention layer.
-
-    A DFlash head must rotate Q/K the way the target it was distilled against
-    does, and a mismatch is silent — acceptance collapses but nothing errors and
-    the output stays correct. Draft checkpoints do not carry this, so take it
-    from the target. None if the target uses no RoPE.
-    """
-    language_model = (
-        target_model.get_language_model()
-        if hasattr(target_model, "get_language_model")
-        else target_model
-    )
-    for module in language_model.modules():
-        style = getattr(module, "is_neox_style", None)
-        if isinstance(style, bool):
-            return style
-    return None
-
-
 def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
     spec_config = vllm_config.speculative_config
     config = spec_config.draft_model_config.hf_config
@@ -493,10 +473,10 @@ class DFlashQwen3Model(nn.Module):
         drafter_config = getattr(self.config, "eagle_config", {})
         drafter_config.update(getattr(self.config, "dflash_config", {}))
 
-        if drafter_config is not None and "use_aux_hidden_state" in drafter_config:
-            self.use_aux_hidden_state = drafter_config["use_aux_hidden_state"]
-        else:
-            self.use_aux_hidden_state = True
+        self.use_aux_hidden_state = drafter_config.get(
+            "use_aux_hidden_state",
+            getattr(self.config, "use_aux_hidden_state", True),
+        )
 
         current_vllm_config = get_current_vllm_config()
 
@@ -506,11 +486,11 @@ class DFlashQwen3Model(nn.Module):
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
-        # Masked query slots are fed to the draft as `mask_token_id`. Most
-        # DFlash checkpoints have the mask embedding in the vocabulary
-        # embedding table at that slot id. Some (e.g. MiMo DFlash) ship a
-        # separate mask embedding tensor; when present it is loaded and
-        # substituted for embed_tokens[mask_token_id] at embedding time.
+        # Masked query slots are fed to the draft as `mask_token_id`. Most DFlash
+        # checkpoints will have the mask embedding in the vocabulary embedding table
+        # at that slot id. Some checkpoints (XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash) ship
+        # with a separate mask embedding tensor to use instead. When present, we load it
+        # and substitute it for embed_tokens[mask_token_id] when computing embeddings.
         self.mask_token_id = drafter_config.get(
             "mask_token_id", getattr(self.config, "mask_token_id", None)
         )
@@ -965,26 +945,23 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             model_weights["model.mask_embedding"] = mask_embedding
             self.model.has_separate_mask_embedding = True
 
-        skip_substrs = []
+        orig_to_new_substr = {}
         if not includes_draft_id_mapping:
-            skip_substrs.append("draft_id_to_target_id")
+            orig_to_new_substr["draft_id_to_target_id"] = None
         if not includes_embed_tokens:
-            skip_substrs.append("embed_tokens")
+            orig_to_new_substr["embed_tokens"] = None
         if not self.model.use_aux_hidden_state:
-            skip_substrs.append("fc.")
+            orig_to_new_substr["fc."] = None
         if self.markov_rank <= 0:
             # DSpark Markov head weights present in ckpt but head disabled.
-            skip_substrs.append("markov")
+            orig_to_new_substr["markov"] = None
         # confidence_head drives adaptive-verify (not yet modeled); skip its weights.
-        skip_substrs.append("confidence_head")
+        orig_to_new_substr["confidence_head"] = None
         if not self.model.has_separate_mask_embedding:
-            skip_substrs.append("mask_embedding")
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=None,
-            skip_substrs=skip_substrs,
-        )
-        loader.load_weights(model_weights.items())
+            orig_to_new_substr["mask_embedding"] = None
+        mapper = WeightsMapper(orig_to_new_substr=orig_to_new_substr)
+        loader = AutoWeightsLoader(self)
+        loader.load_weights(model_weights.items(), mapper=mapper)
         self.model._build_fused_kv_buffers()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:

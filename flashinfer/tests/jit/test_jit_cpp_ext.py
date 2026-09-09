@@ -28,6 +28,16 @@ def test_nvcc_parallelism_flags_ignore_sccache_launcher(monkeypatch):
     assert cpp_ext.get_nvcc_parallelism_flags() == ["--threads=4"]
 
 
+def test_jit_uses_size_optimized_fatbin_compression(monkeypatch):
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(core, "get_nvcc_parallelism_flags", lambda: ["--threads=1"])
+
+    spec = core.gen_jit_spec(name="test_module", sources=[])
+
+    assert "-Xfatbin=-compress-all" in spec.extra_cuda_cflags
+    assert "--compress-mode=size" in spec.extra_cuda_cflags
+
+
 def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
     monkeypatch, tmp_path
 ):
@@ -170,8 +180,11 @@ def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
         torch.int32,
         512,
         512,
-        [],
-        [],
+        # NVFP4 (uint8) KV paged prefill now requires the scale-factor tensors as
+        # additional inputs (maybe_k_cache_sf / maybe_v_cache_sf), matching the
+        # generator contract; pass them so generation reaches the flag assertions.
+        ["maybe_k_cache_sf", "maybe_v_cache_sf"],
+        ["uint8_t", "uint8_t"],
         ["sm_scale"],
         ["double"],
         "DefaultAttention<false, false, false, false>",

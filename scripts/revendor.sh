@@ -65,7 +65,9 @@ rebase_tree() {
   git -C "$dir" checkout --quiet -b fork-old "$old"
   rsync -a --delete "${ex[@]}" "$ROOT/$name/" "$dir/"
   git -C "$dir" add -A
-  git -C "$dir" commit --quiet -m "fork: vendored $name edits on top of $old"
+  # --allow-empty: a tree with no fork delta at all is a valid (and now expected) state -- the
+  # vendored flashinfer is plain upstream. Without it, `git commit` fails and takes the run with it.
+  git -C "$dir" commit --quiet --allow-empty -m "fork: vendored $name edits on top of $old"
   echo "   fork delta: $(git -C "$dir" show --shortstat --format='' HEAD | tr -d '\n')"
 
   git -C "$dir" checkout --quiet -b fork-new "$new"

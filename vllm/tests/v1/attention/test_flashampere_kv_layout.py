@@ -11,25 +11,43 @@ publishes -- if upstream moves the layout again, this fails here instead of in a
 
 import torch
 
-from vllm.v1.attention.backends.flashampere.backend import FlashAmpereBackend
 from vllm.v1.attention.backends.flashampere.kernels import _split_kv
 
 NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE = 3, 16, 2, 64
 
 
 def _cache(num_kv_heads=NUM_KV_HEADS, head_size=HEAD_SIZE):
-    shape = FlashAmpereBackend.get_kv_cache_shape(
-        NUM_BLOCKS, BLOCK_SIZE, num_kv_heads, head_size
-    )
+    # vLLM 0.29 removed get_kv_cache_shape/get_kv_cache_stride_order from the backends (the layout
+    # is centralized now), so the packed page shape is spelled out here instead of asked for.
+    # test_upstream_still_unpacks_the_same_way below is what actually pins us to upstream.
+    shape = (NUM_BLOCKS, num_kv_heads, BLOCK_SIZE, 2 * head_size)
     return torch.arange(
         int(torch.tensor(shape).prod()), dtype=torch.float32
     ).reshape(shape)
 
 
-def test_split_kv_shape_follows_the_backend():
+def test_split_kv_shape():
     k, v = _split_kv(_cache(), HEAD_SIZE)
     expected = (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
     assert k.shape == v.shape == expected, (k.shape, v.shape, expected)
+
+
+def test_upstream_still_unpacks_the_same_way():
+    """The real contract: famp must read the paged cache exactly as upstream's FA impl does.
+
+    Backends no longer publish their own shape, so this asserts the idiom directly against
+    upstream's source. If upstream repacks the cache again, this fails here -- loudly and in a
+    test -- instead of silently feeding a famp kernel the wrong strides.
+    """
+    import inspect
+
+    from vllm.v1.attention.backends import flash_attn
+
+    src = inspect.getsource(flash_attn)
+    assert "kv_cache.transpose(1, 2).split(self.head_size, dim=-1)" in src, (
+        "upstream FlashAttention no longer unpacks the paged KV cache the way _split_kv does; "
+        "re-derive flashampere/kernels.py::_split_kv against the new layout"
+    )
 
 
 def test_head_size_dim_stays_contiguous():

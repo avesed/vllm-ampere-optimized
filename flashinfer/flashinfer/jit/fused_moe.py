@@ -33,6 +33,11 @@ from .cubin_loader import (
     verify_symlinked_headers,
 )
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
+from .trtllm_gen_metainfo import (
+    BLACKWELL_CUBIN_ARCHS,
+    RUBIN_CUBIN_ARCHS,
+    write_filtered_metainfo,
+)
 
 BMM_EXPORT_HEADERS = [
     "BatchedGemmEnums.h",
@@ -117,9 +122,10 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
         "-DENABLE_BF16",
         "-DENABLE_FP8",
         "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
-        "-DENABLE_FP4" if is_cuda_version_at_least("12.8") else "",
+        "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
         "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
+        "-DCUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1",
     ]
     return gen_cutlass_fused_moe_module(nvcc_flags, "90", use_fast_build)
 
@@ -158,63 +164,62 @@ def gen_cutlass_fused_moe_module(
     except Exception as e:
         raise RuntimeError(f"Failed to generate Cutlass kernels: {e}") from e
 
+    sources = [
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_uint4.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp8.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp4.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp4_fp4.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp32_fp32.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint8.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint4.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp16.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint8.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint4.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_fp8.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_bf16.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_fp4.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp4.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
+        *(output_dir / kernel for kernel in output_dir.rglob("*.generated.cu")),
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/preQuantScaleKernel.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/kernels/lora/lora.cpp",
+    ]
+
     return gen_jit_spec(
         f"fused_moe_{device_arch}",
-        [
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_uint4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp8.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp8_fp4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp4_fp4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp32_fp32.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint8.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_uint4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp16.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint8.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_uint4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_fp8.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_bf16.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_fp4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp16_fp4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/cutlass_backend/deepgemm_jit_setup.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu",
-            # Add all generated kernels
-            *(output_dir / kernel for kernel in output_dir.rglob("*.generated.cu")),
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/preQuantScaleKernel.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal/tensorrt_llm/kernels/lora/lora.cpp",
-        ],
+        sources,
         extra_cuda_cflags=nvcc_flags,
         extra_cflags=["-DFAST_BUILD"] if use_fast_build else [],
         extra_ldflags=["-lnvrtc"],
@@ -247,16 +252,10 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenBatchedGemmList` as the list of available kernels
     # online. It is included when compiling `trtllm_fused_moe_runner.cu`, etc.
-    bmm_path = (
-        ArtifactPath.TRTLLM_GEN_BMM_RUBIN
-        if enable_rubin
-        else ArtifactPath.TRTLLM_GEN_BMM
-    )
-    bmm_checksum = (
-        CheckSumHash.TRTLLM_GEN_BMM_RUBIN
-        if enable_rubin
-        else CheckSumHash.TRTLLM_GEN_BMM
-    )
+    # One BMM package serves both Blackwell and Rubin; only the compile flags
+    # and the module name still differ between the two variants.
+    bmm_path = ArtifactPath.TRTLLM_GEN_BMM
+    bmm_checksum = CheckSumHash.TRTLLM_GEN_BMM
     module_name = "fused_moe_trtllm_sm107" if enable_rubin else "fused_moe_trtllm_sm100"
     rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
     include_path = f"{bmm_path}/include"
@@ -290,6 +289,17 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
     )
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
     verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
+
+    # flashinferMetaInfo.h is generated by trtllm_gen_metainfo.py, which filters
+    # the manifest to only include architectures the module can actually reach.
+    # The filtered copy lands in gen_root, replacing the raw artifact include
+    # dir on the search path so exactly one flashinferMetaInfo.h is visible to
+    # the compiler.
+    write_filtered_metainfo(
+        gen_root / f"{header_name}.h",
+        metainfo,
+        RUBIN_CUBIN_ARCHS if enable_rubin else BLACKWELL_CUBIN_ARCHS,
+    )
 
     # currently only support Blackwell (SM107 compiles as sm100f)
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
@@ -333,10 +343,13 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
         ]
         + nvcc_flags,
         extra_include_paths=[
+            # gen_root supplies both the export-header symlink and the
+            # arch-filtered flashinferMetaInfo.h; the artifact's own include/
+            # dir is deliberately not on the path so the unfiltered manifest
+            # cannot be picked up instead.
             gen_root,
             jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
-            jit_env.FLASHINFER_CUBIN_DIR / include_path,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
         ],
