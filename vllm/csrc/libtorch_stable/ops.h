@@ -392,7 +392,6 @@ void fused_kda_decode(
     torch::stable::Tensor& out, std::optional<double> lower_bound,
     std::optional<torch::stable::Tensor> output_gate,
     std::optional<torch::stable::Tensor> norm_weight, double norm_eps);
-#endif
 
 #endif
 
