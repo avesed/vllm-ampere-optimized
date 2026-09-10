@@ -48,8 +48,12 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
         # Only next_token_ids and mask tokens are query tokens, all other context is K/V
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
+        self.max_padded_query_tokens = max(
+            self.max_query_tokens,
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+        )
         # Positions covers both context states + query states
-        self.max_positions = self.max_num_tokens + self.max_query_tokens
+        self.max_positions = self.max_num_tokens + self.max_padded_query_tokens
 
         # Separate context buffers to keep query buffer addresses stable for CUDA graphs
         self._context_slot_mapping_buffer = torch.zeros(
@@ -58,7 +62,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             device=device,
         )
         self._slot_mapping_buffer = torch.zeros(
-            self.max_query_tokens,
+            self.max_padded_query_tokens,
             dtype=torch.int64,
             device=device,
         )
@@ -73,7 +77,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             device=device,
         )
         self.positions = torch.zeros(
-            self.max_query_tokens,
+            self.max_padded_query_tokens,
             dtype=torch.int64,
             device=device,
         )
@@ -85,7 +89,26 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # DFlash embeds mask tokens directly.
         self.parallel_drafting_hidden_state_tensor = None
 
-        self.dflash_causal = self.dflash_config.get("causal", False)
+        from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
+
+        self.dflash_causal = not dflash_has_any_non_causal(
+            self.draft_model_config.hf_config
+        )
+
+    @override
+    def load_model(self, target_model: torch.nn.Module) -> None:
+        from vllm.model_executor.models.qwen3_dflash import (
+            dflash_target_rope_is_neox_style,
+        )
+
+        draft_model_config = self.speculative_config.draft_model_config
+        assert draft_model_config is not None
+        # The drafter must rotate Q/K the way its target does. Take that from the
+        # built target before super() constructs the draft.
+        is_neox_style = dflash_target_rope_is_neox_style(target_model)
+        if is_neox_style is not None:
+            draft_model_config.hf_config.is_neox_style = is_neox_style
+        super().load_model(target_model)
 
         # Diagnostic A/B (default OFF => behavior unchanged). The z-lab Qwen3.6
         # DFlash head is a NON-causal block-diffusion drafter (dflash_causal is

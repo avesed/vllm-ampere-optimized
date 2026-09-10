@@ -24,10 +24,10 @@ _CAPS: capability.FlashAmpereCaps | None = None
 
 
 def _caps() -> capability.FlashAmpereCaps:
-    # Process-global: one GPU per process, so detect once and reuse across all layers.
+    # Process-global (capability.caps() owns the cache so the backend sees the same probe); log once.
     global _CAPS
     if _CAPS is None:
-        _CAPS = capability.detect(**capability.gather_inputs())
+        _CAPS = capability.caps()
         logger.info("flashampere caps: %s", _CAPS)
     return _CAPS
 

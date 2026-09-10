@@ -11,6 +11,7 @@ from pydantic import Field
 
 from vllm.config import AttentionConfig, CompilationConfig, ModelConfig, config
 from vllm.engine.arg_utils import (
+    PREFIX_CACHE_RETENTION_INTERVAL_UNSET,
     EngineArgs,
     _expand_json_human_readable_numbers,
     contains_type,
@@ -383,8 +384,6 @@ def test_attention_config():
             "FLASH_ATTN",
             "--attention-config.flash_attn_version",
             "3",
-            "--attention-config.use_prefill_decode_attention",
-            "true",
             "--attention-config.flash_attn_max_num_splits_for_cuda_graph",
             "16",
             "--attention-config.use_trtllm_attention",
@@ -398,7 +397,6 @@ def test_attention_config():
     assert engine_args.attention_config.backend is not None
     assert engine_args.attention_config.backend.name == "FLASH_ATTN"
     assert engine_args.attention_config.flash_attn_version == 3
-    assert engine_args.attention_config.use_prefill_decode_attention is True
     assert engine_args.attention_config.flash_attn_max_num_splits_for_cuda_graph == 16
     assert engine_args.attention_config.use_trtllm_attention is True
     assert engine_args.attention_config.disable_flashinfer_q_quantization is True
@@ -408,7 +406,6 @@ def test_attention_config():
         [
             "--attention-config="
             '{"backend": "FLASHINFER", "flash_attn_version": 2, '
-            '"use_prefill_decode_attention": false, '
             '"flash_attn_max_num_splits_for_cuda_graph": 8, '
             '"use_trtllm_attention": false, '
             '"disable_flashinfer_q_quantization": false}',
@@ -419,7 +416,6 @@ def test_attention_config():
     assert engine_args.attention_config.backend is not None
     assert engine_args.attention_config.backend.name == "FLASHINFER"
     assert engine_args.attention_config.flash_attn_version == 2
-    assert engine_args.attention_config.use_prefill_decode_attention is False
     assert engine_args.attention_config.flash_attn_max_num_splits_for_cuda_graph == 8
     assert engine_args.attention_config.use_trtllm_attention is False
     assert engine_args.attention_config.disable_flashinfer_q_quantization is False
@@ -476,6 +472,12 @@ def test_prefix_cache_default():
     # should be None by default (depends on model).
     engine_args = EngineArgs.from_cli_args(args=args)
     assert engine_args.enable_prefix_caching is None
+    # Left as an unresolved sentinel; create_engine_config resolves it against
+    # the model and speculative-decoding configuration.
+    assert (
+        engine_args.prefix_cache_retention_interval
+        is PREFIX_CACHE_RETENTION_INTERVAL_UNSET
+    )
 
     # with flag to turn it on.
     args = parser.parse_args(["--enable-prefix-caching"])
@@ -486,6 +488,28 @@ def test_prefix_cache_default():
     args = parser.parse_args(["--no-enable-prefix-caching"])
     engine_args = EngineArgs.from_cli_args(args=args)
     assert not engine_args.enable_prefix_caching
+
+    args = parser.parse_args(["--prefix-cache-retention-interval", "64"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.prefix_cache_retention_interval == 64
+
+
+def test_prefix_cache_retention_interval_from_deprecated_env(
+    monkeypatch, caplog, disable_log_dedup
+):
+    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "64")
+
+    engine_args = EngineArgs()
+
+    assert engine_args.prefix_cache_retention_interval == 64
+    assert "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" in caplog.text
+    assert "deprecated" in caplog.text
+    assert "prefix_cache_retention_interval" in caplog.text
+
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--prefix-cache-retention-interval", "32"])
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.prefix_cache_retention_interval == 32
 
 
 @pytest.mark.parametrize(
@@ -563,6 +587,40 @@ def test_human_readable_model_len():
     for invalid in ["1a", "pwd", "10.24", "1.23M", "1.22T"]:
         with pytest.raises(ArgumentError):
             parser.parse_args(["--max-model-len", invalid])
+
+
+def test_human_readable_other_args():
+    # Test human-readable parsing for other integer args
+    # that were added to use human_readable_int parser
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser(exit_on_error=False))
+
+    # Test max_num_scheduled_tokens
+    args = parser.parse_args(["--max-num-scheduled-tokens", "1024"])
+    assert args.max_num_scheduled_tokens == 1024
+    args = parser.parse_args(["--max-num-scheduled-tokens", "2k"])
+    assert args.max_num_scheduled_tokens == 2_000
+    args = parser.parse_args(["--max-num-scheduled-tokens", "4K"])
+    assert args.max_num_scheduled_tokens == 2**10 * 4
+    args = parser.parse_args(["--max-num-scheduled-tokens", "10.5k"])
+    assert args.max_num_scheduled_tokens == 10500
+
+    # Test kv_cache_memory_bytes (existing human-readable arg)
+    args = parser.parse_args(["--kv-cache-memory-bytes", "100000"])
+    assert args.kv_cache_memory_bytes == 100000
+    args = parser.parse_args(["--kv-cache-memory-bytes", "100k"])
+    assert args.kv_cache_memory_bytes == 100_000
+    args = parser.parse_args(["--kv-cache-memory-bytes", "1M"])
+    assert args.kv_cache_memory_bytes == 2**20
+    args = parser.parse_args(["--kv-cache-memory-bytes", "1m"])
+    assert args.kv_cache_memory_bytes == 1_000_000
+
+    # Test max_num_batched_tokens (existing human-readable arg)
+    args = parser.parse_args(["--max-num-batched-tokens", "1024"])
+    assert args.max_num_batched_tokens == 1024
+    args = parser.parse_args(["--max-num-batched-tokens", "2k"])
+    assert args.max_num_batched_tokens == 2_000
+    args = parser.parse_args(["--max-num-batched-tokens", "4K"])
+    assert args.max_num_batched_tokens == 2**10 * 4
 
 
 def test_numa_bind_args():
@@ -817,7 +875,7 @@ class TestDpDeviceIdSharding:
         against its inherited device-control env var."""
         import argparse
 
-        from vllm.entrypoints.openai.dp_supervisor import _build_device_ids
+        from vllm.entrypoints.launchers.dp_supervisor import _build_device_ids
 
         args = argparse.Namespace(
             tensor_parallel_size=2, pipeline_parallel_size=1, device_ids=None
@@ -829,7 +887,7 @@ class TestDpDeviceIdSharding:
         """User-provided --device-ids are sharded across DP children."""
         import argparse
 
-        from vllm.entrypoints.openai.dp_supervisor import _build_device_ids
+        from vllm.entrypoints.launchers.dp_supervisor import _build_device_ids
 
         args = argparse.Namespace(
             tensor_parallel_size=2, pipeline_parallel_size=1, device_ids=[4, 5, 6, 7]

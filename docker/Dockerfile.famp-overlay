@@ -1,0 +1,17 @@
+# Validation-only overlay: drop the fork's flashampere backend onto an OFFICIAL vLLM image.
+#
+# Purpose: exercise the famp legs (and their KV-cache reads) on a stock upstream engine, without
+# the 2.5h from-source build. famp is self-contained -- it carries its own prefill.cuh under
+# prefill/include and JIT-builds its kernels at runtime -- so the only things this has to add are
+# the package, the vllm.general_plugins entry point, and the cuda.py backend prepend.
+#
+# NOT a release path: the vendored fp16-PV FlashInfer and the famp_marlin .so are not here.
+#   docker build -f docker/Dockerfile.famp-overlay -t famp-overlay:0.28 .
+ARG BASE=vllm/vllm-openai:v0.28.0
+FROM ${BASE}
+
+COPY vllm/vllm/v1/attention/backends/flashampere /tmp/famp/flashampere
+COPY docker/famp_overlay/ /tmp/famp/overlay/
+RUN python3 /tmp/famp/overlay/install.py && rm -rf /tmp/famp
+
+ENV VLLM_FLASHAMPERE=1

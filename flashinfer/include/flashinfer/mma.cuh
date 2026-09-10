@@ -39,7 +39,6 @@ namespace mma {
 #endif
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 800))
 #define FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED
-#define FLASHINFER_MMA_S8S8S32_M16N8K32_ENABLED
 #define FLASHINFER_MMA_F16F16F16_M16N8K16_ENABLED
 #endif
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 750))
@@ -306,44 +305,6 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
 #endif
 }
 
-template <typename T, MMAMode mma_mode = MMAMode::kInplaceUpdate>
-__device__ __forceinline__ void mma_sync_m16n16k32_row_col_s8s8s32(int32_t* C, uint32_t* A,
-                                                                   uint32_t* B) {
-  static_assert(sizeof(T) == 1, "int8 mma operand must be 8-bit");
-#if defined(FLASHINFER_MMA_S8S8S32_M16N8K32_ENABLED)
-  if constexpr (mma_mode == MMAMode::kInit) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
-        : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]),
-          "r"(0), "r"(0), "r"(0), "r"(0));
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
-        : "=r"(C[4]), "=r"(C[5]), "=r"(C[6]), "=r"(C[7])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[2]), "r"(B[3]),
-          "r"(0), "r"(0), "r"(0), "r"(0));
-  } else {
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
-        : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]),
-          "r"(C[0]), "r"(C[1]), "r"(C[2]), "r"(C[3]));
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
-        : "=r"(C[4]), "=r"(C[5]), "=r"(C[6]), "=r"(C[7])
-        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[2]), "r"(B[3]),
-          "r"(C[4]), "r"(C[5]), "r"(C[6]), "r"(C[7]));
-  }
-#else
-  static_assert(sizeof(T) == 0, "s8s8s32 m16n8k32 requires FLASHINFER_MMA_S8S8S32_M16N8K32_ENABLED (sm_80+)");
-#endif
-}
-
-
 /*!
  * \brief Wrapper of two mma m16n8k16 instructions for row major and column major f16 matrix
  *   multiplication, accumulated in f32.
@@ -559,7 +520,7 @@ __device__ __forceinline__ void m16k32_rowsum_f8f8f32(float* d, DType* s) {
  */
 template <typename DType>
 __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s) {
-  static_assert(sizeof(DType) == 2 || sizeof(DType) == 1, "relaxed int8 placeholder I-1");
+  static_assert(sizeof(DType) == 2, "DType must be 16bit floating data type");
   uint32_t* s_u32 = (uint32_t*)(s);
 #if defined(FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED)
   if constexpr (std::is_same_v<DType, half>) {

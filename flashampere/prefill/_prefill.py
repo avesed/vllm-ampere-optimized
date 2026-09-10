@@ -34,12 +34,17 @@ def single_prefill(q, k, v, *, causal, sm_scale, o_dtype=None, use_fp16_pv=True)
     )
     out = torch.empty(q.shape[:-1] + (Dvo,), dtype=o_dtype, device=q.device)
     tmp = _tmp_buf(q.device)
-    # run(q,k,v, tmp,out,lse, mask_mode,layout,window_left, custom_mask,alibi,k_sf,v_sf,
-    #     logits_soft_cap,sm_scale,rope_rcp_scale,rope_rcp_theta)
-    mod.run(
-        q, k, v, tmp, out, None,
-        _CAUSAL if causal else _NONCAUSAL, _NHD, -1,
-        None, None, None, None,
-        0.0, float(sm_scale), 1.0, 1e4,
-    )
+    head = (q, k, v, tmp, out, None,
+            _CAUSAL if causal else _NONCAUSAL, _NHD, -1,
+            None, None)  # ..., packed_custom_mask, alibi_slopes
+    # FlashInfer's run() ABI moved between the versions we support, and the two differ in ARITY
+    # (17 vs 20), so a wrong guess raises instead of silently shuffling scalars into each other's
+    # slots (that failure mode reads as cos~0.25 output, not an error).
+    #   >=0.6.13: ..., logits_soft_cap, sm_scale, scale_q, scale_k, scale_v, rope_scale, rope_theta,
+    #             k_sf, v_sf
+    #    0.6.12 : ..., k_sf, v_sf, logits_soft_cap, sm_scale, rope_rcp_scale, rope_rcp_theta
+    try:
+        mod.run(*head, 0.0, float(sm_scale), None, None, None, 1.0, 1e4, None, None)
+    except TypeError:
+        mod.run(*head, None, None, 0.0, float(sm_scale), 1.0, 1e4)
     return out

@@ -1,3 +1,9 @@
+# NOTE for future contributors (incl. AI agents): keep this file lean. Randomized
+# breadth (shapes, token counts) belongs in tests/moe/test_unified_moe_fuzz.py --
+# extend its axes/adapters. This file exists for the quant x routing x layout
+# kernel-selection matrix and for paths the fuzzer cannot express; add cases only
+# as deliberate regression anchors.
+
 """
 Copyright (c) 2025 by FlashInfer team.
 
@@ -32,6 +38,7 @@ from flashinfer.fp4_quantization import (
     block_scale_interleave,
     e2m1_and_ufp8sf_scale_to_float,
 )
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.fused_moe.core import (
     get_w2_permute_indices_with_cache,
     _maybe_get_cached_w3_w1_permute_indices,
@@ -39,7 +46,7 @@ from flashinfer.fused_moe.core import (
 from flashinfer.utils import device_support_pdl, get_compute_capability
 from tests.test_helpers.utils_fp4 import nvfp4_global_decode_scale_te
 from . import utils as moe_utils
-from .test_trtllm_gen_fused_moe import (
+from .trtllm_gen_fused_moe_utils import (
     check_accuracy,
     routing_reference_topk,
 )
@@ -50,9 +57,11 @@ torch.manual_seed(42)
 cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 
 
-@pytest.mark.parametrize("num_tokens", [1, 8, 1024])
-@pytest.mark.parametrize("hidden_size", [1024, 2048, 4096])
-@pytest.mark.parametrize("intermediate_size", [1024, 2048, 4096])
+# The 4-over-6 x per-token-scaling matrix is the coverage here (only file exercising
+# it); shape fan-out kept to boundary corners.
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+@pytest.mark.parametrize("hidden_size", [1024, 4096])
+@pytest.mark.parametrize("intermediate_size", [2048])
 @pytest.mark.parametrize("num_experts", [32])
 @pytest.mark.parametrize("top_k", [4])
 @pytest.mark.parametrize("use_4over6", [False, True])
@@ -113,9 +122,11 @@ def test_routed_fused_moe(
     ].to(torch.bfloat16)
 
     # ======== Quantize =======
+    nvfp4_4over6_config = NVFP44Over6Config() if use_4over6 else None
+    weights_nvfp4_4over6_config = NVFP44Over6Config() if weights_use_4over6 else None
     hidden_states_global_scale_inv = nvfp4_global_decode_scale_te(
         torch.ones((), dtype=torch.float32, device=device),
-        use_4over6=use_4over6,
+        nvfp4_4over6_config,
     )
     hidden_states, hidden_states_scale, per_token_scale_inv = nvfp4_quantize(
         hidden_states_bf16,
@@ -130,10 +141,10 @@ def test_routed_fused_moe(
     w13_global_amax = w13_bf16.abs().amax().to(torch.float32)
     w2_global_amax = w2_bf16.abs().amax().to(torch.float32)
     w13_global_scale_inv = nvfp4_global_decode_scale_te(
-        w13_global_amax, use_4over6=weights_use_4over6
+        w13_global_amax, weights_nvfp4_4over6_config
     )
     w2_global_scale_inv = nvfp4_global_decode_scale_te(
-        w2_global_amax, use_4over6=weights_use_4over6
+        w2_global_amax, weights_nvfp4_4over6_config
     )
     with moe_utils.nvfp4_4over6_env(weights_use_4over6):
         w13, w13_scale = nvfp4_quantize(

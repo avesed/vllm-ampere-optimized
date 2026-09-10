@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backends import flash_attn as _fa
 
 from .dispatch import KernelDecline
+from .kernels import _split_kv
 
 logger = init_logger(__name__)
 
@@ -166,7 +167,7 @@ def xqa_verify(impl, layer, query, key, value, kv_cache, m, output):
     if D not in (64, 128, 256) or query.dtype not in (torch.float16, torch.bfloat16):
         raise KernelDecline
 
-    key_cache, value_cache = kv_cache.unbind(1)  # [num_blocks, page_size, Hkv, D] (NHD == XQA NHD)
+    key_cache, value_cache = _split_kv(kv_cache, D)  # [num_blocks, page_size, Hkv, D] (NHD == XQA NHD)
     if not is_supported_page_size(key_cache.shape[1]):
         _decline_page(key_cache.shape[1])  # before the KV write; base FA does its own
     _fa.reshape_and_cache_flash(

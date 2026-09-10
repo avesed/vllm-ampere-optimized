@@ -59,11 +59,23 @@ oneshot(**ok)
 tok.save_pretrained(OUT)
 # Save the full processor too (preprocessor_config.json / video_preprocessor_config.json) so VL
 # checkpoints are servable as-is; no-op for text-only models that have no processor.
+saved_processor = False
 if AutoProcessor is not None:
     try:
         AutoProcessor.from_pretrained(MODEL, trust_remote_code=True).save_pretrained(OUT)
+        saved_processor = True
     except Exception as e:
         print(f"[run_recipe] no processor saved ({type(e).__name__})", flush=True)
+if not saved_processor:
+    # AutoProcessor needs torchvision for VL models; without it a VL checkpoint would silently ship
+    # without its image/video preprocessor and fail to serve images. Copy the static configs instead.
+    import shutil
+    for fn in ("preprocessor_config.json", "video_preprocessor_config.json",
+               "chat_template.jinja", "vocab.json", "merges.txt"):
+        src = os.path.join(MODEL, fn)
+        if os.path.exists(src) and not os.path.exists(os.path.join(OUT, fn)):
+            shutil.copy2(src, os.path.join(OUT, fn))
+            print(f"[run_recipe] copied {fn} from base", flush=True)
 
 import json  # noqa: E402
 qc = json.load(open(os.path.join(OUT, "config.json"))).get("quantization_config", {})

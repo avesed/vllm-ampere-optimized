@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -65,8 +65,9 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   // The warpGrpThreadIdx.
   int32_t const warpGrpThreadIdx{static_cast<int32_t>(threadIdx.x)};
 
-  // The seqOffsetQ.
-  int32_t const seqOffsetQ{params.ptrCumSeqLensQ == nullptr ? batchIdx * params.mMaxNumCtasQ
+  // The seqOffsetQ in token units (cumSeqLensQ is already token-relative).
+  // Fixed-Q batches are packed by mMaxSeqLenQ; grouped CTA coverage can include padded rows.
+  int32_t const seqOffsetQ{params.ptrCumSeqLensQ == nullptr ? batchIdx * params.mMaxSeqLenQ
                                                             : params.ptrCumSeqLensQ[batchIdx]};
   // The seqLenQ.
   int32_t const seqLenQ{params.ptrCumSeqLensQ == nullptr
@@ -82,10 +83,22 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     return;
   }
 
-  // The actual number of seqLenKv.
-  int32_t seqLenKv{params.ptrSeqLensKv[batchIdx]};
-  // Consider the causal-mask speculative decoding.
-  seqLenKv = seqLenKv - ((params.mMaxSeqLenQ - 1) - ctaIdxQ);
+  // The last tokenQ index (relative to the request) processed by this CTA.
+  int32_t const lastTokenIdxQ{ctaIdxQ * params.mNumTokensPerCtaQ + numValidTokens - 1};
+
+  // The actual number of seqLenKv. Block-sparse attention uses per-KV-head sequence lengths
+  // laid out as [numHeadsKv, batchSize].
+  int32_t seqLenKv;
+  if (params.mUseBlockSparseAttention) {
+    int32_t const headIdxKv{headIdxO / params.mNumHeadsQPerKv};
+    seqLenKv = params.ptrSeqLensKv[headIdxKv * params.mBatchSize + batchIdx];
+  } else {
+    seqLenKv = params.ptrSeqLensKv[batchIdx];
+  }
+  // Consider the causal-mask speculative decoding. Use the per-batch seqLenQ (not mMaxSeqLenQ)
+  // so variable-length batches get the correct KV extent; these agree when seqLenQ ==
+  // mMaxSeqLenQ.
+  seqLenKv = max(seqLenKv - seqLenQ + lastTokenIdxQ + 1, 0);
   // Consider sparseAttnTopK and variable sparse MLA topK lengths.
   if (supportsVarSparseMlaTopKLens) {
     seqLenKv = params.ptrSparseMlaTopKLens[seqOffsetQ + ctaIdxQ * params.mNumTokensPerCtaQ];
@@ -126,8 +139,9 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
   // Whether to store the softmax stats.
   bool const storesSoftmaxStats{params.ptrSoftmaxStats != nullptr};
 
-  // The softmaxScaleLog2.
-  float const softmaxScaleLog2 = params.mScaleSoftmaxLog2;
+  // The softmaxScaleLog2. Prefer the device-side scale when supplied.
+  float const softmaxScaleLog2 = params.ptrScaleSoftmaxLog2 != nullptr ? *params.ptrScaleSoftmaxLog2
+                                                                       : params.mScaleSoftmaxLog2;
 
   int32_t constexpr NumBytesPerPartialElt{sizeof(DtypePartialO)};
   static_assert(NumBytesPerPartialElt == 2,

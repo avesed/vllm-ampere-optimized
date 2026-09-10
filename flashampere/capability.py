@@ -119,6 +119,28 @@ def detect(
     )
 
 
+_CAPS: "FlashAmpereCaps | None" = None
+
+
+def caps() -> "FlashAmpereCaps":
+    """Process-global caps (one GPU per process): detect once, reuse everywhere.
+
+    Shared by the backend (which must decide what it can claim before any impl exists) and the
+    impl, so both see the same probe result.
+    """
+    global _CAPS
+    if _CAPS is None:
+        inputs = gather_inputs()
+        probed = detect(**inputs)
+        if not inputs["cc_major"]:
+            # Device not resolvable yet (this can run during backend selection, before device
+            # init). Answer from the probe but do NOT memoize, or the worker would inherit a
+            # cap=OTHER verdict and every leg would stay off for the process lifetime.
+            return probed
+        _CAPS = probed
+    return _CAPS
+
+
 def gather_inputs() -> dict:
     """Collect the real runtime inputs for detect() (called once at backend init)."""
     cc_major = 0
@@ -158,15 +180,23 @@ def gather_inputs() -> dict:
 
 
 def _flashinfer_has_fp16pv() -> bool:
-    """True iff the vendored FlashInfer exposes the use_fp16_pv_reduction lever (patch 0007).
-    Probed so VLLM_FLASHAMPERE_PV_FP16=1 on a stock (un-patched) FlashInfer is a silent no-op
-    rather than a crash."""
+    """True iff famp's OWN fp16-PV prefill kernel can be built here.
+
+    This used to probe the installed FlashInfer for a `use_fp16_pv_reduction` parameter, i.e. for
+    patch 0007. famp no longer depends on a patched FlashInfer: it ships its own prefill.cuh under
+    prefill/include and passes -DFA_USE_FP16_PV itself, using FlashInfer only as the JIT toolchain
+    (measured that way against stock 0.6.16). So the real question is whether our header is present
+    and FlashInfer is importable to build against.
+    """
     try:
-        import inspect
+        import pathlib
 
-        import flashinfer
+        import flashinfer  # noqa: F401  (JIT toolchain)
 
-        sig = inspect.signature(flashinfer.single_prefill_with_kv_cache)
-        return "use_fp16_pv_reduction" in sig.parameters
+        header = (
+            pathlib.Path(__file__).parent
+            / "prefill" / "include" / "flashinfer" / "attention" / "prefill.cuh"
+        )
+        return header.is_file()
     except Exception:
         return False

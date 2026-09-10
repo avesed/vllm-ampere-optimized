@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import os
-from typing import List
+from typing import List, Optional
 
 import jinja2
 import torch
@@ -23,6 +23,7 @@ import torch
 from .. import env as jit_env
 from ..core import (
     JitSpec,
+    common_nvcc_flags,
     gen_jit_spec,
     logger,
     sm90a_nvcc_flags,
@@ -33,11 +34,12 @@ from ..utils import (
     dtype_map,
     dtype_map_kv,
     filename_safe_dtype_map,
+    filename_safe_dtype_map_kv,
     mask_mode_literal,
     pos_encoding_mode_literal,
     write_if_different,
 )
-from .utils import generate_additional_params
+from .utils import _is_nvfp4_kv_dtype, generate_additional_params
 from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
 
@@ -54,7 +56,7 @@ def get_single_decode_uri(
 ) -> str:
     return (
         f"single_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_qk_{head_dim_qk}_"
         f"head_dim_vo_{head_dim_vo}_"
@@ -77,7 +79,7 @@ def get_batch_decode_uri(
 ) -> str:
     return (
         f"batch_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -100,7 +102,7 @@ def get_batch_mla_uri(
 ) -> str:
     return (
         f"batch_mla_attention_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_ckv_{head_dim_ckv}_"
@@ -217,7 +219,7 @@ def get_batch_decode_mla_uri(
 ) -> str:
     return (
         f"batch_decode_mla_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_ckv{head_dim_ckv}_"
@@ -326,20 +328,17 @@ def get_single_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
-    use_fp16_pv_reduction: bool = False,
 ) -> str:
     return (
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_qk_{head_dim_qk}_"
         f"head_dim_vo_{head_dim_vo}_"
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}"
-        + (f"_f16pv_{use_fp16_pv_reduction}" if use_fp16_pv_reduction else "")
-        + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -359,7 +358,7 @@ def get_pod_uri(
 ) -> str:
     return (
         f"pod_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_{head_dim}_"
         f"posenc_p_{pos_encoding_mode_p}_"
@@ -388,7 +387,7 @@ def get_batch_prefill_uri(
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -413,7 +412,7 @@ def get_batch_prefill_attention_sink_uri(
 ) -> str:
     return (
         f"batch_prefill_with_attention_sink_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -435,7 +434,7 @@ def get_batch_attention_uri(
 ) -> str:
     return (
         f"batch_attention_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -501,7 +500,6 @@ def gen_single_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
-    use_fp16_pv_reduction: bool = False,
 ) -> JitSpec:
     uri = get_single_prefill_uri(
         backend,
@@ -514,7 +512,6 @@ def gen_single_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
-        use_fp16_pv_reduction,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -531,17 +528,6 @@ def gen_single_prefill_module(
             "maybe_v_cache_sf",
         ]
         additional_tensor_dtypes = ["uint8_t", "float", "uint8_t", "uint8_t"]
-        if dtype_q == torch.int8:  # I-4a: per-token int8-QK dequant scales
-            # I-5 audit: the int8 IMMA QK read assumes the k128B smem swizzle. For
-            # head_dim_vo==64 the KV smem uses the k64B swizzle + a different token-row
-            # layout, which the int8 path does not implement -> would be silently wrong.
-            # Guard it loudly (head_dim 64 is not in any deployed int8-QK path: hd128/hd256).
-            assert head_dim_vo != 64, (
-                "int8-QK prefill does not support head_dim_vo==64 (k64B smem swizzle "
-                "unimplemented); use head_dim 128/256 or the f16 path."
-            )
-            additional_tensor_names += ["maybe_q_scale", "maybe_k_scale"]
-            additional_tensor_dtypes += ["float", "float"]
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
@@ -594,7 +580,6 @@ def gen_single_prefill_module(
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
-        use_fp16_pv_reduction=use_fp16_pv_reduction,
         fp8_enabled=fp8_enabled,
     )
 
@@ -1037,18 +1022,6 @@ def gen_batch_prefill_module(
             "uint8_t",
             "uint8_t",
         ]  # NOTE(Zihao): int32_t should follow dtype_idx
-        if dtype_q == torch.int8:  # I-4a: per-token int8-QK dequant scales
-            # I-5 audit: head_dim_vo==64 uses the k64B KV smem swizzle (unimplemented in the
-            # int8 IMMA read) -> guard loudly. Deployed int8-QK paths are hd128/hd256 only.
-            assert head_dim_vo != 64, (
-                "int8-QK prefill does not support head_dim_vo==64 (k64B smem swizzle "
-                "unimplemented); use head_dim 128/256 or the f16 path."
-            )
-            additional_tensor_names += ["maybe_q_scale", "maybe_k_scale"]
-            additional_tensor_dtypes += ["float", "float"]
-            # I-5: per-request k-scale offset (kv-TOKEN prefix sum) for MULTI-request batch.
-            additional_tensor_names += ["maybe_kv_scale_indptr"]
-            additional_tensor_dtypes += ["int32_t"]
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
@@ -1215,6 +1188,72 @@ def gen_batch_attention_module(
     )
 
 
+def _fa2_head_dim_nvcc_flags(
+    head_dim_qk: int,
+    head_dim_vo: int,
+    dtype_kv: torch.dtype,
+    *,
+    allow_nvfp4_sm8_large_head: bool = False,
+) -> Optional[List[str]]:
+    """Return arch flags for FA2 large-head modules.
+
+    For 16-bit KV, head_dim > 256 uses the Ampere+ large-head path. NVFP4 KV
+    can opt into the same arch set only for validated FA2 prefill read paths.
+    Other one-byte large-head modules remain restricted to SM100+ until those
+    variants are validated separately.
+    """
+    if head_dim_qk > 256 or head_dim_vo > 256:
+        if dtype_kv.itemsize == 1:
+            if not (allow_nvfp4_sm8_large_head and _is_nvfp4_kv_dtype(dtype_kv)):
+                return current_compilation_context.get_nvcc_flags_list(
+                    supported_major_versions=[10, 11, 12]
+                )
+        return current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[8, 9, 10, 11, 12]
+        )
+    return None
+
+
+def _fa2_prefill_head_dim_nvcc_flags(
+    head_dim_qk: int, head_dim_vo: int, dtype_kv: torch.dtype
+) -> Optional[List[str]]:
+    return _fa2_head_dim_nvcc_flags(
+        head_dim_qk,
+        head_dim_vo,
+        dtype_kv,
+        allow_nvfp4_sm8_large_head=True,
+    )
+
+
+def _append_nvfp4_sf_stride_setter(
+    additional_params_setter: str,
+    additional_tensor_names: List[str],
+    params_expr: str = "params",
+) -> str:
+    stride_setters = []
+    if "maybe_k_cache_sf" in additional_tensor_names:
+        stride_setters.append(
+            "if (maybe_k_cache_sf) { const auto& sf_tensor = maybe_k_cache_sf.value(); "
+            "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+            f"{params_expr}.k_sf_stride_page = sf_strides.stride_page; "
+            f"{params_expr}.k_sf_stride_n = sf_strides.stride_n; "
+            f"{params_expr}.k_sf_stride_h = sf_strides.stride_h; }}"
+        )
+    if "maybe_v_cache_sf" in additional_tensor_names:
+        stride_setters.append(
+            "if (maybe_v_cache_sf) { const auto& sf_tensor = maybe_v_cache_sf.value(); "
+            "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+            f"{params_expr}.v_sf_stride_page = sf_strides.stride_page; "
+            f"{params_expr}.v_sf_stride_n = sf_strides.stride_n; "
+            f"{params_expr}.v_sf_stride_h = sf_strides.stride_h; }}"
+        )
+    if not stride_setters:
+        return additional_params_setter
+    if additional_params_setter:
+        return additional_params_setter + " \\\n" + " \\\n".join(stride_setters)
+    return " \\\n".join(stride_setters)
+
+
 def gen_customize_single_decode_module(
     uri: str,
     dtype_q: torch.dtype,
@@ -1298,7 +1337,11 @@ def gen_customize_single_decode_module(
     generated_config_path = gen_directory / "single_decode_config.inc"
     write_if_different(generated_config_path, generated_inc_str)
 
-    return gen_jit_spec(uri, source_paths)
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv),
+    )
 
 
 def gen_customize_single_prefill_module(
@@ -1319,7 +1362,6 @@ def gen_customize_single_prefill_module(
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
-    use_fp16_pv_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> JitSpec:
     kwargs = {
@@ -1397,7 +1439,9 @@ def gen_customize_single_prefill_module(
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=(["-DFA_USE_FP16_PV=1"] if use_fp16_pv_reduction else None),
+            extra_cuda_cflags=_fa2_prefill_head_dim_nvcc_flags(
+                head_dim_qk, head_dim_vo, dtype_kv
+            ),
         )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
@@ -1547,7 +1591,11 @@ def gen_customize_batch_decode_module(
 
     generated_config_path = gen_directory / "batch_decode_config.inc"
     write_if_different(generated_config_path, generated_inc_str)
-    return gen_jit_spec(uri, source_paths)
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo, dtype_kv),
+    )
 
 
 def gen_customize_batch_prefill_module(
@@ -1569,9 +1617,22 @@ def gen_customize_batch_prefill_module(
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
-    use_fp16_pv_reduction: bool = False,
     fp8_enabled: bool = False,
 ) -> JitSpec:
+    require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+    if require_fp4_kv_cache:
+        missing_sf_tensors = [
+            name
+            for name in ("maybe_k_cache_sf", "maybe_v_cache_sf")
+            if name not in additional_tensor_names
+        ]
+        if missing_sf_tensors:
+            raise ValueError(
+                "NVFP4 KV paged prefill JIT modules require scale-factor tensors "
+                f"{missing_sf_tensors}; pass maybe_k_cache_sf and maybe_v_cache_sf "
+                "as additional tensors."
+            )
+
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
@@ -1579,6 +1640,7 @@ def gen_customize_batch_prefill_module(
         "dtype_kv": dtype_map_kv[dtype_kv],
         "dtype_o": dtype_map[dtype_o],
         "idtype": dtype_map[idtype],
+        "require_fp4_kv_cache": require_fp4_kv_cache,
         "head_dim_qk": head_dim_qk,
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
@@ -1597,6 +1659,9 @@ def gen_customize_batch_prefill_module(
                 additional_scalar_names,
                 additional_scalar_dtypes,
             )
+        )
+        additional_params_setter = _append_nvfp4_sf_stride_setter(
+            additional_params_setter, additional_tensor_names
         )
 
         with open(
@@ -1660,7 +1725,18 @@ def gen_customize_batch_prefill_module(
 
         generated_config_path = gen_directory / "batch_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
-        return gen_jit_spec(uri, source_paths)
+        extra_cuda_cflags = _fa2_prefill_head_dim_nvcc_flags(
+            head_dim_qk, head_dim_vo, dtype_kv
+        )
+        if kwargs["require_fp4_kv_cache"]:
+            # NVFP4 KV kernels need FLASHINFER_ENABLE_FP4_E2M1 (common flags) even
+            # when the head_dim helper returns no arch-specific flags.
+            extra_cuda_cflags = (extra_cuda_cflags or []) + common_nvcc_flags
+        return gen_jit_spec(
+            uri,
+            source_paths,
+            extra_cuda_cflags=extra_cuda_cflags,
+        )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
         (additional_params_decl, additional_func_params, additional_params_setter) = (
@@ -1756,7 +1832,7 @@ def get_fmha_cutlass_sm100a_uri(
     return "fmha_cutlass_sm100a"
     # return (
     #     f"fmha_cutlass_sm100a_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-    #     f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+    #     f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
     #     f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
     #     f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
     #     f"head_dim_qk_{head_dim_qk}_"
@@ -1797,7 +1873,7 @@ def gen_fmha_cutlass_sm100a_module(
     ]
 
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
     return gen_jit_spec(
         uri,
@@ -1832,6 +1908,9 @@ def gen_trtllm_gen_fmha_module():
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
             jit_env.FLASHINFER_CSRC_DIR / "fmhaReduction.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_sage_quant.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal/tensorrt_llm/common/sageQuant.cu",
         ],
         # link "include" sub-directory in cache
         extra_include_paths=[jit_env.FLASHINFER_CUBIN_DIR / include_path],
@@ -1893,6 +1972,9 @@ def gen_customize_batch_attention_module(
             )
         ]
         + [f"params[i].{var} = {var};" for var in additional_scalar_names]
+    )
+    batch_additional_params_setter = _append_nvfp4_sf_stride_setter(
+        batch_additional_params_setter, additional_tensor_names, params_expr="params[i]"
     )
     with open(
         jit_env.FLASHINFER_CSRC_DIR / "batch_attention_customize_config.jinja"
@@ -1970,7 +2052,10 @@ def gen_trtllm_fmha_v2_sm120_module() -> JitSpec:
 
     kernels = [
         "fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_64x64_output_bf16_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_128x128_output_bf16_sm120.cu",
         "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_fp16_sm120.cu",
         "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120.cu",
     ]
 

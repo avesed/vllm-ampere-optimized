@@ -1,5 +1,10 @@
 """Regenerate the W4A8-INT8 Marlin Ampere patch against a vLLM source checkout.
 
+HISTORICAL TOOL — nothing in the build or the re-vendor flow runs this. The W4A8 edits it
+describes are already hand-baked into the vendored vllm/ tree, which is what actually ships.
+Keep it as documentation of the five edits; to move to a new upstream tag, 3-way merge the
+vendored tree instead (scripts/revendor.sh, docs/PATCHING.md).
+
 Applies the 5 edits IN-PLACE to a vLLM source tree, so you can then `git diff` to
 produce patches/0001-marlin-w4a8-int8-ampere.patch. Run from anywhere:
 

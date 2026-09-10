@@ -26,6 +26,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 
+from . import capability
 from .impl import FlashAmpereImpl
 
 logger = init_logger(__name__)
@@ -139,7 +140,19 @@ class FlashAmpereBackend(FlashAttentionBackend):
         # prefill-only through famp for now; covered for prefill-bench / enforce-eager.)
         if head_size % 8 != 0:
             return False
-        return head_size <= 512
+        if head_size > 256:
+            # famp no longer claims large heads. Two independent reasons, both measured on a 3090
+            # against FlashInfer 0.6.16 (which enabled FA2 large-head on SM80+ in #3739):
+            #   1. CORRECTNESS -- famp's vendored 0.6.12 prefill.cuh has no VO-split
+            #      (NUM_MMA_D_VO_TILE) while the 0.6.16 headers it compiles against assume one, so
+            #      hd512 prefill returns cos~0.25/nan. The same header is cos 1.0 at hd<=256.
+            #   2. PERFORMANCE -- stock is simply better here now. hd512 decode over 90 points
+            #      (bs 1-64 x ctx 2k-16k x fp16/bf16): famp's XQA is 0.68-0.86x of stock's decode
+            #      and plateaus at ~65-70% of DRAM roofline where stock reaches 90-94%.
+            # There is also no safe sink: super() is FA2, which raises "head dimension at most 256".
+            # Declining lets selection pick FlashInfer/TRITON, which handle hd512 correctly.
+            return False
+        return True
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
@@ -172,6 +185,8 @@ class FlashAmpereBackend(FlashAttentionBackend):
         # to TRITON/FLEX, which correctly carry their bidirectional image mm_prefix. Keep FA's sink
         # gate. hd512 has no stock fallback anyway (FA rejects >256), so famp must own it.
         if use_mm_prefix and head_size > 256:
+            if not capability.caps().has_fp16pv_kernel:
+                return "flashampere hd>256 needs the vendored fp16-PV FlashInfer kernel"
             if has_sink and device_capability < DeviceCapability(9, 0):
                 return "sink not supported on compute capability < 9.0"
             return None

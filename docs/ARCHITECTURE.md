@@ -4,20 +4,21 @@ The maintainer's mental model. Why this repo is shaped the way it is.
 
 ## Vendored fork, built from source
 
-This repo vendors the **complete** modified source — `vllm/` (upstream v0.23.0) and `flashinfer/`
-(v0.6.12) — with every edit baked in, plus the fork-owned `flashampere/` package (attention backend +
+This repo vendors the **complete** modified source — `vllm/` and `flashinfer/`, at the upstream tags
+recorded in `UPSTREAM_VLLM_VERSION` and `flashinfer/version.txt` — with every edit baked in, plus the
+fork-owned `flashampere/` package (attention backend +
 vendored XQA / FA2-prefill / Marlin kernels). It is **not** a patch-overlay, because the native work is
-`.cu`/`.cuh` kernels (the int8 8-row Marlin decode tile in patch 0002, the fp16-PV FlashInfer prefill
-patch 0007, the vendored famp_marlin GEMM and XQA kernels) that a pip-overlay onto an official
+`.cu`/`.cuh` kernels (the fp16-PV FlashInfer prefill kernel, the vendored famp_marlin GEMM — which
+now carries the int8 8-row Marlin decode tile — and the XQA kernels) that a pip-overlay onto an official
 wheel/image physically cannot carry. Native code ships only from a real source build — which is exactly
 why the source is vendored rather than patched at build time. (The old int8-QK attention backend was
 removed 2026-06-25 — measured net-negative; its kernel edits remain inert in the vendored `flashinfer/`
 tree because they share files with the fp16-PV patch.)
 
-`patches/` is no longer applied during a build — it is the **recipe** (`regenerate.py` for 0001 +
-`git apply` for the numbered patches + `flashinfer_int8/apply_to_source.py`) that regenerates the
-vendored trees from a fresh upstream checkout, so an upstream bump stays reproducible and drift is
-detectable (`scripts/revendor.sh`). See `patches/README.md`.
+`patches/` is applied by **nothing** — not at build time, not at re-vendor time. It is the written
+record of what the fork changed and why; the tree is the fork, and every change is a hand edit in it.
+An upstream bump is a 3-way merge of the vendored tree onto the new tag (`scripts/revendor.sh`).
+See `docs/PATCHING.md` and `patches/README.md`.
 
 ## One build path: local, from source
 

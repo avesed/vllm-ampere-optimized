@@ -17,3 +17,4 @@ eval/results_awqmse/*_n250.json
 
 # research/analysis docs are local-only (never commit)
 docs/RESEARCH-*.md
+.revendor/

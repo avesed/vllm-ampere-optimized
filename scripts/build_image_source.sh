@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Build the COMPLETE Ampere int8 fork image FROM SOURCE from the VENDORED trees — no upstream
-# clone, no apply_patches (the vendored vllm/ + flashinfer/ ARE the fork, all edits baked in):
-#   stage 1: vLLM (W4A8 Marlin + int8-8row decode + int8qk_backend, baked into vllm/) from source
+# clone, no patch-apply step of any kind (the vendored vllm/ + flashinfer/ ARE the fork, every edit
+# is already in them):
+#   stage 1: vLLM (W4A8 Marlin routing + flashampere backend, baked into vllm/) from source
 #            via upstream vllm/docker/Dockerfile -> sm_80 + sm_86 fatbin.
-#   stage 2: overlay the vendored int8-QK flashinfer/ (docker/Dockerfile.flashinfer-int8).
+#   stage 2: (skipped by default) overlay the vendored flashinfer/ -- now plain upstream.
 # Push the final image to ghcr (:<tag>-ampere-<cu> + :latest).
 #
 # THIS IS THE RELEASE TOOL: run it YOURSELF on a local CUDA box and it pushes to ghcr. There is no CI
@@ -27,8 +28,13 @@ IMAGE="ghcr.io/${OWNER,,}/vllm-ampere-optimized"       # ghcr path must be lower
 CU="cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')"
 # parallel compile TUs (bounds build RAM). Default = min(nproc, 8) for safety on unknown hosts; set
 # JOBS env to override (honored up to nproc) on a big build box with RAM headroom.
+# The default cap of 8 is a floor for small boxes, not a target: on a 64-core host it turns the
+# CUDA compile into a ~4.7h serial-ish crawl. Override with JOBS=<n> (and NVCC_THREADS, which only
+# needs to cover the arch count -- 2 is enough for an Ampere-only list). Watch RAM: heavy template
+# units run ~2GB per job.
 if [ -n "${JOBS:-}" ]; then NPROC=$(nproc); [ "$JOBS" -gt "$NPROC" ] && JOBS=$NPROC
 else JOBS=$(nproc); [ "$JOBS" -gt 8 ] && JOBS=8; fi
+NVCC_THREADS="${NVCC_THREADS:-4}"
 # GHA registry cache only works inside GitHub Actions; locally use docker's own layer cache.
 GHA_CACHE=""; [ -n "${GITHUB_ACTIONS:-}" ] && GHA_CACHE="--cache-from type=gha --cache-to type=gha,mode=max"
 # PUSH=1 (default) pushes the final image to ghcr; PUSH=0 builds it into the LOCAL docker (--load) for
@@ -45,7 +51,7 @@ BUILDER="${BUILDER:---builder default}"; [ -n "${GITHUB_ACTIONS:-}" ] && BUILDER
 [ -f flashinfer/include/flashinfer/mma.cuh ] || { echo "::error::vendored flashinfer/ source missing"; exit 1; }
 
 # The upstream vLLM Dockerfile bind-mounts vllm/.git (setuptools-scm version + build commit), but the
-# vendored vllm/ has no .git (revendor strips it). Synthesize an ephemeral one tagged VLLM_TAG so the
+# vendored vllm/ has no .git (it is a plain source tree). Synthesize an ephemeral one tagged VLLM_TAG so the
 # build + the git-derived version resolve. Build-time only; never committed to the fork.
 if [ ! -d vllm/.git ]; then
   echo "== synthesizing ephemeral vllm/.git tagged ${VLLM_TAG} (for the Dockerfile's git-version mount) =="
@@ -79,7 +85,7 @@ docker buildx build vllm $BUILDER \
   --build-arg CUDA_VERSION="$CUDA_VERSION" \
   --build-arg torch_cuda_arch_list="$TORCH_CUDA_ARCH_LIST" \
   --build-arg max_jobs="$JOBS" \
-  --build-arg nvcc_threads=4 \
+  --build-arg nvcc_threads="$NVCC_THREADS" \
   --build-arg RUN_WHEEL_CHECK=false \
   --build-arg VLLM_SCM_VERSION="${VLLM_TAG#v}" \
   --build-arg VLLM_BUILD_COMMIT="${GITHUB_SHA:-unknown}" \
@@ -88,17 +94,26 @@ docker buildx build vllm $BUILDER \
   $GHA_CACHE \
   --tag "$VLLM_IMG" --load
 
-echo "== stage 2/3: overlay vendored int8-QK flashinfer (load locally; the final push is stage 3) =="
-docker buildx build . $BUILDER \
-  --file docker/Dockerfile.flashinfer-int8 \
-  --build-arg BASE="$VLLM_IMG" \
-  --platform linux/amd64 \
-  --provenance=false \
-  --tag "$FI_IMG" --load
+# stage 2 exists to put a MODIFIED flashinfer into the image. The vendored flashinfer is now plain
+# upstream (identical to the version vLLM pins), because famp carries its own prefill.cuh and needs
+# flashinfer only as a JIT toolchain -- so the overlay is a no-op at best, and overlaying source over
+# an installed wheel is a risk at worst. Skipped by default; OVERLAY_FLASHINFER=1 forces it back.
+if [ "${OVERLAY_FLASHINFER:-0}" = "1" ]; then
+  echo "== stage 2/3: overlay vendored flashinfer (load locally; the final push is stage 3) =="
+  docker buildx build . $BUILDER \
+    --file docker/Dockerfile.flashinfer-int8 \
+    --build-arg BASE="$VLLM_IMG" \
+    --platform linux/amd64 \
+    --provenance=false \
+    --tag "$FI_IMG" --load
+else
+  echo "== stage 2/3: SKIPPED (vendored flashinfer is plain upstream; OVERLAY_FLASHINFER=1 to force) =="
+  FI_IMG="$VLLM_IMG"
+fi
 
 # stage 3: compile the vendored famp_marlin FROM SOURCE on the from-source image (NOT an overlay on an
-# upstream wheel) + register the FampMarlinKernel plugin. P4 (the int8-act config widening) ships in the
-# vendored vllm/ via patches/0007.
+# upstream wheel) + register the FampMarlinKernel plugin. The int8-act config widening is already in the
+# vendored vllm/ tree (recorded as patches/0009).
 echo "== stage 3/3: compile vendored famp_marlin (sm: $FAMP_MARLIN_ARCH) + register plugin ($([ "$PUSH" = 1 ] && echo 'push to ghcr' || echo 'load locally')) =="
 docker buildx build . $BUILDER \
   --file docker/Dockerfile.famp-marlin \

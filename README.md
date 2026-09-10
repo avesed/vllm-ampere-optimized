@@ -15,7 +15,7 @@ Marlin can run it on Ampere, but vLLM gates its W4A8 path to Hopper: on an Amper
 ## What's in it
 
 - **W4A8 on Ampere** (`patches/0001`, upstream [#38066](https://github.com/vllm-project/vllm/pull/38066)) — int4-weight + int8-act through Marlin.
-- **int8 8-row Marlin decode tile** (`patches/0002`) — completes the W4A8 small-batch decode path.
+- **int8 8-row Marlin decode tile** (`flashampere/marlin/`) — completes the W4A8 small-batch decode path.
 - **AOT-compile cache-key fix** (`patches/0003`) — keys the torch.compile cache on the quant scheme.
 - **int8-act opt-in flag + MoE support** (`patches/0005`–`0006`) — `--marlin-input-dtype int8` (or env
   `VLLM_MARLIN_INPUT_DTYPE=int8`) turns a W4A16 checkpoint into W4A8 at serve time, for **dense and MoE**.
@@ -30,8 +30,9 @@ Marlin can run it on Ampere, but vLLM gates its W4A8 path to Hopper: on an Amper
   serving of block-diffusion draft heads (DeepSeek DSpark / z-lab DFlash); ready-made head:
   [Avesed/Qwen3.6-27B-DSpark](https://huggingface.co/Avesed/Qwen3.6-27B-DSpark).
 
-`vllm/` and `flashinfer/` carry the edits baked in; `patches/` + `scripts/revendor.sh` replay them on an
-upstream bump, and `scripts/build_image_source.sh` builds + pushes the image.
+`vllm/` and `flashinfer/` carry the edits baked in — the vendored tree *is* the fork, and nothing
+applies `patches/` (it is the written record of the edits). `scripts/revendor.sh` 3-way merges the tree
+onto a new upstream tag, and `scripts/build_image_source.sh` builds + pushes the image.
 
 ## Results
 
