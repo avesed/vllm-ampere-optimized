@@ -238,7 +238,10 @@ class _BatchPrefillState:
         mod.paged_run = _recorder
         try:
             out.zero_()
-            o = w.run(q, kv_cache, out=out)
+            # Hand the wrapper the UNPACKED views, not the raw page. Since 0.26 the page is
+            # (B, H, N, 2*D); flashinfer reads head_dim off the last dim and would size `out` at
+            # 2*D. The fast path below already uses kc/vc, so this keeps both paths identical.
+            o = w.run(q, (kc, vc), out=out)
         finally:
             mod.paged_run = orig
         a = rec.get("a")
