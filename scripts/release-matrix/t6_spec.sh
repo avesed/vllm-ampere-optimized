@@ -41,11 +41,11 @@ say "T6.5 DFlash 27B K=7"
 if spec t6-dflash 8189 Qwen3.6-27B-DFlash 7 dflash \
      -e VLLM_FLASHAMPERE=1 -e VLLM_USE_V2_MODEL_RUNNER=0 -e VLLM_FLASHAMPERE_XQA_VERIFY=1; then
   battery 8189; accept t6-dflash; fi
-docker rm -f t6-dflash >/dev/null 2>&1
+matrix_rm t6-dflash
 
 say "T6.4 DSpark 27B K=7"
 if spec t6-dspark 8189 dspark_27b_published 7 dspark \
      -e VLLM_FLASHAMPERE=1 -e VLLM_USE_V2_MODEL_RUNNER=0 -e VLLM_FLASHAMPERE_XQA_VERIFY=1; then
   battery 8189; accept t6-dspark; fi
-docker rm -f t6-dspark >/dev/null 2>&1
+matrix_rm t6-dspark
 echo -e "\nT6_DONE" >> "$LOG"

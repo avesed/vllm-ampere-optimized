@@ -44,9 +44,9 @@ with cf.ThreadPoolExecutor(16) as ex:
 print("SOAK RESULT", stats)
 PY
   kill $SAMPLER 2>/dev/null
-  echo "engine alive at end: $(docker ps --filter name=t9-soak --format '{{.Names}}' | grep -c t9-soak)" >> "$LOG"
+  echo "engine alive at end: $(docker ps --filter 'name=^t9-soak$' --format '{{.Names}}' | grep -cx t9-soak)" >> "$LOG"
   echo "engine deaths: $(docker logs t9-soak 2>&1 | grep -ac 'EngineDeadError\|EngineCore encountered a fatal error')" >> "$LOG"
   accept t9-soak
 fi
-docker rm -f t9-soak >/dev/null 2>&1
+matrix_rm t9-soak
 echo -e "\nT9_DONE" >> "$LOG"

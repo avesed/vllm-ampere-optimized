@@ -28,7 +28,7 @@ if serve t2-on 8184 Qwen3.6-27B-W4A16 \
   ask 8184 200 "long ~2016tok (batch path expected)"
   fired t2-on
 fi
-docker rm -f t2-on >/dev/null 2>&1
+matrix_rm t2-on
 
 say "T2.5/T2.6 FAMP_BP_NOZERO=1 + concurrency W=8"
 if serve t2-nozero 8184 Qwen3.6-27B-W4A16 \
@@ -53,5 +53,5 @@ print(f"  concurrency W=8: {len(r)} requests, {len(e)} errors {e[:3]}")
 PY
   fired t2-nozero
 fi
-docker rm -f t2-nozero >/dev/null 2>&1
+matrix_rm t2-nozero
 echo -e "\nT2_DONE" >> "$LOG"
