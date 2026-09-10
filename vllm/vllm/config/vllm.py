@@ -2631,16 +2631,18 @@ class VllmConfig:
         if self.parallel_config.prefill_context_parallel_size > 1:
             unsupported.append("prefill context parallel")
 
-        # DSpark is implemented only by the V2 GPU model runner.
+        # Upstream gates DSpark and mixed sliding/full DFlash to the V2 runner. Neither holds on
+        # this fork, which implements both on V1 and ships them as its primary decode lever:
+        #   - DSpark: v1/spec_decode/dspark.py::DSparkProposer, selected in gpu_model_runner
+        #     before the use_eagle() branch.
+        #   - mixed sliding/full DFlash: qwen3_dflash.py::DFlashAttention widens a
+        #     SlidingWindowSpec to a FullAttentionSpec so one KV group serves the whole draft,
+        #     which is exactly what the multi-KV-group requirement was about.
+        # Both are covered by the release matrix (T6); if either regresses, T6 fails loudly rather
+        # than silently degrading, so the guard is not carrying weight here.
         if self.speculative_config:
-            if self.speculative_config.method == "dspark":
-                unsupported.append("dspark speculative decoding")
             if self.speculative_config.enable_adaptive_verification:
                 unsupported.append("adaptive draft verification")
-
-        # Mixed sliding/full DFlash drafts need multiple KV groups (V2 only).
-        if self._dflash_needs_multi_kv_group():
-            unsupported.append("mixed sliding/full dflash drafts")
 
         # The DFlash2 candidate selector exists only in the V2 speculator. On
         # V1 the same checkpoint drafts through DFlashProposer, which never
