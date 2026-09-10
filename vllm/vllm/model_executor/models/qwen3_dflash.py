@@ -72,6 +72,29 @@ def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
     return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
 
 
+# Carried by the fork: upstream had this in 0.28, dropped it in 0.29, and the fork's
+# DFlashProposer.load_model still needs it -- a RoPE-layout mismatch between draft and
+# target is silent (acceptance collapses, output stays plausible, nothing raises).
+def dflash_target_rope_is_neox_style(target_model: nn.Module) -> bool | None:
+    """The target's RoPE layout, from its first attention layer.
+
+    A DFlash head must rotate Q/K the way the target it was distilled against
+    does, and a mismatch is silent — acceptance collapses but nothing errors and
+    the output stays correct. Draft checkpoints do not carry this, so take it
+    from the target. None if the target uses no RoPE.
+    """
+    language_model = (
+        target_model.get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
+    for module in language_model.modules():
+        style = getattr(module, "is_neox_style", None)
+        if isinstance(style, bool):
+            return style
+    return None
+
+
 def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
     """Whether the draft needs a non-causal-capable backend, resolved from config
     (config mirror of the model's ``get_draft_attn_causal``, usable pre-build)."""
