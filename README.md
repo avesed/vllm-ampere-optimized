@@ -1,8 +1,10 @@
 # vllm-ampere-optimized
 
-An Ampere fork of **vLLM v0.23.0** (+ FlashInfer v0.6.12) that un-gates **W4A8 (int4 weights + int8
-activations)** and adds native int8 kernels upstream restricts to Hopper. Built from source for
-`sm_80` (A100) and `sm_86` (RTX 3090 / A40 / A6000 / A10).
+An Ampere fork of **vLLM** (v0.29.0 + FlashInfer 0.6.18 as of fork v0.4.2; `UPSTREAM_VLLM_VERSION` and
+`flashinfer/version.txt` track the vendored versions) that un-gates **W4A8 (int4 weights + int8
+activations)** and adds native int8 kernels upstream restricts to Hopper. The fork's own kernels target
+`sm_80` (A100) and `sm_86` (RTX 3090 / A40 / A6000 / A10). The image is a full multi-arch build, so
+other GPUs run the stock vLLM paths.
 
 **Image:** [`ghcr.io/avesed/vllm-ampere-optimized`](https://github.com/avesed/vllm-ampere-optimized/pkgs/container/vllm-ampere-optimized)
 
@@ -23,11 +25,15 @@ Marlin can run it on Ampere, but vLLM gates its W4A8 path to Hopper: on an Amper
   as a plugin-selected `.so` (bit-exact vs stock, built in the image for `sm_80`+`sm_86`), so the int8
   path survives upstream refactors.
 - **flashampere attention backend** (`flashampere/`, opt-in `VLLM_FLASHAMPERE=1`) — composable Ampere
-  attention legs: fp16-accumulate PV prefill (GeForce RTX-30 only; +1–4% long-context TTFT), a vendored
-  XQA decode kernel for head_dim-512 (gemma-4) and MTP spec-verify, with bit-faithful fallback to stock
-  FA. A per-model-architecture registry auto-applies validated defaults.
-- **DSpark / DFlash speculative decoding** — native `--speculative-config '{"method":"dspark",...}'`
-  serving of block-diffusion draft heads (DeepSeek DSpark / z-lab DFlash); ready-made head:
+  attention legs for head_dim ≤ 256: fp16-accumulate PV prefill (GeForce RTX-30 only; +1–4%
+  long-context TTFT) and an opt-in XQA spec-verify kernel (`VLLM_FLASHAMPERE_XQA_VERIFY=1`; engages only
+  when the KV page is ≤ 256 tokens, so not on the Qwen3.5/3.6 hybrids). Any case a leg does not cover
+  falls back to the stock backend bit-for-bit. Larger heads (Gemma-4's head_dim 512) go to stock
+  FlashInfer/Triton, which are now correct and faster there.
+- **DSpark speculative decoding** — `--speculative-config '{"method":"dspark",...}'` serves DeepSeek
+  DSpark block-diffusion draft heads (fork-only). DFlash is upstream too; the fork also serves DFlash
+  heads that mix sliding and full attention on the V1 model runner, which upstream 0.29 rejects there.
+  Ready-made head:
   [Avesed/Qwen3.6-27B-DSpark](https://huggingface.co/Avesed/Qwen3.6-27B-DSpark).
 
 `vllm/` and `flashinfer/` carry the edits baked in — the vendored tree *is* the fork, and nothing
@@ -37,7 +43,8 @@ onto a new upstream tag, and `scripts/build_image_source.sh` builds + pushes the
 ## Results
 
 Stock vLLM **won't load W4A8 on any Ampere GPU** — the fork is the only way to run it. Numbers below are
-**W4A16 → W4A8** on the same fork engine, tok/s (int4 g32 AWQ+mse, cudagraph):
+**W4A16 → W4A8** on the same fork engine, tok/s (int4 g32 AWQ+mse, cudagraph). They were measured on
+the vLLM 0.23-based releases (v0.2/v0.3) and have not been re-measured on 0.29:
 
 | GPU · arch | model | prefill (8k) | int8 Δ | decode | batch-32 |
 |---|---|---|---:|---:|---:|
@@ -69,17 +76,22 @@ Stock vLLM **won't load W4A8 on any Ampere GPU** — the fork is the only way to
 ## Use
 
 ```bash
-docker run --gpus all -p 8000:8000 \
+docker run --gpus all --ipc=host -p 8000:8000 \
   ghcr.io/avesed/vllm-ampere-optimized:latest \
   --model Avesed/Qwen3.6-27B-INT4-W4A16 --marlin-input-dtype int8 --pipeline-parallel-size 2 --max-model-len 8192
 ```
-*(cu130 image needs NVIDIA driver ≥ 580.65. With NVLink use `--tensor-parallel-size 2`; single GPU, drop both. On a **no-NVLink** multi-GPU box, prefer `-pp 2`, or add `--disable-custom-all-reduce` if you use `-tp 2` — custom all-reduce over PCIe + `expandable_segments` can crash at startup.)*
+*(cu130 image needs NVIDIA driver ≥ 580.65. Keep `--ipc=host` (or `--shm-size=8g`): Docker's default
+64 MB `/dev/shm` corrupts vLLM's multi-GPU input broadcast and `-tp 2` output turns to garbage. With NVLink use `--tensor-parallel-size 2`; single GPU, drop both. On a **no-NVLink** multi-GPU box, prefer `-pp 2`, or add `--disable-custom-all-reduce` if you use `-tp 2` — custom all-reduce over PCIe + `expandable_segments` can crash at startup.)*
 
 Run a plain **W4A16** checkpoint as **W4A8** by adding **`--marlin-input-dtype int8`** (dense or MoE).
 
-**No Docker?** A from-source wheel (`sm_80`+`sm_86`) is on
-[Releases](https://github.com/avesed/vllm-ampere-optimized/releases) — `pip install` it (needs torch 2.11
-+ CUDA 13). Enable W4A8 with `--marlin-input-dtype int8`.
+**Images and video** work on every fork path: W4A8 (dense and MoE), flashampere, and MTP / DFlash /
+DSpark spec decode. The quant recipes, and the Qwen3.6 quants below, keep the vision tower in bf16.
+The release matrix covers this in `scripts/release-matrix/t12_mm.sh`.
+
+**No Docker?** Releases since v0.4 ship as the image only. The last wheel is on
+[v0.3](https://github.com/avesed/vllm-ampere-optimized/releases/tag/v0.3) (vLLM 0.23, `sm_80`+`sm_86`,
+torch 2.11 + CUDA 13) and predates everything after it.
 
 - **Ready-made quants** — [huggingface.co/Avesed](https://huggingface.co/Avesed):
   - Qwen3.6-27B: [INT4-W4A16](https://huggingface.co/Avesed/Qwen3.6-27B-INT4-W4A16) · [INT8-W8A8](https://huggingface.co/Avesed/Qwen3.6-27B-INT8-W8A8) — int4: GSM8K 96.8% / MMLU-Pro 82.4%
