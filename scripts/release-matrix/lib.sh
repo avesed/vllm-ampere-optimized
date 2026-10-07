@@ -53,6 +53,55 @@ serve(){ # name port model [extra docker args...] [--ARGS-- extra server args...
   echo "TIMEOUT (container alive but never served)" >> "$LOG"; return 1
 }
 
+# GSM8K over the API with one fixed protocol (sampled -- never greedy on these thinking models,
+# 0.6/0.95/20, \boxed{} answers). Only ever compare a number to the same call on another image.
+gsm8k(){ # port tag [n]
+  GSM8K_JSONL="${GSM8K_JSONL:?set GSM8K_JSONL}" python3 ../../eval/gsm8k_api_eval.py \
+    --base "http://127.0.0.1:$1" --tag "$2" --n "${3:-40}" --temperature 0.6 --top-p 0.95 \
+    --top-k 20 --max-tokens 6000 --concurrency 20 --boxed 2>&1 | grep -aE "RESULT|thinking spans|mean completion" >> "$LOG"
+}
+
+# Fire one raw /v1/completions prompt and print the text (for exact-token-count triggers).
+complete(){ # port prompt max_tokens
+  python3 - "$1" "$2" "$3" <<'PY' >> "$LOG" 2>&1
+import json, sys, urllib.request
+port, prompt, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
+b = json.dumps({"model":"test","prompt":prompt,"max_tokens":n,"temperature":0.0}).encode()
+try:
+    d = json.load(urllib.request.urlopen(urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/completions", b, {"Content-Type":"application/json"}), timeout=300))
+    print(f"  prompt_tokens={d['usage']['prompt_tokens']} -> {d['choices'][0]['text'][:200]!r}")
+except Exception as e:
+    print(f"  REQUEST FAILED {type(e).__name__}: {str(e)[:120]}")
+PY
+}
+
+# zh+en garble canary: 8 chat prompts, flag looping/repeated spans or U+FFFD. Texts of hits are
+# printed so a hit can be judged.
+canary(){ # port
+  python3 - "$1" <<'PY' >> "$LOG" 2>&1
+import json, re, sys, urllib.request
+port = sys.argv[1]
+qs = ["用三句话解释 Transformer 里的自注意力机制。", "请用中文写一句关于春天的话。",
+      "把这句话翻译成英文：床前明月光，疑是地上霜。", "列出三种常见的排序算法并简单比较。",
+      "Explain in two sentences why the sky is blue.", "写一首四行的小诗，主题是秋天。",
+      "What is the capital of Australia, and why is it not Sydney?", "用一句话介绍一下长城。"]
+hits = 0
+for q in qs:
+    b = json.dumps({"model":"test","messages":[{"role":"user","content":q}],
+                    "max_tokens":300,"temperature":0.6,"top_p":0.95}).encode()
+    try:
+        d = json.load(urllib.request.urlopen(urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions", b, {"Content-Type":"application/json"}), timeout=300))
+        t = d["choices"][0]["message"]["content"] or ""
+    except Exception as e:
+        hits += 1; print("  REQUEST FAILED:", type(e).__name__, str(e)[:100]); continue
+    if "�" in t or re.search(r"(.{4,}?)\1{5,}", t, re.S):
+        hits += 1; print("  CANARY HIT:", repr(t[-300:]))
+print(f"  canary: {hits}/{len(qs)} degenerate")
+PY
+}
+
 fired(){ echo "  famp fired: $(docker logs "$1" 2>&1 | grep -ac 'FLASHAMPERE .* FIRED')" >> "$LOG"
          docker logs "$1" 2>&1 | grep -a 'FLASHAMPERE .* FIRED' | tail -2 >> "$LOG"; }
 backends(){ docker logs "$1" 2>&1 | grep -aE "Using .*attention backend" | grep -avi all-reduce | sort -u >> "$LOG"; }
