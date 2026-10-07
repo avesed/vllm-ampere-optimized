@@ -36,10 +36,13 @@ if(VLLM_FLASH_ATTN_SRC_DIR)
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 else()
+  # [Ampere fork] upstream 9cd61de + one commit that skips fwd_kvcache's host-synced
+  # seqlens bound check during CUDA graph capture (the fork's FA2 kvcache spec-verify
+  # path is captured into FULL graphs).
   FetchContent_Declare(
           vllm-flash-attn
-          GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
-          GIT_TAG 9cd61de38763d712bb6ce56e2a02cc2bf718c89f
+          GIT_REPOSITORY https://github.com/avesed/flash-attention.git
+          GIT_TAG d52b9273328559b67aa08662d6156e071be36434
           GIT_PROGRESS TRUE
           # Don't share the vllm-flash-attn build between build types
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
