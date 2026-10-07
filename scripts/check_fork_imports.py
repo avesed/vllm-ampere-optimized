@@ -15,7 +15,7 @@ the defining module's own AST, and reports misses.
 
 Function-local imports are checked too; those are the ones that fail late.
 
-    python3 scripts/check_fork_imports.py [--baseline <pristine-tree>] [tree]
+    python3 scripts/check_fork_imports.py [--baseline <pristine-tree>] [--extra flashampere] [tree]
 
 With --baseline, findings that also occur in pristine upstream are dropped, so the output is
 fork-introduced breakage only.
@@ -71,9 +71,11 @@ def exported(path: pathlib.Path) -> set[str] | None:
     return names
 
 
-def scan(root: pathlib.Path) -> set[str]:
+def scan(root: pathlib.Path, src: pathlib.Path | None = None) -> set[str]:
+    """Check `from vllm...` imports in the files under `src` (default: `root`) against `root`."""
+    src = src or root
     findings: set[str] = set()
-    for path in sorted(root.rglob("*.py")):
+    for path in sorted(src.rglob("*.py")):
         try:
             tree = ast.parse(path.read_text(errors="replace"))
         except SyntaxError:
@@ -96,7 +98,7 @@ def scan(root: pathlib.Path) -> set[str]:
                 if module_path(root, f"{node.module}.{alias.name}") is not None:
                     continue
                 findings.add(
-                    f"{path.relative_to(root.parent)}:{node.lineno}: "
+                    f"{path.relative_to(src.parent)}:{node.lineno}: "
                     f"cannot import '{alias.name}' from '{node.module}'"
                 )
     return findings
@@ -106,12 +108,20 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("tree", nargs="?", default="vllm/vllm")
     ap.add_argument("--baseline", help="pristine upstream tree to subtract")
+    ap.add_argument(
+        "--extra", action="append", default=[],
+        help="out-of-tree source dir whose vllm imports must resolve against the tree "
+        "(repeatable; e.g. flashampere -- its plugin loader swallows import errors)",
+    )
     args = ap.parse_args()
 
-    found = scan(pathlib.Path(args.tree))
+    tree = pathlib.Path(args.tree)
+    found = scan(tree)
     if args.baseline:
         base = {f.split(":", 1)[1] for f in scan(pathlib.Path(args.baseline))}
         found = {f for f in found if f.split(":", 1)[1] not in base}
+    for extra in args.extra:
+        found |= scan(tree, pathlib.Path(extra))
     for f in sorted(found):
         print(f)
     print(f"unresolved fork imports: {len(found)}")
