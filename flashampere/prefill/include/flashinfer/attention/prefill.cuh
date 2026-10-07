@@ -46,6 +46,12 @@
 #include <utility>
 namespace flashinfer {
 
+// [famp] FlashInfer 0.7 made math::inf an IEEE infinity and clamped every softmax site of its own
+// prefill.cuh against (-inf) - (-inf). This kernel predates those clamps, so it keeps the finite
+// 0.6.x masking sentinel it was validated with: a row fully masked inside one split-KV chunk then
+// stays finite instead of turning NaN and poisoning the chunk merge.
+constexpr float famp_mask_inf = 5e4f;
+
 DEFINE_HAS_MEMBER(maybe_q_rope_offset)
 DEFINE_HAS_MEMBER(maybe_k_rope_offset)
 DEFINE_HAS_MEMBER(maybe_prefix_len_ptr)
@@ -175,9 +181,9 @@ struct KernelTraits {
   template <typename DT>
   static constexpr DT getNegInf() {
     if constexpr (std::is_same<DT, __half>::value) {
-      return std::bit_cast<half>(fp16_ieee_from_fp32_value(-math::inf));
+      return std::bit_cast<half>(fp16_ieee_from_fp32_value(-famp_mask_inf));
     } else {
-      return static_cast<DTypeQKAccum>(-math::inf);
+      return static_cast<DTypeQKAccum>(-famp_mask_inf);
     }
   }
 
@@ -188,7 +194,7 @@ struct KernelTraits {
                 "Set -DFP16_QK_REDUCTION_SUPPORTED and install boost_math "
                 "then recompile to support fp16 reduction");
   static constexpr DTypeQKAccum MaskFillValue =
-      AttentionVariant::use_softmax ? DTypeQKAccum(-math::inf) : DTypeQKAccum(0.f);
+      AttentionVariant::use_softmax ? DTypeQKAccum(-famp_mask_inf) : DTypeQKAccum(0.f);
 #endif
 };
 
@@ -647,7 +653,7 @@ __device__ __forceinline__ void init_states(typename KTraits::AttentionVariant v
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
-        m[mma_q][j] = typename KTraits::DTypeQKAccum(-math::inf);
+        m[mma_q][j] = typename KTraits::DTypeQKAccum(-famp_mask_inf);
         d[mma_q][j] = 1.f;
       }
     }
@@ -1541,7 +1547,7 @@ __device__ __forceinline__ void finalize_m(typename KTraits::AttentionVariant va
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
-        if (m[mma_q][j] != typename KTraits::DTypeQKAccum(-math::inf)) {
+        if (m[mma_q][j] != typename KTraits::DTypeQKAccum(-famp_mask_inf)) {
           m[mma_q][j] *= variant.sm_scale_log2;
         }
       }
@@ -1631,7 +1637,7 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
         float o_scale[2][KTraits::NUM_WARPS_KV];
 #pragma unroll
         for (uint32_t j = 0; j < 2; ++j) {
-          float m_new = -math::inf, d_new = 1.f;
+          float m_new = -famp_mask_inf, d_new = 1.f;
 #pragma unroll
           for (uint32_t i = 0; i < KTraits::NUM_WARPS_KV; ++i) {
             float2 md = smem_md[(((i * KTraits::NUM_WARPS_Q + get_warp_idx_q<KTraits>(tid.y)) *

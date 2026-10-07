@@ -275,6 +275,25 @@ class _BatchPrefillState:
 
 
 _BP_STATES: dict[tuple, _BatchPrefillState] = {}
+_BP_FI_OK: bool | None = None
+
+
+def _batch_prefill_fi_ok() -> bool:
+    """Whether the installed FlashInfer still routes fa2 batch prefill through the hook the
+    famp shim replaces. FlashInfer 0.7 builds it via _gen_batch_prefill_primary_module (the shim
+    is never consulted) and instantiates SAME_KV_STRIDES variants the vendored prefill.cuh does
+    not define, so the batch path stays off there until it is ported."""
+    global _BP_FI_OK
+    if _BP_FI_OK is None:
+        from flashinfer.jit.attention import modules as _fi_modules
+
+        _BP_FI_OK = not hasattr(_fi_modules, "_gen_batch_prefill_primary_module")
+        if not _BP_FI_OK:
+            logger.warning(
+                "flashampere: VLLM_FAMP_BATCH_PREFILL ignored -- this FlashInfer builds batch "
+                "prefill outside the famp hook; using the per-request leg."
+            )
+    return _BP_FI_OK
 
 
 def _batch_prefill_run(impl, layer, query, key, value, kv_cache, m, output, qsl_cpu, sl_cpu, leg):
@@ -371,6 +390,7 @@ def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: 
         # Small-q steps (prefix-cache hits, tail chunks) are a few-ms op where the per-step
         # plan() tax exceeds the kernel win — leave those to stock FA. Full chunks engage.
         and int(_qsl_cpu[-1]) >= _BP_MIN_TOKENS
+        and _batch_prefill_fi_ok()
     ):
         return _batch_prefill_run(
             impl, layer, query, key, value, kv_cache, m, output, _qsl_cpu, _sl_cpu, leg
