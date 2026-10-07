@@ -57,7 +57,7 @@ matrix_rm t6m-mtp-off
 
 say "T6.4b DSpark K=7 exactly-8-token trigger (the original 'DSpark broken' repro) + canary"
 if serve t6m-dspark 8187 Qwen3.6-27B-W4A16 --ARGS-- --max-num-seqs 64 \
-     --speculative-config '{"method":"dspark","model":"/models/dspark_27b_published","num_speculative_tokens":7}'; then
+     --speculative-config "{\"method\":\"dspark\",\"model\":\"/models/${DSPARK_HEAD:-dspark_27b_published}\",\"num_speculative_tokens\":7}"; then
   complete 8187 "请用中文写一句关于春天的话。" 60
   canary 8187
   accept t6m-dspark

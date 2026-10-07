@@ -39,11 +39,21 @@ fi
 matrix_rm t0-v2
 
 say "T0.7 famp dispatch unit tests against the in-image flashampere"
+# The tests import the repo-root `flashampere` package; in the image famp lives inside vLLM and
+# /opt/famp/flashampere holds only the marlin plugin, so alias the in-image package before collection.
 oneshot t0-pytest -v "$(pwd)/../../vllm/tests/v1/attention":/t:ro -- -c '
-import subprocess, sys
+import importlib, pkgutil, subprocess, sys
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pytest"], check=False)
-sys.exit(subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-    "/t/test_flashampere_dispatch.py", "/t/test_flashampere_kv_layout.py",
-    "/t/test_flashampere_hd512_gate.py"]).returncode)
+src = "vllm.v1.attention.backends.flashampere"
+pkg = importlib.import_module(src)
+sys.modules["flashampere"] = pkg
+for m in pkgutil.iter_modules(pkg.__path__):
+    try:
+        sys.modules["flashampere." + m.name] = importlib.import_module(src + "." + m.name)
+    except Exception as e:
+        print("alias skipped:", m.name, type(e).__name__, e)
+import pytest
+sys.exit(pytest.main(["-q", "-p", "no:cacheprovider", "/t/test_flashampere_dispatch.py",
+                      "/t/test_flashampere_kv_layout.py", "/t/test_flashampere_hd512_gate.py"]))
 '
 echo -e "\nT0_DONE" >> "$LOG"

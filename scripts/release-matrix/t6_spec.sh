@@ -44,7 +44,7 @@ if spec t6-dflash 8189 Qwen3.6-27B-DFlash 7 dflash \
 matrix_rm t6-dflash
 
 say "T6.4 DSpark 27B K=7"
-if spec t6-dspark 8189 dspark_27b_published 7 dspark \
+if spec t6-dspark 8189 "${DSPARK_HEAD:-dspark_27b_published}" 7 dspark \
      -e VLLM_FLASHAMPERE=1 -e VLLM_USE_V2_MODEL_RUNNER=0 -e VLLM_FLASHAMPERE_XQA_VERIFY=1; then
   battery 8189; accept t6-dspark; fi
 matrix_rm t6-dspark
