@@ -2,7 +2,8 @@
 # T10 -- perf regression gate. Run on two images back to back on an otherwise idle box, and only
 # compare medians from the same block: one sample per point (as T6m takes) is noise at the +-8%
 # level. Decode is timed by hand from the stream (tokens = max_tokens via ignore_eos); prefill is
-# prompt_tokens / TTFT with prefix caching off and a fresh random prompt per request.
+# prompt_tokens / TTFT with prefix caching off and a fresh random prompt per request. max-num-seqs 64:
+# at 20k context + MTP the 27B hybrid has only ~228 Mamba blocks, below the default 256.
 set -u
 cd "$(dirname "$0")"; LOG=${LOGDIR:-$(pwd)}/t10.log; : > "$LOG"; . ./lib.sh
 REPS=${PERF_REPS:-5}
@@ -36,13 +37,15 @@ PY
 }
 
 say "T10.1 27B W4A16, no spec: decode (ctx ~200) + prefill (~8k, prefix cache off)"
-if serve t10-plain 8190 Qwen3.6-27B-W4A16 --ARGS-- --max-model-len 20000 --no-enable-prefix-caching; then
+if serve t10-plain 8190 Qwen3.6-27B-W4A16 --ARGS-- --max-model-len 20000 --max-num-seqs 64 \
+     --no-enable-prefix-caching; then
   bench 8190 decode 150 400; bench 8190 prefill 7000 8
 fi
 matrix_rm t10-plain
 
 say "T10.2 27B W4A16 + MTP K=2: decode at ctx ~200 and ~16k (FA2 kvcache verify on)"
-if serve t10-mtp 8190 Qwen3.6-27B-W4A16 --ARGS-- --max-model-len 20000 --no-enable-prefix-caching \
+if serve t10-mtp 8190 Qwen3.6-27B-W4A16 --ARGS-- --max-model-len 20000 --max-num-seqs 64 \
+     --no-enable-prefix-caching \
      --speculative-config '{"method":"mtp","num_speculative_tokens":2}'; then
   bench 8190 decode 150 400; bench 8190 decode 14000 400
 fi
