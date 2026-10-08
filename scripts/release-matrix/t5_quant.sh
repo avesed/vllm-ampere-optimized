@@ -6,7 +6,7 @@ cd "$(dirname "$0")"; LOG=${LOGDIR:-$(pwd)}/t5.log; : > "$LOG"; . ./lib.sh
 N=${GSM8K_N:-40}
 
 marlin(){ # name -- which linear kernel and whether famp-marlin registered
-  docker logs "$1" 2>&1 | grep -aE "famp_marlin: |Using .*LinearKernel|selected .*Marlin" | sort -u | head -4 >> "$LOG"
+  docker logs "$1" 2>&1 | grep -aE "famp_marlin: |Using [A-Za-z0-9]*Kernel for" | sed "s/^.*\] //" | sort -u | head -4 >> "$LOG"
 }
 
 say "T5.1 27B W4A16"
@@ -31,7 +31,8 @@ if serve t5-moe8 8185 Qwen3.6-35B-A3B-W4A16 --ARGS-- --marlin-input-dtype int8; 
 matrix_rm t5-moe8
 
 say "T5.5 27B W8A8"
-if serve t5-w8a8 8185 Qwen3.6-27B-W8A8; then
+# W8A8 weights leave ~104 Mamba state blocks at 0.85 util; the default max_num_seqs=256 cannot capture.
+if serve t5-w8a8 8185 Qwen3.6-27B-W8A8 --ARGS-- --max-num-seqs 64; then
   gsm8k 8185 27b-w8a8 "$N"; canary 8185; fi
 matrix_rm t5-w8a8
 
