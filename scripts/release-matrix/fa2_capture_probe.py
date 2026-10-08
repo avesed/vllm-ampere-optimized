@@ -1,11 +1,17 @@
-"""Does FA2 paged fwd_kvcache (the fork's MTP-verify path) survive CUDA graph capture?
+"""FA2 paged fwd_kvcache (the fork's spec-verify path) contract.
 
 Calls torch.ops._vllm_fa2_C.fwd_kvcache exactly like the fork's flash_attn_kvcache_verify
-(k/v None, paged KV via block_table, per-request seqlens_k) once eagerly, then inside
-torch.cuda.graph capture, then replays. Prints CAPTURE_OK / CAPTURE_FAIL.
+(k/v None, paged KV via block_table, per-request seqlens_k):
+  - eagerly, then inside torch.cuda.graph capture, then replays: CAPTURE_OK / CAPTURE_FAIL;
+  - eagerly behind a long GPU sleep: the call must not wait for the GPU (a device-to-host sync
+    there stalls the PIECEWISE spec-decode drafter once per step): NO_HOST_SYNC / HOST_SYNC;
+  - in a subprocess with seqlens_k past the block_table capacity: the paged-KV bounds guard
+    must stop it: GUARD_OK / GUARD_MISSING.
 """
 
+import subprocess
 import sys
+import time
 
 import torch
 
@@ -56,3 +62,30 @@ try:
 except Exception as e:  # noqa: BLE001
     print(f"CAPTURE_FAIL {type(e).__name__}: {str(e).splitlines()[0][:300]}")
     sys.exit(1)
+
+# No host sync on the eager path: queue ~1 s of GPU sleep, the call must return long before it ends.
+torch.cuda.synchronize()
+torch.cuda._sleep(int(2e9))
+t0 = time.perf_counter()
+run()
+host_ms = (time.perf_counter() - t0) * 1e3
+torch.cuda.synchronize()
+print(f"{'NO_HOST_SYNC' if host_ms < 100 else 'HOST_SYNC'} eager call returned in {host_ms:.1f} ms")
+
+# Bounds guard: one sequence longer than its block_table row can address.
+child = f"""
+import torch, vllm.vllm_flash_attn
+dev, dt = "cuda", torch.float16
+kc = torch.randn({num_blocks}, {PAGE}, {HKV}, {D}, dtype=dt, device=dev); vc = torch.randn_like(kc)
+bt = torch.arange({num_blocks}, dtype=torch.int32, device=dev).view({B}, {PAGES_PER_SEQ})
+sk = torch.tensor([{PAGE * PAGES_PER_SEQ + 1}, 1, 1, 1], dtype=torch.int32, device=dev)
+q = torch.randn({B}, {QLEN}, {H}, {D}, dtype=dt, device=dev); o = torch.empty_like(q)
+torch.ops._vllm_fa2_C.fwd_kvcache(q, kc, vc, None, None, sk, None, None, None, None,
+                                  bt, None, o, {D ** -0.5}, True, -1, -1, 0.0, False, 0)
+torch.cuda.synchronize()
+print("NO_ERROR")
+"""
+p = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=300)
+txt = p.stdout + p.stderr
+caught = p.returncode != 0 and "NO_ERROR" not in txt and ("device-side assert" in txt or "block_table" in txt)
+print(("GUARD_OK" if caught else "GUARD_MISSING") + f" rc={p.returncode}")

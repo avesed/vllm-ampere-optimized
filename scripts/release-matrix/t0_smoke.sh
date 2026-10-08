@@ -22,7 +22,7 @@ import flashampere.marlin.kernel as k; print("fampmarlin kernel import OK:", k.F
 import vllm.v1.attention.backends.flashampere.kernels as fk; print("famp kernels import OK")
 '
 
-say "T0.2 FA2 paged fwd_kvcache survives CUDA graph capture (the fork's spec-verify path)"
+say "T0.2 FA2 paged fwd_kvcache (the fork's spec-verify path): graph capture, no eager host sync, bounds guard"
 oneshot t0-fa2cap -v "$(pwd)/fa2_capture_probe.py":/probe.py:ro -- /probe.py
 
 say "T0.3 default env (famp off) -- Qwen3-8B dense"
