@@ -1,6 +1,6 @@
 # vllm-ampere-optimized
 
-An Ampere fork of **vLLM** (v0.29.0 + FlashInfer 0.6.18 as of fork v0.4.2; `UPSTREAM_VLLM_VERSION` and
+An Ampere fork of **vLLM** (v0.31.0 + FlashInfer 0.6.18.post1; `UPSTREAM_VLLM_VERSION` and
 `flashinfer/version.txt` track the vendored versions) that un-gates **W4A8 (int4 weights + int8
 activations)** and adds native int8 kernels upstream restricts to Hopper. The fork's own kernels target
 `sm_80` (A100) and `sm_86` (RTX 3090 / A40 / A6000 / A10). The image is a full multi-arch build, so
@@ -32,9 +32,13 @@ Marlin can run it on Ampere, but vLLM gates its W4A8 path to Hopper: on an Amper
   FlashInfer/Triton, which are now correct and faster there.
 - **DSpark speculative decoding** — `--speculative-config '{"method":"dspark",...}'` serves DeepSeek
   DSpark block-diffusion draft heads (fork-only). DFlash is upstream too; the fork also serves DFlash
-  heads that mix sliding and full attention on the V1 model runner, which upstream 0.29 rejects there.
+  heads that mix sliding and full attention on the V1 model runner, which upstream 0.31 rejects there.
   Ready-made head:
   [Avesed/Qwen3.6-27B-DSpark](https://huggingface.co/Avesed/Qwen3.6-27B-DSpark).
+- **Capture-safe FA2 paged decode** — the image builds vllm-flash-attention from
+  [avesed/flash-attention](https://github.com/avesed/flash-attention/tree/vllm-ampere-optimized/capture-safe-kvcache):
+  the upstream pin's `mha_fwd_kvcache` does a device-to-host sync on paged KV, which breaks CUDA graph
+  capture of the fork's FA2 spec-verify path; the fork skips that check while a stream is capturing.
 
 `vllm/` and `flashinfer/` carry the edits baked in — the vendored tree *is* the fork, and nothing
 applies `patches/` (it is the written record of the edits). `scripts/revendor.sh` 3-way merges the tree
@@ -44,7 +48,7 @@ onto a new upstream tag, and `scripts/build_image_source.sh` builds + pushes the
 
 Stock vLLM **won't load W4A8 on any Ampere GPU** — the fork is the only way to run it. Numbers below are
 **W4A16 → W4A8** on the same fork engine, tok/s (int4 g32 AWQ+mse, cudagraph). They were measured on
-the vLLM 0.23-based releases (v0.2/v0.3) and have not been re-measured on 0.29:
+the vLLM 0.23-based releases (v0.2/v0.3) and have not been re-measured on 0.31:
 
 | GPU · arch | model | prefill (8k) | int8 Δ | decode | batch-32 |
 |---|---|---|---:|---:|---:|
