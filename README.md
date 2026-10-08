@@ -37,8 +37,9 @@ Marlin can run it on Ampere, but vLLM gates its W4A8 path to Hopper: on an Amper
   [Avesed/Qwen3.6-27B-DSpark](https://huggingface.co/Avesed/Qwen3.6-27B-DSpark).
 - **Capture-safe FA2 paged decode** — the image builds vllm-flash-attention from
   [avesed/flash-attention](https://github.com/avesed/flash-attention/tree/vllm-ampere-optimized/capture-safe-kvcache):
-  the upstream pin's `mha_fwd_kvcache` does a device-to-host sync on paged KV, which breaks CUDA graph
-  capture of the fork's FA2 spec-verify path; the fork skips that check while a stream is capturing.
+  the upstream pin's `mha_fwd_kvcache` checks paged-KV sequence lengths with a device-to-host sync,
+  which breaks CUDA graph capture of the fork's FA2 spec-verify path and stalls the MTP drafter once per
+  decode step (−8% MTP decode); the fork runs that check on the device instead.
 
 `vllm/` and `flashinfer/` carry the edits baked in — the vendored tree *is* the fork, and nothing
 applies `patches/` (it is the written record of the edits). `scripts/revendor.sh` 3-way merges the tree
