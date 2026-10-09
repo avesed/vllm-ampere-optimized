@@ -4,6 +4,17 @@ set -u
 cd "$(dirname "$0")"
 export IMG="${IMG:?set IMG}" MODELS="${MODELS:?set MODELS}" LOGDIR="${LOGDIR:-$(pwd)}"
 S="$LOGDIR/spine.log"; : > "$S"
+# A checkpoint with lost-write holes makes every number below meaningless (found 2026-10-07: three
+# staged checkpoints carried 16-36 MiB zeroed extents). Refuse to run unless the holey checkpoint
+# is explicitly allowed (CKPT_HOLES_OK="name1 name2", e.g. to compare against a published artifact).
+# SKIP_CKPT_SCAN=1 only for back-to-back invocations on a MODELS dir that was just scanned clean.
+if [ "${SKIP_CKPT_SCAN:-0}" = 1 ]; then echo "ckpt scan skipped (SKIP_CKPT_SCAN=1)" > "$LOGDIR/ckpt_holes.log"
+else python3 ckpt_holes.py "$MODELS" > "$LOGDIR/ckpt_holes.log" 2>&1; fi
+holes=$(grep "zero 4MiB blocks" "$LOGDIR/ckpt_holes.log" | cut -d/ -f1 | sort -u)
+for ok in ${CKPT_HOLES_OK:-}; do holes=$(echo "$holes" | grep -vx "$ok"); done
+if [ -n "$holes" ]; then
+  echo "CKPT_HOLES in: $holes (see ckpt_holes.log) -- matrix not run" >> "$S"; exit 1
+fi
 for blk in "$@"; do
   echo "BLOCK_START ${blk%%_*} $(date +%H:%M:%S)" >> "$S"
   timeout 14400 "./$blk.sh" >/dev/null 2>&1

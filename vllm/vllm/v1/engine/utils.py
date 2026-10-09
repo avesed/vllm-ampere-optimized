@@ -28,9 +28,9 @@ from vllm.utils.network_utils import (
     get_tcp_uri,
     zmq_socket_ctx,
 )
-from vllm.utils.system_utils import get_mp_context
+from vllm.utils.system_utils import get_mp_context, set_env_var
 from vllm.v1.engine.coordinator import DPCoordinator
-from vllm.v1.executor import Executor
+from vllm.v1.executor import Executor, UniProcExecutor
 from vllm.v1.executor.ray_utils import WORKER_SPECIFIC_ENV_VARS
 from vllm.v1.utils import _SubprocessWrapper, get_engine_client_zmq_addr, shutdown
 
@@ -141,9 +141,44 @@ def _node_ip_from_resources(node_resources: dict) -> str | None:
     return None
 
 
+@contextlib.contextmanager
+def _configure_uniproc_startup_threads(
+    executor_class: type[Executor], local_engine_count: int
+) -> Iterator[None]:
+    if (
+        not issubclass(executor_class, UniProcExecutor)
+        or current_platform.is_cpu()
+        or "OMP_NUM_THREADS" in os.environ
+    ):
+        yield
+        return
+
+    import torch
+
+    from vllm.utils.torch_utils import (
+        OMP_NUM_THREADS_SET_BY_VLLM,
+        set_default_torch_num_threads,
+        startup_omp_num_threads,
+    )
+
+    original_threads = torch.get_num_threads()
+    num_threads = min(original_threads, startup_omp_num_threads(local_engine_count))
+    torch_threads = (
+        set_default_torch_num_threads(num_threads)
+        if num_threads < original_threads
+        else contextlib.nullcontext()
+    )
+    # Fork inherits Torch's setting; spawn reads OMP_NUM_THREADS on import.
+    with (
+        set_env_var("OMP_NUM_THREADS", str(num_threads)),
+        set_env_var(OMP_NUM_THREADS_SET_BY_VLLM, "1"),
+        torch_threads,
+    ):
+        yield
+
+
 class CoreEngineProcManager:
-    """
-    Utility class to handle creation, readiness, and shutdown
+    """Utility class to handle creation, readiness, and shutdown
     of background processes used by the AsyncLLM and LLMEngine.
     """
 
@@ -205,34 +240,36 @@ class CoreEngineProcManager:
         # pickles process args at start() time, sequentially per rank.
         user_assigned_gpu_ids = vllm_config.parallel_config.assigned_physical_gpu_ids
         try:
-            for proc, local_dp_rank in zip(self.processes, local_dp_ranks):
-                # Populate the logical-to-physical GPU mapping in DP for
-                # platforms that cannot rely on
-                # torch.accelerator.set_device_index(), and for Ray.
-                needs_device_env_isolation = not (
-                    current_platform.is_cuda_alike() or current_platform.is_xpu()
-                )
-                if is_dp and (
-                    needs_device_env_isolation or vllm_config.parallel_config.use_ray
-                ):
-                    set_assigned_physical_gpu_ids_for_dp_rank(
-                        vllm_config, local_dp_rank, user_assigned_gpu_ids
+            with _configure_uniproc_startup_threads(executor_class, local_engine_count):
+                for proc, local_dp_rank in zip(self.processes, local_dp_ranks):
+                    # Populate the logical-to-physical GPU mapping in DP for
+                    # platforms that cannot rely on
+                    # torch.accelerator.set_device_index(), and for Ray.
+                    needs_device_env_isolation = not (
+                        current_platform.is_cuda_alike() or current_platform.is_xpu()
                     )
+                    if is_dp and (
+                        needs_device_env_isolation
+                        or vllm_config.parallel_config.use_ray
+                    ):
+                        set_assigned_physical_gpu_ids_for_dp_rank(
+                            vllm_config, local_dp_rank, user_assigned_gpu_ids
+                        )
 
-                with numa_utils.configure_subprocess(
-                    # EngineCore itself does not have a TP/PP-local rank.
-                    # When DP is enabled, set_assigned_physical_gpu_ids_for_dp_rank()
-                    # populates the logical-to-physical mapping for this DP
-                    # shard, so local_rank=0 means "the first local GPU in
-                    # this shard". The actual TP/PP worker processes spawned
-                    # by the executor are bound separately with their own
-                    # local_rank values.
-                    vllm_config,
-                    local_rank=0,
-                    dp_local_rank=local_dp_rank,
-                    process_kind="EngineCore",
-                ):
-                    proc.start()
+                    with numa_utils.configure_subprocess(
+                        # EngineCore itself does not have a TP/PP-local rank.
+                        # set_assigned_physical_gpu_ids_for_dp_rank() populates
+                        # the logical-to-physical mapping for this DP
+                        # shard, so local_rank=0 means "the first local GPU in
+                        # this shard". The actual TP/PP worker processes spawned
+                        # by the executor are bound separately with their own
+                        # local_rank values.
+                        vllm_config,
+                        local_rank=0,
+                        dp_local_rank=local_dp_rank,
+                        process_kind="EngineCore",
+                    ):
+                        proc.start()
         finally:
             # Kill other procs if not all are running.
             if self.finished_procs():
@@ -255,7 +292,6 @@ class CoreEngineProcManager:
 
     def monitor_engine_liveness(self) -> None:
         """Monitor engine core process liveness."""
-
         sentinel_to_proc = {proc.sentinel: proc for proc in self.processes}
         sentinels = set(sentinel_to_proc.keys())
 
@@ -316,8 +352,7 @@ def set_assigned_physical_gpu_ids_for_dp_rank(
     local_dp_rank: int,
     user_assigned_gpu_ids: list[int] | None = None,
 ) -> None:
-    """
-    Populate assigned_physical_gpu_ids on the config for the given DP rank.
+    """Populate assigned_physical_gpu_ids on the config for the given DP rank.
 
     user_assigned_gpu_ids is the full (un-sharded) --device-ids list, if the
     user provided one; this DP rank's shard is sliced from it. It is passed
@@ -345,8 +380,7 @@ def get_physical_gpu_ids_for_local_dp_rank(
     local_world_size: int | None = None,
     user_assigned_gpu_ids: list[int] | None = None,
 ) -> list[int]:
-    """
-    Returns list of physical GPU IDs for the specified
+    """Returns list of physical GPU IDs for the specified
     data parallel rank.
 
     For example, if world_size=2 and local_dp_rank=1, and there are 4 devices,
@@ -399,8 +433,7 @@ def _apply_dp_identity_suffix(dp_vllm_config, dp_rank: int) -> None:
 
 
 class CoreEngineActorManager:
-    """
-    Utility class to handle creation, readiness, and shutdown
+    """Utility class to handle creation, readiness, and shutdown
     of core engine Ray actors used by the AsyncLLM and LLMEngine.
 
     Different from CoreEngineProcManager, this class manages
@@ -552,10 +585,7 @@ class CoreEngineActorManager:
     def create_dp_placement_groups(
         vllm_config: VllmConfig,
     ) -> tuple[list["PlacementGroup"], list[int]]:
-        """
-        Create placement groups for data parallel.
-        """
-
+        """Create placement groups for data parallel."""
         import ray
         from ray._private.state import available_resources_per_node
 
@@ -769,9 +799,7 @@ class CoreEngineActorManager:
     def add_dp_placement_groups(
         old_vllm_config: VllmConfig, new_data_parallel_size: int
     ) -> tuple[list["PlacementGroup"], list[int]]:
-        """
-        Add placement groups for new data parallel size.
-        """
+        """Add placement groups for new data parallel size."""
         import ray
         from ray._private.state import (
             available_resources_per_node,
@@ -1108,7 +1136,6 @@ def launch_core_engines(
     addresses: EngineZmqAddresses,
 ) -> Iterator[CoreEngineLaunch]:
     """Launch engine and DP coordinator processes as needed."""
-
     parallel_config = vllm_config.parallel_config
     dp_size = parallel_config.data_parallel_size
     local_engine_count = parallel_config.data_parallel_size_local
@@ -1139,6 +1166,7 @@ def launch_core_engines(
         coordinator = DPCoordinator(
             parallel_config,
             enable_wave_coordination=vllm_config.model_config.is_moe,
+            logging_config=vllm_config.logging_config,
         )
 
         addresses.coordinator_input, addresses.coordinator_output = (

@@ -20,13 +20,36 @@ maintainer, locally:
   1b. scripts/revendor.sh --sync-back                   # copy merged trees in + bump UPSTREAM_VLLM_VERSION
   2. git diff && git commit                             # review + commit the vendored trees
   3. OWNER=<you> scripts/build_image_source.sh          # from-source sm_80+sm_86 build → push ghcr :<tag>-ampere-<cu> + :latest
-  4. (optional) scripts/smoke_test.sh <img> ; scripts/ampere_kernel_ci.sh <img> "$(cat UPSTREAM_VLLM_VERSION)"
+  4. scripts/release-matrix/run.sh <blocks>             # MANDATORY e2e gate on the new image AND the previous
+                                                        # release, same night, same box (see "Release matrix")
+  4b. (optional) scripts/smoke_test.sh <img> ; scripts/ampere_kernel_ci.sh <img> "$(cat UPSTREAM_VLLM_VERSION)"
        W4A16_CKPT=<w4a16> W4A8_CKPT=<w4a8> scripts/int8_cudagraph_regression.sh <img>   # asserts the AOT cache-key fix
   5. echo <tag> > UPSTREAM_VLLM_VERSION && git commit   # bump the marker (--sync-back already does this)
 
 ```
 
 No marker auto-bump, no partial-failure logic — the human runs the steps and commits the marker.
+
+## Release matrix
+
+`scripts/release-matrix/` is the end-to-end gate: every block serves the image under test over the
+OpenAI API and logs pass/fail lines. Run it on an otherwise idle box, once on the candidate image and
+once on the previous release, and compare the two log sets block by block.
+
+```bash
+export MODELS=/path/to/staged/checkpoints GSM8K_JSONL=/path/to/gsm8k.jsonl
+IMG=<candidate> LOGDIR=out/new bash scripts/release-matrix/run.sh t0_smoke t6m_mtp t6_spec t5_quant \
+  t7_hybrid t4_gemma t1_famp t2_batch t12_mm t5e_equiv t6g_greedy t10_perf t9_soak
+IMG=<previous>  LOGDIR=out/old bash scripts/release-matrix/run.sh ...   # same blocks
+```
+
+- Each block serves fixed checkpoint directory names under `MODELS` (see its `serve` lines).
+- `run.sh` first scans `MODELS` for lost-write holes (`ckpt_holes.py`, zeroed 4 MiB extents) and refuses
+  to run if any checkpoint has them; list a known-holey checkpoint in `CKPT_HOLES_OK` to allow it.
+- Containers carry the label `vllm-release-matrix=1`; cleanup only ever selects on that label.
+- Compare like with like: acceptance length per category and per sampling regime (`t6g_greedy` for draft
+  code changes, `t6_spec`/`t6h_heads` sampled), perf as medians from `t10_perf` on both images.
+- Re-run the affected blocks after every fix.
 
 ## Build any tag / CUDA variant (locally)
 

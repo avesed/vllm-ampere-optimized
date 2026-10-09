@@ -44,7 +44,10 @@ class FlashAmpereMetadataBuilder(FlashAttentionMetadataBuilder):
     def build(self, common_prefix_len, common_attn_metadata, fast_build: bool = False):
         md = super().build(common_prefix_len, common_attn_metadata, fast_build)
         md.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        md.seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        # 0.31 dropped the exact CPU seq_lens. The upper bound is exact for prefill rows;
+        # kernels._exact_seq_lens_cpu syncs once per step when other rows are present.
+        md.seq_lens_cpu_upper_bound = common_attn_metadata.seq_lens_cpu_upper_bound
+        md.is_prefilling_cpu = common_attn_metadata.is_prefilling
         return md
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):

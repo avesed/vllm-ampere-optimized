@@ -26,8 +26,8 @@ Cases:
   M=17 forces a non-tile-aligned size_m (catches padding / atomic-add bugs).
 
 Out of test scope (rely on the byte-identical-sources argument + the GSM8K serve gate):
-(1) act-order has_g_idx=True (g_idx_sort wiring); (2) fp8 activations (unreachable on Ampere;
-get_marlin_input_dtype rejects fp8 < SM89). Both are byte-identical to stock by inspection.
+fp8 activations (unreachable on Ampere; get_marlin_input_dtype rejects fp8 < SM89), byte-identical
+to stock by inspection. Act order no longer exists upstream (vLLM 0.31, #54809).
 
 Standalone vLLM marlin layers need a current VllmConfig context + a 1-rank TP group (PackedvLLMParameter
 queries the TP rank). Mirrors fused_silu_int8/test_mlp_equiv.py.
@@ -149,7 +149,6 @@ def _run_kernel(Kernel, cfg, x, seed):
         w_q_param_name="weight_packed",
         w_s_param_name="weight_scale",
         w_zp_param_name="weight_zero_point" if cfg.zero_points else None,
-        w_gidx_param_name="weight_g_idx",
     )
     k.process_weights_after_loading(layer)
     with torch.no_grad():
@@ -165,7 +164,6 @@ def _check(label, K, N, M, act_type, group_size, x_dtype, seed=1234,
         act_type=act_type,
         group_size=group_size,
         zero_points=zero_points,
-        has_g_idx=False,
     )
     x = torch.randn((M, K), dtype=x_dtype, device=DEV)
     s = _run_kernel(MarlinLinearKernel, cfg, x, seed)

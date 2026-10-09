@@ -275,6 +275,25 @@ class _BatchPrefillState:
 
 
 _BP_STATES: dict[tuple, _BatchPrefillState] = {}
+_BP_FI_OK: bool | None = None
+
+
+def _batch_prefill_fi_ok() -> bool:
+    """Whether the installed FlashInfer still routes fa2 batch prefill through the hook the
+    famp shim replaces. FlashInfer 0.7 builds it via _gen_batch_prefill_primary_module (the shim
+    is never consulted) and instantiates SAME_KV_STRIDES variants the vendored prefill.cuh does
+    not define, so the batch path stays off there until it is ported."""
+    global _BP_FI_OK
+    if _BP_FI_OK is None:
+        from flashinfer.jit.attention import modules as _fi_modules
+
+        _BP_FI_OK = not hasattr(_fi_modules, "_gen_batch_prefill_primary_module")
+        if not _BP_FI_OK:
+            logger.warning(
+                "flashampere: VLLM_FAMP_BATCH_PREFILL ignored -- this FlashInfer builds batch "
+                "prefill outside the famp hook; using the per-request leg."
+            )
+    return _BP_FI_OK
 
 
 def _batch_prefill_run(impl, layer, query, key, value, kv_cache, m, output, qsl_cpu, sl_cpu, leg):
@@ -296,6 +315,28 @@ def _batch_prefill_run(impl, layer, query, key, value, kv_cache, m, output, qsl_
     return output
 
 
+def _exact_seq_lens_cpu(m, qsl_cpu):
+    """Exact per-row CPU seq_lens, or None without CPU query_start_loc.
+
+    The builder's upper bound is exact for prefill rows. A batch that also carries
+    decode/verify rows (over-estimated under async spec decode) pays one device sync,
+    cached on the step's metadata so the layers share it.
+    """
+    if qsl_cpu is None:
+        return None
+    ub = getattr(m, "seq_lens_cpu_upper_bound", None)
+    pre = getattr(m, "is_prefilling_cpu", None)
+    if ub is not None and pre is not None:
+        has_q = (qsl_cpu[1:] - qsl_cpu[:-1]) > 0
+        if bool(pre[: has_q.numel()][has_q].all()):
+            return ub[: has_q.numel()]
+    sl = getattr(m, "_famp_seq_lens_cpu", None)
+    if sl is None:
+        sl = m.seq_lens.cpu()
+        m._famp_seq_lens_cpu = sl
+    return sl
+
+
 def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: str = "fp16pv"):
     """fp16-PV prefill — gather/loop + fp16 FlashInfer with use_fp16_pv_reduction. Casts Q/K/V to fp16
     and runs FlashInfer with use_fp16_pv_reduction (DTypeProb=half). Serves BOTH:
@@ -311,10 +352,10 @@ def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: 
     if not _HAS_FI:
         raise KernelDecline
     guard_fp16 = leg == "bf16cvt"  # bf16 source: range-check Q/K/V before upcast (else inf on cast)
-    # CPU twins attached by FlashAmpereMetadataBuilder -> zero device syncs here (and none paid
-    # when the mixed-batch check below declines). Device-tensor .tolist() is the legacy fallback.
+    # CPU twins attached by FlashAmpereMetadataBuilder -> no device sync for pure-prefill
+    # batches. Device-tensor .tolist() is the legacy fallback.
     _qsl_cpu = getattr(m, "query_start_loc_cpu", None)
-    _sl_cpu = getattr(m, "seq_lens_cpu", None)
+    _sl_cpu = _exact_seq_lens_cpu(m, _qsl_cpu)
     if _qsl_cpu is not None and _sl_cpu is not None:
         cu_list = _qsl_cpu.tolist()
         seq_lens_cpu = _sl_cpu.tolist()
@@ -349,6 +390,7 @@ def fp16pv_prefill(impl, layer, query, key, value, kv_cache, m, output, *, leg: 
         # Small-q steps (prefix-cache hits, tail chunks) are a few-ms op where the per-step
         # plan() tax exceeds the kernel win — leave those to stock FA. Full chunks engage.
         and int(_qsl_cpu[-1]) >= _BP_MIN_TOKENS
+        and _batch_prefill_fi_ok()
     ):
         return _batch_prefill_run(
             impl, layer, query, key, value, kv_cache, m, output, _qsl_cpu, _sl_cpu, leg

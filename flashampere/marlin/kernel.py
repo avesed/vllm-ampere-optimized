@@ -21,10 +21,8 @@ from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     MARLIN_SUPPORTED_GROUP_SIZES,
     USE_FP32_REDUCE_DEFAULT,
-    check_marlin_supports_shape,
     marlin_act_int8_process_scales,
-    marlin_is_k_full,
-    marlin_make_empty_g_idx,
+    marlin_make_empty,
     marlin_make_workspace_new,
     marlin_pad_dim,
     marlin_pad_qweight,
@@ -35,7 +33,6 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_repacked_nk,
     marlin_unpad_output,
     marlin_quant_input,
-    marlin_sort_g_idx,
     marlin_zero_points,
     query_marlin_supported_quant_types,
     should_use_atomic_add_reduce,
@@ -91,16 +88,6 @@ class FampMarlinKernel(MPLinearKernel):
                 f"{MARLIN_SUPPORTED_GROUP_SIZES}",
             )
 
-        if c.has_g_idx:
-            # Act-order couples K to the full-model group layout, so tile
-            # padding is not supported; keep the strict shape check.
-            return check_marlin_supports_shape(
-                c.partition_weight_shape[1],  # out_features
-                c.partition_weight_shape[0],  # in_features
-                c.full_weight_shape[0],  # in_features
-                c.group_size,
-            )
-
         # A group straddling TP ranks cannot be fixed by padding.
         if (
             c.group_size != -1
@@ -141,23 +128,17 @@ class FampMarlinKernel(MPLinearKernel):
                 getattr(layer, self.w_s_name).data * 512
             )
 
-        row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
-        self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
-
         size_k, size_n = c.partition_weight_shape
-        if c.has_g_idx:
-            # Act-order shapes were strictly validated in can_implement.
-            padded_n, padded_k = size_n, size_k
-        else:
-            padded_n, padded_k = marlin_padded_nk(size_n, size_k, c.group_size)
+        padded_n, padded_k = marlin_padded_nk(size_n, size_k, c.group_size)
 
         # Allocate marlin workspace.
         self.workspace = marlin_make_workspace_new(device)
+        # 0.31 dropped act order (#54809); famp's vendored op still takes g_idx/perm, so
+        # every layer passes the empty tensors stock used for non-act-order layers.
+        self.empty_g_idx = marlin_make_empty(device)
 
-        # Default names since marlin requires empty parameters for these,
+        # Default name since marlin requires empty parameter for zp,
         # TODO: remove this requirement from marlin (allow optional tensors)
-        if self.w_gidx_name is None:
-            self.w_gidx_name = "g_idx"
         if self.w_zp_name is None:
             self.w_zp_name = "w_zp"
 
@@ -185,7 +166,7 @@ class FampMarlinKernel(MPLinearKernel):
                 marlin_pad_qweight(
                     x.data.contiguous(), size_n, size_k, padded_n, padded_k
                 ),
-                layer.g_idx_sort_indices,        # perm
+                self.empty_g_idx,                # perm
                 padded_k,                        # size_k
                 padded_n,                        # size_n
                 c.weight_type.size_bits,         # num_bits
@@ -226,16 +207,6 @@ class FampMarlinKernel(MPLinearKernel):
                 layer.input_global_scale = None
             return x
 
-        if c.has_g_idx:
-            g_idx, g_idx_sort_indices = marlin_sort_g_idx(
-                getattr(layer, self.w_gidx_name)
-            )
-            self._transform_param(layer, self.w_gidx_name, lambda _: g_idx)
-            layer.g_idx_sort_indices = g_idx_sort_indices
-        else:
-            setattr(layer, self.w_gidx_name, marlin_make_empty_g_idx(device))
-            layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
-
         if c.zero_points:
             grouped_k = size_k // c.group_size if c.group_size != -1 else 1
             padded_grouped_k = padded_k // c.group_size if c.group_size != -1 else 1
@@ -263,9 +234,7 @@ class FampMarlinKernel(MPLinearKernel):
                 ),
             )
         else:
-            setattr(layer, self.w_zp_name, marlin_make_empty_g_idx(device))
-        # g_idx block above sets layer.g_idx_sort_indices BEFORE transform_w_q reads it as `perm`;
-        # w_q transform runs before w_s. Preserve this order (stock).
+            setattr(layer, self.w_zp_name, marlin_make_empty(device))
         self._transform_param(layer, self.w_q_name, transform_w_q)
         self._transform_param(layer, self.w_s_name, transform_w_s)
 
@@ -286,9 +255,9 @@ class FampMarlinKernel(MPLinearKernel):
         # from the packed shape, the activation is K-zero-padded to match, the gemm runs at the
         # padded extents, and the padded output columns are stripped at the end.
         c = self.config
-        w_q, w_s, w_zp, w_gidx = self._get_weight_params(layer)
+        w_q, w_s, w_zp = self._get_weight_params(layer)
 
-        # `process_weights_after_loading` ensures w_zp and w_gidx are not None for marlin.
+        # `process_weights_after_loading` ensures w_zp is not None for marlin.
         wtype = (
             scalar_types.uint4b8
             if c.weight_type == scalar_types.int4
@@ -341,14 +310,14 @@ class FampMarlinKernel(MPLinearKernel):
             a_scales,                         # a_scales
             None,                             # global_scale
             w_zp,                             # b_zeros_or_none
-            w_gidx,                           # g_idx_or_none
-            layer.g_idx_sort_indices,         # perm_or_none
+            self.empty_g_idx,                 # g_idx_or_none
+            self.empty_g_idx,                 # perm_or_none
             self.workspace,                   # workspace
             wtype.id,                         # b_type_id (INT, not ScalarType)
             reshaped_x.shape[0],              # size_m
             padded_n,                         # size_n (tile-padded)
             padded_k,                         # size_k (tile-padded)
-            self.is_k_full,                   # is_k_full
+            True,                             # is_k_full (no act order)
             use_atomic_add,                   # use_atomic_add
             USE_FP32_REDUCE_DEFAULT,          # use_fp32_reduce
             False,                            # is_zp_float

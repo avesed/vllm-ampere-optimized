@@ -83,7 +83,7 @@ class FlashAmpereImpl(FlashAttentionImpl):
         masking/window state the fast kernels would silently ignore (correctness hazard for
         VL prefix-LM / R-SWA batches):
           - causal became bool | Tensor (per-request dynamic causality; legs assume bool),
-          - mm_prefix_range_tensor (multimodal bidirectional prefix ranges),
+          - mm_prefix_query_range_tensor (multimodal bidirectional prefix ranges),
           - sliding_window on the METADATA (batch-level override of the impl's static window),
           - rswa_prefix_lens / rswa_window / rswa_window_tensor (Reference-SWA masking).
         Any of these set/non-default -> sink to stock FA (bit-faithful; FA implements them).
@@ -97,7 +97,7 @@ class FlashAmpereImpl(FlashAttentionImpl):
             sw = None
         return (
             isinstance(getattr(m, "causal", True), torch.Tensor)
-            or getattr(m, "mm_prefix_range_tensor", None) is not None
+            or getattr(m, "mm_prefix_query_range_tensor", None) is not None
             or sw is not None
             or getattr(m, "rswa_prefix_lens", None) is not None
             or getattr(m, "rswa_window", None) is not None
