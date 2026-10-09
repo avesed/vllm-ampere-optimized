@@ -1206,6 +1206,14 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # [Ampere fork] upstream #51571: land the async accepted-count copy before
+        # any batch row is added, moved or swapped, so each count moves with its row.
+        if (
+            self.use_async_scheduling
+            and self.num_accepted_tokens_event is not None
+            and self.cache_config.mamba_cache_mode == "align"
+        ):
+            self.num_accepted_tokens_event.synchronize()
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             req_state = self.requests.pop(req_id, None)
@@ -2108,24 +2116,11 @@ class GPUModelRunner(
         if needs_cpu_accepted_counts:
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.synchronize()
-            # Async mode: condense() reordered indices, use prev_positions mapping
-            if self.use_async_scheduling and prev_req_id_to_index:
-                prev_idx = self.prev_positions.np[:num_reqs]
-                new_mask = prev_idx < 0
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[
-                        np.where(new_mask, 0, prev_idx)
-                    ]
-                )
-                self.num_accepted_tokens.np[:num_reqs][new_mask] = 1
-                self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
-                    self.num_accepted_tokens.np[:num_reqs]
-                )
-            else:
-                # Non-async mode: use values directly
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
-                )
+            # [Ampere fork] upstream #51571: counts are already in current row order;
+            # a prev_positions remap would apply the row moves twice.
+            self.num_accepted_tokens.np[:num_reqs] = (
+                self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+            )
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
         else:
