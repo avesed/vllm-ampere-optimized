@@ -30,7 +30,7 @@ def rate(reps, tag):
     print(f"  {tag}: ttft {first - t0:.2f}s  decode {tps:.1f} tok/s ({n} chunks)")
     return tps
 short, long_ = rate(150, "ctx~200"), rate(14000, "ctx~16k")
-print(f"  long/short decode ratio: {long_ / short:.2f}  (gate >= 0.9)")
+print(f"  long/short decode ratio: {long_ / short:.2f}  (27B hybrid K=2: ~0.80 verify on, ~0.59 off; perf gate = t10)")
 PY
 }
 
