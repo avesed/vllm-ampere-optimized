@@ -22,6 +22,16 @@ import humming; print("humming", getattr(humming, "__version__", "?"))
 import vllm.v1.attention.backends.flashampere.kernels as fk; print("famp kernels import OK")
 '
 
+say "T0.1b package completeness: every vendored vllm/*.py is in the image"
+# vllm/.gitignore matches some real modules (*_hip*); one missing from the vendored tree failed every
+# serve of the first 0.34 build at model inspection.
+oneshot t0-files -v "$(pwd)/../../vllm/vllm":/src:ro -- -c '
+import pathlib, vllm
+src, dst = pathlib.Path("/src"), pathlib.Path(vllm.__file__).parent
+missing = sorted(str(p.relative_to(src)) for p in src.rglob("*.py") if not (dst / p.relative_to(src)).exists())
+print(f"  missing from image: {len(missing)} (expect 0)", missing[:8])
+'
+
 say "T0.2 FA2 paged fwd_kvcache (the fork's spec-verify path): graph capture, no eager host sync, bounds guard"
 oneshot t0-fa2cap -v "$(pwd)/fa2_capture_probe.py":/probe.py:ro -- /probe.py
 
