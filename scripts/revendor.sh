@@ -43,6 +43,17 @@ sync_back() {
     [ "$t" = flashinfer ] && ex+=(--exclude '3rdparty/')
     rsync -a --delete "${ex[@]}" "$WORK/$t/" "$ROOT/$t/"
     echo "synced $WORK/$t -> $ROOT/$t"
+    # The vendored tree ships upstream's own .gitignore, and upstream force-adds a few files it
+    # matches (vllm/.gitignore `*_hip*` also covers the real module kernels/linear/mxfp4/rdna3_hip.py).
+    # A plain `git add -A` drops them silently -- the 0.34 image failed every serve on that import --
+    # so stage every file the merged tree tracks that git would ignore here.
+    local ignored
+    ignored=$(git -C "$WORK/$t" ls-files | sed "s|^|$t/|" | git -C "$ROOT" check-ignore --no-index --stdin || true)
+    if [ -n "$ignored" ]; then
+      echo "$ignored" | git -C "$ROOT" add -f --pathspec-from-file=-
+      echo "force-added $(echo "$ignored" | wc -l) tracked-but-ignored file(s):"
+      echo "$ignored" | sed 's/^/     /'
+    fi
   done
   if [ -f "$WORK/vllm.newtag" ]; then
     cp "$WORK/vllm.newtag" "$ROOT/UPSTREAM_VLLM_VERSION"
