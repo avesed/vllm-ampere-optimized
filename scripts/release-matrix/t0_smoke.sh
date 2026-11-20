@@ -57,6 +57,12 @@ say "T0.4 runner: MRv2 is the only runner since vLLM 0.34; the image must not pi
 echo "  image env pin: $(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$IMG" \
   | grep -c '^VLLM_USE_V2_MODEL_RUNNER=') (expect 0)" >> "$LOG"
 
+say "T0.5 Humming W4A8 35B-A3B MoE loads (crashes at load without the carried #68194 fix)"
+if serve t0-hum 8180 Qwen3.6-35B-A3B-W4A16 "${HUM_ENV[@]}" --ARGS-- "${HUM_ARGS[@]}"; then
+  canary 8180
+fi
+matrix_rm t0-hum
+
 say "T0.7 famp dispatch unit tests against the in-image flashampere"
 # The tests import the repo-root `flashampere` package; in the image famp lives inside vLLM, so alias
 # the in-image package before collection.

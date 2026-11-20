@@ -45,6 +45,9 @@ if serve t6m-mtp 8187 Qwen3.6-27B-W4A16 --ARGS-- --max-model-len 20000 --max-num
   complete 8187 "Paris is the" 40
   canary 8187
   decode_ratio 8187
+  # Accuracy on the path the image changes vs stock: fork FA2 verify routing + its FlashInfer pin
+  # (sampling). The per-quant GSM8K rows (T5) exercise stock kernels only.
+  gsm8k 8187 t6m-mtp-27b "${GSM8K_N:-40}"
   accept t6m-mtp
 fi
 matrix_rm t6m-mtp
