@@ -28,6 +28,27 @@ oneshot t0-fa2cap -v "$(pwd)/fa2_capture_probe.py":/probe.py:ro -- /probe.py
 say "T0.3 default env (famp off) -- Qwen3-8B dense"
 if serve t0-def 8180 Qwen3-8B; then
   backends t0-def; fired t0-def; canary 8180
+  # Over-limit sampling params once raised inside the V2 worker and killed the engine (upstream PR
+  # #55164, ported): each must come back as a 400 and the next normal request must still succeed.
+  python3 - <<'PY' >> "$LOG" 2>&1
+import json, urllib.error, urllib.request
+def post(extra):
+    b = json.dumps({"model": "test", "prompt": "Hello", "max_tokens": 4, **extra}).encode()
+    try:
+        r = urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:8180/v1/completions", b,
+                                   {"Content-Type": "application/json"}), timeout=120)
+        return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception as e:
+        return type(e).__name__
+cases = {"logit_bias x2000": {"logit_bias": {str(i): 1.0 for i in range(2000)}},
+         "allowed_token_ids x2000": {"allowed_token_ids": list(range(2000))},
+         "stop_token_ids x200 + min_tokens": {"stop_token_ids": list(range(200)), "min_tokens": 1}}
+for name, extra in cases.items():
+    print(f"  over-limit {name}: HTTP {post(extra)} (expect 400)")
+print(f"  normal request after: HTTP {post({})} (expect 200)")
+PY
 fi
 matrix_rm t0-def
 
