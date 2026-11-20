@@ -1,6 +1,6 @@
 #!/bin/bash
 # T0 -- smoke: what the image claims to be, the FA2 capture contract, default-env serve, the runner
-# pin check, and the in-image famp dispatch unit tests.
+# pin check, sampling-param limits and the Humming W4A8 fallback fix.
 set -u
 cd "$(dirname "$0")"; LOG=${LOGDIR:-$(pwd)}/t0.log; : > "$LOG"; . ./lib.sh
 
@@ -19,7 +19,6 @@ print("vllm", vllm.__version__, "| torch", torch.__version__, "| flashinfer", fl
 eps = sorted(e.name for e in md.entry_points(group="vllm.general_plugins"))
 print("general_plugins:", eps)
 import humming; print("humming", getattr(humming, "__version__", "?"))
-import vllm.v1.attention.backends.flashampere.kernels as fk; print("famp kernels import OK")
 '
 
 say "T0.1b package completeness: every vendored vllm/*.py is in the image"
@@ -35,9 +34,9 @@ print(f"  missing from image: {len(missing)} (expect 0)", missing[:8])
 say "T0.2 FA2 paged fwd_kvcache (the fork's spec-verify path): graph capture, no eager host sync, bounds guard"
 oneshot t0-fa2cap -v "$(pwd)/fa2_capture_probe.py":/probe.py:ro -- /probe.py
 
-say "T0.3 default env (famp off) -- Qwen3-8B dense"
+say "T0.3 default env -- Qwen3-8B dense"
 if serve t0-def 8180 Qwen3-8B; then
-  backends t0-def; fired t0-def; canary 8180
+  backends t0-def; canary 8180
   # Over-limit sampling params once raised inside the V2 worker and killed the engine (upstream PR
   # #55164, ported): each must come back as a 400 and the next normal request must still succeed.
   python3 - <<'PY' >> "$LOG" 2>&1
@@ -73,22 +72,4 @@ if serve t0-hum 8180 Qwen3.6-35B-A3B-W4A16 "${HUM_ENV[@]}" --ARGS-- "${HUM_ARGS[
 fi
 matrix_rm t0-hum
 
-say "T0.7 famp dispatch unit tests against the in-image flashampere"
-# The tests import the repo-root `flashampere` package; in the image famp lives inside vLLM, so alias
-# the in-image package before collection.
-oneshot t0-pytest -v "$(pwd)/../../vllm/tests/v1/attention":/t:ro -- -c '
-import importlib, pkgutil, subprocess, sys
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pytest"], check=False)
-src = "vllm.v1.attention.backends.flashampere"
-pkg = importlib.import_module(src)
-sys.modules["flashampere"] = pkg
-for m in pkgutil.iter_modules(pkg.__path__):
-    try:
-        sys.modules["flashampere." + m.name] = importlib.import_module(src + "." + m.name)
-    except Exception as e:
-        print("alias skipped:", m.name, type(e).__name__, e)
-import pytest
-sys.exit(pytest.main(["-q", "-p", "no:cacheprovider", "/t/test_flashampere_dispatch.py",
-                      "/t/test_flashampere_kv_layout.py", "/t/test_flashampere_hd512_gate.py"]))
-'
 echo -e "\nT0_DONE" >> "$LOG"

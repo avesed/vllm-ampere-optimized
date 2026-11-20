@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-# Build the COMPLETE Ampere int8 fork image FROM SOURCE from the VENDORED trees — no upstream
-# clone, no patch-apply step of any kind (the vendored vllm/ + flashinfer/ ARE the fork, every edit
-# is already in them):
-#   stage 1: vLLM (flashampere backend + FA2 spec-verify routing, baked into vllm/) from source
-#            via upstream vllm/docker/Dockerfile -> sm_80 + sm_86 fatbin.
-#   stage 2: (skipped by default) overlay the vendored flashinfer/ -- now plain upstream.
+# Build the Ampere fork image FROM SOURCE from the VENDORED vllm/ tree — no upstream clone, no
+# patch-apply step of any kind (the vendored vllm/ IS the fork, every edit is already in it): vLLM
+# with the FA2 spec-verify routing baked in, built by upstream vllm/docker/Dockerfile.
 # Push the final image to ghcr (:<tag>-ampere-<cu> + :latest).
 #
 # THIS IS THE RELEASE TOOL: run it YOURSELF on a local CUDA box and it pushes to ghcr. There is no CI
@@ -37,18 +34,14 @@ else JOBS=$(nproc); [ "$JOBS" -gt 8 ] && JOBS=8; fi
 NVCC_THREADS="${NVCC_THREADS:-4}"
 # GHA registry cache only works inside GitHub Actions; locally use docker's own layer cache.
 GHA_CACHE=""; [ -n "${GITHUB_ACTIONS:-}" ] && GHA_CACHE="--cache-from type=gha --cache-to type=gha,mode=max"
-# PUSH=1 (default) pushes the final image to ghcr; PUSH=0 builds it into the LOCAL docker (--load) for
-# testing without publishing. Stage-1 is always --load (intermediate base for stage-2).
+# PUSH=1 (default) pushes the final image to ghcr; PUSH=0 keeps it in the LOCAL docker for testing
+# without publishing. The build always --loads; the push is a plain docker push of the tagged image.
 PUSH="${PUSH:-1}"
-# Use the docker-driver "default" builder: the 2-stage build does stage-1 `--load` (into the local
-# docker image store) then stage-2 `FROM` it — but a docker-CONTAINER-driver builder resolves FROM
-# from the REGISTRY, so it can't see the local intermediate and stage-2 fails ("...vllm-cu130: not
-# found"). The docker driver reads the local store + supports --load/--push for single-platform.
-# CI (GHA cache) needs the container driver, so leave BUILDER empty there.
+# Use the docker-driver "default" builder: it builds straight into the local image store, which the
+# retag + push below rely on. CI (GHA cache) needs the container driver, so leave BUILDER empty there.
 BUILDER="${BUILDER:---builder default}"; [ -n "${GITHUB_ACTIONS:-}" ] && BUILDER=""
 
 [ -f vllm/docker/Dockerfile ] || { echo "::error::vendored vllm/ source missing (vllm/docker/Dockerfile)"; exit 1; }
-[ -f flashinfer/include/flashinfer/mma.cuh ] || { echo "::error::vendored flashinfer/ source missing"; exit 1; }
 
 # The upstream vLLM Dockerfile bind-mounts vllm/.git (setuptools-scm version + build commit), but the
 # vendored vllm/ has no .git (it is a plain source tree). Synthesize an ephemeral one tagged VLLM_TAG so the
@@ -62,7 +55,6 @@ if [ ! -d vllm/.git ]; then
 fi
 
 VLLM_IMG="${IMAGE}:${VLLM_TAG}-vllm-${CU}"             # intermediate (vLLM-only) tag
-FI_IMG="${IMAGE}:${VLLM_TAG}-fi-${CU}"                 # intermediate (vLLM + flashinfer) tag
 # Tagging channel: CHANNEL=dev -> :dev only (do NOT move :latest). Default
 # (release) -> :<VLLM_TAG>-ampere-<cu> + :latest (the existing release scheme).
 CHANNEL="${CHANNEL:-}"
@@ -74,7 +66,7 @@ else
   LATEST_TAG_ARG="--tag ${IMAGE}:latest"
 fi
 
-echo "== stage 1/2: build vLLM from vendored fork source (sm_80+sm_86) =="
+echo "== build vLLM from vendored fork source ($TORCH_CUDA_ARCH_LIST) =="
 docker buildx build vllm $BUILDER \
   --file vllm/docker/Dockerfile \
   --target vllm-openai \
@@ -91,27 +83,10 @@ docker buildx build vllm $BUILDER \
   $GHA_CACHE \
   --tag "$VLLM_IMG" --load
 
-# stage 2 exists to put a MODIFIED flashinfer into the image. The vendored flashinfer is now plain
-# upstream (identical to the version vLLM pins), because famp carries its own prefill.cuh and needs
-# flashinfer only as a JIT toolchain -- so the overlay is a no-op at best, and overlaying source over
-# an installed wheel is a risk at worst. Skipped by default; OVERLAY_FLASHINFER=1 forces it back.
-if [ "${OVERLAY_FLASHINFER:-0}" = "1" ]; then
-  echo "== stage 2/2: overlay vendored flashinfer =="
-  docker buildx build . $BUILDER \
-    --file docker/Dockerfile.flashinfer-int8 \
-    --build-arg BASE="$VLLM_IMG" \
-    --platform linux/amd64 \
-    --provenance=false \
-    --tag "$FI_IMG" --load
-else
-  echo "== stage 2/2: SKIPPED (vendored flashinfer is plain upstream; OVERLAY_FLASHINFER=1 to force) =="
-  FI_IMG="$VLLM_IMG"
-fi
-
-# Final tags. famp_marlin (the old stage 3) is retired: vLLM 0.34 removed Marlin W4A8 and
-# `--quantization humming` serves int8 activations on Ampere faster than famp_marlin did.
-docker tag "$FI_IMG" "$FINAL"
-[ -n "$LATEST_TAG_ARG" ] && docker tag "$FI_IMG" "${IMAGE}:latest"
+# Final tags. (The famp_marlin stage and the vendored-FlashInfer overlay were retired with the vLLM
+# 0.34 move: Humming serves W4A8, and FlashInfer is the stock wheel vLLM pins.)
+docker tag "$VLLM_IMG" "$FINAL"
+[ -n "$LATEST_TAG_ARG" ] && docker tag "$VLLM_IMG" "${IMAGE}:latest"
 if [ "$PUSH" = 1 ]; then
   docker push "$FINAL"
   [ -n "$LATEST_TAG_ARG" ] && docker push "${IMAGE}:latest"

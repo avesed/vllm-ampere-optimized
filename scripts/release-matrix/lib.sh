@@ -107,7 +107,5 @@ print(f"  canary: {hits}/{len(qs)} degenerate")
 PY
 }
 
-fired(){ echo "  famp fired: $(docker logs "$1" 2>&1 | grep -ac 'FLASHAMPERE .* FIRED')" >> "$LOG"
-         docker logs "$1" 2>&1 | grep -a 'FLASHAMPERE .* FIRED' | tail -2 >> "$LOG"; }
 backends(){ docker logs "$1" 2>&1 | grep -aE "Using .*attention backend" | grep -avi all-reduce | sort -u >> "$LOG"; }
 accept(){ docker logs "$1" 2>&1 | grep -a "acceptance length" | tail -1 >> "$LOG"; }

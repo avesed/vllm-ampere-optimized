@@ -1,6 +1,6 @@
 #!/bin/bash
 # T12 -- multimodal. Images (and one video) through every surface the fork changes: Marlin W4A16,
-# W4A8 via Humming (dense and MoE), the famp prefill legs, all three spec-decode methods, and
+# W4A8 via Humming (dense and MoE), all three spec-decode methods, and
 # the Gemma4 per-head backend split, where the hd256 sliding layers carry the bidirectional image
 # prefix. Vision towers stay bf16 in every checkpoint, so what is under test is the language model
 # consuming image embeddings. Probe = mm_probe.py (stdlib, OpenAI API); every answer is a colour,
@@ -39,21 +39,13 @@ if serve t12-int8 $P Qwen3.6-27B-W4A16 "${HUM_ENV[@]}" --ARGS-- "${HUM_ARGS[@]}"
 fi
 matrix_rm t12-int8
 
-say "T12.3 27B W4A16 + famp (bf16-served -> bf16cvt prefill leg on the hd256 layers)"
-if serve t12-famp $P Qwen3.6-27B-W4A16 -e VLLM_FLASHAMPERE=1; then
-  probe battery --video "$VID"; probe concurrency 8 48; fired t12-famp; backends t12-famp; dead t12-famp
-fi
-matrix_rm t12-famp
-
 spec_mm(){ # id name method draft|- K
   local id=$1 name=$2 method=$3 draft=$4 K=$5 cfg
   cfg="{\"method\":\"$method\",\"num_speculative_tokens\":$K"
   [ "$draft" != "-" ] && cfg+=",\"model\":\"/models/$draft\""
   cfg+="}"
   say "$id spec $method K=$K + images (verification is lossless, so answers must match T12.1)"
-  if serve "$name" $P Qwen3.6-27B-W4A16 \
-       -e VLLM_FLASHAMPERE=1 -e VLLM_FLASHAMPERE_XQA_VERIFY=1 \
-       --ARGS-- --max-num-seqs 128 --speculative-config "$cfg"; then
+  if serve "$name" $P Qwen3.6-27B-W4A16 --ARGS-- --max-num-seqs 128 --speculative-config "$cfg"; then
     probe battery --video "$VID"; probe concurrency 8 48; accept "$name"; dead "$name"
   fi
   matrix_rm "$name"
@@ -68,9 +60,9 @@ if serve t12-moe $P Qwen3.6-35B-A3B-W4A16 "${HUM_ENV[@]}" --ARGS-- "${HUM_ARGS[@
 fi
 matrix_rm t12-moe
 
-say "T12.8 gemma-4-12B + famp profile -- bidirectional image prefix on the hd256 sliding layers"
-if serve t12-gemma $P gemma-4-12B-it-bf16 -e VLLM_FLASHAMPERE=1; then
-  probe battery; probe concurrency 8 48; backends t12-gemma; fired t12-gemma; dead t12-gemma
+say "T12.8 gemma-4-12B -- bidirectional image prefix on the hd256 sliding layers"
+if serve t12-gemma $P gemma-4-12B-it-bf16; then
+  probe battery; probe concurrency 8 48; backends t12-gemma; dead t12-gemma
 fi
 matrix_rm t12-gemma
 echo -e "\nT12_DONE" >> "$LOG"

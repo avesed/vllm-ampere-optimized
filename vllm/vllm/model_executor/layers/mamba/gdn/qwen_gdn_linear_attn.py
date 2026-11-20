@@ -440,6 +440,7 @@ def fi_chunk_gated_delta_rule(
         checkpoint_cu_starts=checkpoint_cu_starts,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         use_cp=use_cp,
+        backend="flashinfer",
     )
     # FlashInfer returns (output, state) when output_final_state=True,
     # or just output when output_final_state=False.

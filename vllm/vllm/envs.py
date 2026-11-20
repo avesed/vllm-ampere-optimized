@@ -95,13 +95,6 @@ if TYPE_CHECKING:
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_FA2_KVCACHE_VERIFY: bool = True
-    VLLM_FLASHAMPERE: bool = False
-    VLLM_FLASHAMPERE_PV_FP16: bool = True
-    VLLM_FLASHAMPERE_BF16CVT: bool = True
-    VLLM_FLASHAMPERE_XQA_VERIFY: bool = False
-    VLLM_FLASHAMPERE_SAGE: bool = False
-    VLLM_FAMP_OWN_PREFILL: bool = False
-    VLLM_FAMP_XQA_HD512: bool = False
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -697,30 +690,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_FA2_KVCACHE_VERIFY": lambda: bool(
         int(os.getenv("VLLM_FA2_KVCACHE_VERIFY", "1"))
     ),
-    # [Ampere fork] flashampere — the unified Ampere attention backend (patch 0008). Master gate:
-    # when "1", the `vllm.general_plugins` entry-point register_flashampere installs
-    # FlashAmpereBackend into Backend.CUSTOM and the CUDA platform auto-selects it for Ampere
-    # full-attn layers. forward() dispatches per call (fp16-PV prefill: fp16pv fp16-served /
-    # bf16cvt bf16-served) and sinks everything else (decode, MTP-verify, encoder, fp8-KV,
-    # non-Ampere) to stock FlashAttention. Default off so a plain image swap doesn't change
-    # attention for every model. (int8-QK was removed: net-negative in every measured scenario.)
-    "VLLM_FLASHAMPERE": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE", "0"))),
-    # Per-leg sub-toggles (only meaningful when VLLM_FLASHAMPERE=1). The fp16-PV legs are the
-    # primary Ampere prefill win -> default ON; they are GeForce-GA10x-gated (forced off on
-    # AMPERE_SERVER/OTHER) so default-on is a no-op on pro Ampere. PV_FP16 = fp16-served;
-    # BF16CVT = bf16-served via runtime bf16->fp16 upcast. SageAttn is research-grade + needs the
-    # sageattention package -> default off.
-    "VLLM_FLASHAMPERE_PV_FP16": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE_PV_FP16", "1"))),
-    "VLLM_FLASHAMPERE_BF16CVT": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE_BF16CVT", "1"))),
-    # MTP spec-decode verify via famp's vendored XQA kernel (any Ampere; 1.8-4.3x faster than FA2
-    # fwd_kvcache verify). Opt-in (default off) until e2e MTP serve + cudagraph are validated.
-    "VLLM_FLASHAMPERE_XQA_VERIFY": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE_XQA_VERIFY", "0"))),
-    "VLLM_FLASHAMPERE_SAGE": lambda: bool(int(os.getenv("VLLM_FLASHAMPERE_SAGE", "0"))),
-    # famp hd512 (gemma4 full-attn) opt-ins, read directly in the flashampere kernels layer.
-    # OWN_PREFILL = famp's vendored FA2 prefill; XQA_HD512 = famp's XQA hd512 decode. Registered
-    # here so 0.25.1's unknown-env-var check does not warn; both default off.
-    "VLLM_FAMP_OWN_PREFILL": lambda: bool(int(os.getenv("VLLM_FAMP_OWN_PREFILL", "0"))),
-    "VLLM_FAMP_XQA_HD512": lambda: bool(int(os.getenv("VLLM_FAMP_XQA_HD512", "0"))),
     # Use tensor descriptors for Q/K/V loads and output stores in the
     # Triton unified-attention kernel.  Enables HW 2D block reads on
     # Intel XPU; the non-TD branch is dead-code-eliminated at Triton

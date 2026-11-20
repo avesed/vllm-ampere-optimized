@@ -15,7 +15,7 @@ the defining module's own AST, and reports misses.
 
 Function-local imports are checked too; those are the ones that fail late.
 
-    python3 scripts/check_fork_imports.py [--baseline <pristine-tree>] [--extra flashampere] [tree]
+    python3 scripts/check_fork_imports.py [--baseline <pristine-tree>] [--extra <dir>] [tree]
 
 With --baseline, findings that also occur in pristine upstream are dropped, so the output is
 fork-introduced breakage only.
@@ -111,7 +111,7 @@ def main() -> int:
     ap.add_argument(
         "--extra", action="append", default=[],
         help="out-of-tree source dir whose vllm imports must resolve against the tree "
-        "(repeatable; e.g. flashampere -- its plugin loader swallows import errors)",
+        "(repeatable; for plugins, whose loader swallows import errors)",
     )
     args = ap.parse_args()
 

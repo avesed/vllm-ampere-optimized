@@ -562,14 +562,6 @@ class Gemma4Config(VerifyAndUpdateConfig):
 
         max_head_dim = max(head_dims.values())
 
-        # famp: when VLLM_FLASHAMPERE=1, the FlashAmpere CUSTOM backend handles head_dim>256 itself
-        # (fp16-PV-hd512 prefill via the vendored-FI IsInvalid relaxation), uniformly across the
-        # sliding(256) and full(512) layers -> NO mixed-backend divergence, so skip the TRITON force
-        # and let the cuda.py priority-walk pick CUSTOM (priority 0 on Ampere).
-        import os as _os
-
-        _famp_on = _os.environ.get("VLLM_FLASHAMPERE", "0") in ("1", "true", "True")
-
         if is_fa_version_supported(4) and max_head_dim <= 512:
             if (
                 vllm_config.attention_config.flash_attn_version is None
@@ -598,7 +590,7 @@ class Gemma4Config(VerifyAndUpdateConfig):
                 "attention backend choice to the XPU platform.",
                 head_dims,
             )
-        elif vllm_config.attention_config.backend is None and not _famp_on:
+        elif vllm_config.attention_config.backend is None:
             vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
             logger.info(
                 "Gemma4 model has heterogeneous head dimensions "

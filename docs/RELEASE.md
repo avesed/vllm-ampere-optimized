@@ -14,11 +14,11 @@ watch-upstream.yml (cron, daily)
         └─ opens ONE reminder ISSUE per new tag (deduped incl. closed; no build is triggered)
 
 maintainer, locally:
-  1. scripts/revendor.sh <vllm_tag> <flashinfer_tag>   # only if upstream bumped; else skip
-       └─ 3-way MERGES the vendored trees onto the new tags in .revendor/ (no patch replay -- the
+  1. scripts/revendor.sh <vllm_tag>                    # only if upstream bumped; else skip
+       └─ 3-way MERGES the vendored tree onto the new tag in .revendor/ (no patch replay -- the
           tree IS the fork). Conflicts stop it loudly; resolve, git add, then --sync-back.
-  1b. scripts/revendor.sh --sync-back                   # copy merged trees in + bump UPSTREAM_VLLM_VERSION
-  2. git diff && git commit                             # review + commit the vendored trees
+  1b. scripts/revendor.sh --sync-back                   # copy the merged tree in + bump UPSTREAM_VLLM_VERSION
+  2. git diff && git commit                             # review + commit the vendored tree
   3. OWNER=<you> scripts/build_image_source.sh          # from-source sm_80+sm_86 build → push ghcr :<tag>-ampere-<cu> + :latest
   4. scripts/release-matrix/run.sh <blocks>             # MANDATORY e2e gate on the new image AND the previous
                                                         # release, same night, same box (see "Release matrix")
@@ -39,7 +39,7 @@ once on the previous release, and compare the two log sets block by block.
 ```bash
 export MODELS=/path/to/staged/checkpoints GSM8K_JSONL=/path/to/gsm8k.jsonl
 IMG=<candidate> LOGDIR=out/new bash scripts/release-matrix/run.sh t0_smoke t6m_mtp t6_spec t5_quant \
-  t7_hybrid t4_gemma t1_famp t2_batch t12_mm t6g_greedy t10_perf t9_soak
+  t7_hybrid t4_gemma t12_mm t6g_greedy t10_perf t9_soak
 IMG=<previous>  LOGDIR=out/old bash scripts/release-matrix/run.sh ...   # same blocks
 ```
 
@@ -61,8 +61,7 @@ OWNER=<you> scripts/build_image_source.sh                         # cu130 (defau
 OWNER=<you> CUDA_VERSION=12.9.1 scripts/build_image_source.sh     # cu129 broad-compat variant
 ```
 
-`build_image_source.sh` builds vLLM from `vllm/` (the vLLM image, plus an optional overlay of the
-vendored `flashinfer/`, skipped by default because it is plain upstream), tags
+`build_image_source.sh` builds vLLM from `vllm/`, tags
 `:<tag>-ampere-<cu>` + `:latest` (fork releases add `:X.Y`, e.g. `:0.3`), and `--push`es. `VLLM_TAG` defaults
 to `UPSTREAM_VLLM_VERSION`; `TORCH_CUDA_ARCH_LIST` defaults to `8.0 8.6` (all Ampere). It uses GHA
 registry cache only when run inside Actions; locally it uses docker's own layer cache.
