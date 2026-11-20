@@ -71,6 +71,7 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    max_decode_query_len,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -1135,6 +1136,11 @@ class FlashAttentionImpl(AttentionImpl):
         )
         # Cache the batch invariant result for use in forward passes
         self.batch_invariant_enabled = envs.VLLM_BATCH_INVARIANT
+        # [Ampere fork] Widest spec-decode verify query; the fwd_kvcache verify route
+        # below must not catch a lone uniform prefill chunk.
+        self.max_verify_q_len = (
+            max_decode_query_len(vllm_config) if vllm_config is not None else 1
+        )
 
         if is_quantized_kv_cache(
             self.kv_cache_dtype
@@ -1451,7 +1457,7 @@ class FlashAttentionImpl(AttentionImpl):
                 envs.VLLM_FA2_KVCACHE_VERIFY
                 and flash_attn_kvcache_verify is not None
                 and self.vllm_flash_attn_version == 2
-                and q_len > 1
+                and 1 < q_len <= self.max_verify_q_len
                 and num_actual_tokens == num_reqs * q_len
                 and causal is True
                 and dynamic_causal is None
@@ -1474,7 +1480,8 @@ class FlashAttentionImpl(AttentionImpl):
                 # Decided once per (num_reqs, q_len) graph at capture time; log it
                 # so a silently dead gate shows up in the serve log.
                 logger.info_once(
-                    "[Ampere fork] FA2 fwd_kvcache verify engaged (q_len=%d, capturing=%s)",
+                    "[Ampere fork] FA2 fwd_kvcache verify engaged "
+                    "(q_len=%d, capturing=%s)",
                     q_len,
                     torch.cuda.is_current_stream_capturing(),
                 )
