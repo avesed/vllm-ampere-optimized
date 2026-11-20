@@ -36,9 +36,7 @@ AUDIO_MODEL_SETTINGS: dict[str, dict[str, Any]] = {
             "<sound>Transcribe the input speech.<|im_end|>\n"
             "<|im_start|>assistant\n"
         ),
-        "vllm_runner_kwargs": {
-            "gpu_memory_utilization": 0.85,
-        },
+        "vllm_runner_kwargs": {},
     },
     "microsoft/VibeVoice-ASR-HF": {
         "prompt": (
@@ -55,7 +53,6 @@ AUDIO_MODEL_SETTINGS: dict[str, dict[str, Any]] = {
         "sampling_rate": 24000,
         "vllm_runner_kwargs": {
             "max_num_batched_tokens": 2048,
-            "gpu_memory_utilization": 0.85,
         },
     },
     "zai-org/GLM-ASR-Nano-2512": {
@@ -69,13 +66,8 @@ AUDIO_MODEL_SETTINGS: dict[str, dict[str, Any]] = {
 }
 
 
-@pytest.mark.parametrize("model_id", list(AUDIO_MODEL_SETTINGS))
-def test_transformers_audio_generation(
-    hf_runner: type[HfRunner],
-    vllm_runner: type[VllmRunner],
-    monkeypatch,
-    model_id: str,
-):
+@pytest.fixture(autouse=True)
+def use_spawn_for_audio_models(monkeypatch):
     """Single-process workaround for V1 fork safety deadlock issue
     (vllm-project/vllm/issues/17676). Running multiple audio models together
     under pytest can cause (possibly flaky) hangs, so they are grouped under
@@ -87,6 +79,13 @@ def test_transformers_audio_generation(
     disable_envs_cache()
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
+
+@pytest.mark.parametrize("model_id", list(AUDIO_MODEL_SETTINGS))
+def test_transformers_audio_generation(
+    hf_runner: type[HfRunner],
+    vllm_runner: type[VllmRunner],
+    model_id: str,
+):
     settings = AUDIO_MODEL_SETTINGS[model_id]
     audio_lora_path = settings.get("audio_lora_path")
 

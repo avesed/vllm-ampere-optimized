@@ -128,6 +128,11 @@ class FlashAmpereBackend(FlashAttentionBackend):
         return FlashAmpereImpl
 
     @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # The legs classify and slice from CPU query lens; they must match the GPU ones.
+        return False
+
+    @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         # Ampere only (sm_80/sm_86/sm_89). Hopper/Blackwell have better backends; non-Ampere
         # gets "compute capability not supported" -> selector falls back to FLASH_ATTN.
