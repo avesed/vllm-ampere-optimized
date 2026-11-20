@@ -39,11 +39,13 @@ once on the previous release, and compare the two log sets block by block.
 ```bash
 export MODELS=/path/to/staged/checkpoints GSM8K_JSONL=/path/to/gsm8k.jsonl
 IMG=<candidate> LOGDIR=out/new bash scripts/release-matrix/run.sh t0_smoke t6m_mtp t6_spec t5_quant \
-  t7_hybrid t4_gemma t1_famp t2_batch t12_mm t5e_equiv t6g_greedy t10_perf t9_soak
+  t7_hybrid t4_gemma t1_famp t2_batch t12_mm t6g_greedy t10_perf t9_soak
 IMG=<previous>  LOGDIR=out/old bash scripts/release-matrix/run.sh ...   # same blocks
 ```
 
 - Each block serves fixed checkpoint directory names under `MODELS` (see its `serve` lines).
+- W4A8 blocks (T5.2, T5.4, T12.2, T12.7) serve through `--quantization humming` since the vLLM 0.34
+  move. A pre-0.34 image ran W4A8 through Marlin, so those rows do not compare across that boundary.
 - `run.sh` first scans `MODELS` for lost-write holes (`ckpt_holes.py`, zeroed 4 MiB extents) and refuses
   to run if any checkpoint has them; list a known-holey checkpoint in `CKPT_HOLES_OK` to allow it.
 - Containers carry the label `vllm-release-matrix=1`; cleanup only ever selects on that label.
@@ -59,8 +61,8 @@ OWNER=<you> scripts/build_image_source.sh                         # cu130 (defau
 OWNER=<you> CUDA_VERSION=12.9.1 scripts/build_image_source.sh     # cu129 broad-compat variant
 ```
 
-`build_image_source.sh` builds vLLM from `vllm/` (three-stage: vLLM image, the vendored FlashInfer
-overlay from `flashinfer/`, then the famp_marlin `.so` from `flashampere/marlin/csrc`), tags
+`build_image_source.sh` builds vLLM from `vllm/` (the vLLM image, plus an optional overlay of the
+vendored `flashinfer/`, skipped by default because it is plain upstream), tags
 `:<tag>-ampere-<cu>` + `:latest` (fork releases add `:X.Y`, e.g. `:0.3`), and `--push`es. `VLLM_TAG` defaults
 to `UPSTREAM_VLLM_VERSION`; `TORCH_CUDA_ARCH_LIST` defaults to `8.0 8.6` (all Ampere). It uses GHA
 registry cache only when run inside Actions; locally it uses docker's own layer cache.

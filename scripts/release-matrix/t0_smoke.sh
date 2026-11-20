@@ -1,6 +1,6 @@
 #!/bin/bash
-# T0 -- smoke: what the image claims to be, the FA2 capture contract, default-env serve, the V2
-# escape hatch, and the in-image famp dispatch unit tests.
+# T0 -- smoke: what the image claims to be, the FA2 capture contract, default-env serve, the runner
+# pin check, and the in-image famp dispatch unit tests.
 set -u
 cd "$(dirname "$0")"; LOG=${LOGDIR:-$(pwd)}/t0.log; : > "$LOG"; . ./lib.sh
 
@@ -18,7 +18,7 @@ import importlib.metadata as md, torch, flashinfer, vllm
 print("vllm", vllm.__version__, "| torch", torch.__version__, "| flashinfer", flashinfer.__version__)
 eps = sorted(e.name for e in md.entry_points(group="vllm.general_plugins"))
 print("general_plugins:", eps)
-import flashampere.marlin.kernel as k; print("fampmarlin kernel import OK:", k.FampMarlinKernel.__name__)
+import humming; print("humming", getattr(humming, "__version__", "?"))
 import vllm.v1.attention.backends.flashampere.kernels as fk; print("famp kernels import OK")
 '
 
@@ -37,8 +37,8 @@ echo "  image env pin: $(docker inspect -f '{{range .Config.Env}}{{println .}}{{
   | grep -c '^VLLM_USE_V2_MODEL_RUNNER=') (expect 0)" >> "$LOG"
 
 say "T0.7 famp dispatch unit tests against the in-image flashampere"
-# The tests import the repo-root `flashampere` package; in the image famp lives inside vLLM and
-# /opt/famp/flashampere holds only the marlin plugin, so alias the in-image package before collection.
+# The tests import the repo-root `flashampere` package; in the image famp lives inside vLLM, so alias
+# the in-image package before collection.
 oneshot t0-pytest -v "$(pwd)/../../vllm/tests/v1/attention":/t:ro -- -c '
 import importlib, pkgutil, subprocess, sys
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pytest"], check=False)

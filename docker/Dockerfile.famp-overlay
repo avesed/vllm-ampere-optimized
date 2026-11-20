@@ -5,7 +5,7 @@
 # prefill/include and JIT-builds its kernels at runtime -- so the only things this has to add are
 # the package, the vllm.general_plugins entry point, and the cuda.py backend prepend.
 #
-# NOT a release path: the vendored fp16-PV FlashInfer and the famp_marlin .so are not here.
+# NOT a release path: the vendored fp16-PV FlashInfer is not here.
 #   docker build -f docker/Dockerfile.famp-overlay -t famp-overlay:0.28 .
 ARG BASE=vllm/vllm-openai:v0.28.0
 FROM ${BASE}

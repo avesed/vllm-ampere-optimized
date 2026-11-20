@@ -5,11 +5,9 @@ Adding a validated model = add ONE entry to ``PROFILES``. ``apply_famp_profile``
 config handler (e.g. the Gemma4 TRITON-force gate) reads the env AND before worker subprocesses are
 spawned -- so the ``VLLM_FAMP_*`` env it sets is both seen by that gate and inherited by every worker.
 
-Scope: only the famp ATTENTION path is routed here (it needs explicit env). The famp MARLIN kernel
-self-gates (plugin presence + built arch + ``can_implement``), so it needs no per-model flag -- the
-``marlin`` field below is DOCUMENTATION only (the end-to-end validation status per architecture).
+Scope: only the famp ATTENTION path is routed here (it needs explicit env).
 
-Unlisted architectures get stock defaults (no famp attention); marlin still self-gates as usual.
+Unlisted architectures get stock defaults (no famp attention).
 User-set env always wins: every write uses ``setdefault`` so an explicit ``VLLM_FLASHAMPERE=0`` (etc.)
 is never overridden.
 """
@@ -31,14 +29,13 @@ except Exception:  # never let a logging import break config setup
 
 @dataclass(frozen=True)
 class FampProfile:
-    """Per-architecture famp routing. Attention fields are applied; marlin/note are documentation."""
+    """Per-architecture famp routing. Attention fields are applied; note is documentation."""
 
     # --- attention routing (actively applied to the environment) ---
     flashampere: bool = False  # select the FlashAmpere CUSTOM attention backend
     own_prefill: bool = False  # hd512 prefill via famp's vendored FI (relaxed IsInvalid + fp16-PV)
     xqa_hd512: bool = False     # hd512 decode via famp's own vendored XQA kernel
-    # --- documentation only (famp-marlin self-gates; NOT applied here) ---
-    marlin: str = ""            # famp-marlin (W4A8/W4A16) end-to-end validation status for this arch
+    # --- documentation only (NOT applied here) ---
     note: str = ""
 
 
@@ -55,7 +52,6 @@ PROFILES: dict[str, FampProfile] = {
         flashampere=True,
         own_prefill=True,
         xqa_hd512=True,
-        marlin="W4A16 data-free RTN validated coherent; W4A8-int8 NO-GO (L0 down_proj outlier -> SmoothQuant)",
         note="hd512 full-attn -> famp (prefill 1.9-2.9x + XQA gemm0-once decode 1.5-2.8x vs TRITON); hd256 sliding -> TRITON",
     ),
     "Gemma4ForConditionalGeneration": FampProfile(
@@ -71,21 +67,17 @@ PROFILES: dict[str, FampProfile] = {
         note="hd512 full-attn text-only -> famp (prefill+XQA-decode); hd256 sliding -> TRITON",
     ),
 
-    # -- Qwen3.6-27B dense (hd128). famp MARLIN validated (W4A16 bit-exact vs stock; W4A8-int8
-    #    engaged + coherent). famp ATTENTION is NOT beneficial: hd128 sinks to stock FA (the fp16-PV
-    #    prefill leg is 0 e2e), so attention stays default (FLASH_ATTN). Listed for the marlin doc.
+    # -- Qwen3.6-27B dense (hd128). famp ATTENTION is NOT beneficial: hd128 sinks to stock FA (the
+    #    fp16-PV prefill leg is 0 e2e), so attention stays default (FLASH_ATTN).
     "Qwen3_5ForConditionalGeneration": FampProfile(
         flashampere=False,
-        marlin="W4A16 famp bit-exact vs stock _C (GSM8K 87.5%); W4A8-int8 engaged + coherent (85%)",
-        note="dense hd128 -> famp attention gives 0 e2e (sinks to FA); marlin auto-engages",
+        note="dense hd128 -> famp attention gives 0 e2e (sinks to FA)",
     ),
 
-    # -- Qwen3.6-35B-A3B MoE. Quantized GEMMs are all MoE experts on stock CompressedTensorsWNA16
-    #    MarlinMoEMethod (famp deliberately does NOT vendor MoE); dense/attention linears are bf16.
-    #    So famp MARLIN does not engage and famp ATTENTION is not beneficial -> all defaults.
+    # -- Qwen3.6-35B-A3B MoE. Quantized GEMMs are all MoE experts on stock kernels; dense/attention
+    #    linears are bf16. famp ATTENTION is not beneficial -> all defaults.
     "Qwen3_5MoeForConditionalGeneration": FampProfile(
         flashampere=False,
-        marlin="N/A - experts use stock Marlin MoE (famp not vendored for MoE); dense/attn = bf16",
         note="MoE + GDN hybrid; serves coherently on stock paths (GSM8K 85-95%)",
     ),
 }

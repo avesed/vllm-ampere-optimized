@@ -1,6 +1,0 @@
-__pycache__/
-*.pyc
-*.so
-*.o
-build/
-_cuda_inc/

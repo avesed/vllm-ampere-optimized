@@ -7,10 +7,11 @@ The maintainer's mental model. Why this repo is shaped the way it is.
 This repo vendors the **complete** modified source — `vllm/` and `flashinfer/`, at the upstream tags
 recorded in `UPSTREAM_VLLM_VERSION` and `flashinfer/version.txt` — with every edit baked in, plus the
 fork-owned `flashampere/` package (attention backend +
-vendored XQA / FA2-prefill / Marlin kernels). It is **not** a patch-overlay, because the native work is
-`.cu`/`.cuh` kernels (the fp16-PV FlashInfer prefill kernel, the vendored famp_marlin GEMM — which
-now carries the int8 8-row Marlin decode tile — and the XQA kernels) that a pip-overlay onto an official
-wheel/image physically cannot carry. Native code ships only from a real source build — which is exactly
+vendored XQA / FA2-prefill kernels). It is **not** a patch-overlay, because the native work is
+`.cu`/`.cuh` kernels (the fp16-PV FlashInfer prefill kernel and the XQA kernels) and a pinned
+flash-attention fork commit, which a pip-overlay onto an official wheel/image physically cannot carry.
+(The vendored famp_marlin W4A8 GEMM was retired with the vLLM 0.34 move: upstream removed Marlin
+W4A8, and `--quantization humming` serves int8 activations on Ampere faster than famp_marlin did.) Native code ships only from a real source build — which is exactly
 why the source is vendored rather than patched at build time. (The old int8-QK attention backend was
 removed 2026-06-25 — measured net-negative; its kernel edits remain inert in the vendored `flashinfer/`
 tree because they share files with the fp16-PV patch.)
@@ -23,8 +24,7 @@ See `docs/PATCHING.md` and `patches/README.md`.
 ## One build path: local, from source
 
 The image is built **from the vendored source on a local GPU box** (`scripts/build_image_source.sh`,
-three stages: vLLM → sm_80+sm_86 fatbin, the vendored FlashInfer overlay, then the famp_marlin `.so`
-compiled from `flashampere/marlin/csrc`) and pushed to ghcr **by the maintainer**. There is **no CI build**: a from-source vLLM CUDA build needs a GPU, and a self-hosted
+the vLLM image plus an optional overlay of the vendored FlashInfer) and pushed to ghcr **by the maintainer**. There is **no CI build**: a from-source vLLM CUDA build needs a GPU, and a self-hosted
 GPU runner on a **public** repo is a security risk — a malicious PR could run arbitrary code on the
 runner. The only CI is one github-hosted canary (`watch-upstream`) that opens a one-time reminder issue
 per new upstream release; it never builds or pushes. See `docs/RELEASE.md`.
