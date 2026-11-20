@@ -951,7 +951,9 @@ ARG FLASHINFER_VERSION=0.6.18.post1
 RUN --mount=type=cache,target=/opt/uv/cache \
     if [ "${INSTALL_RUBIN_PRERELEASE}" != "true" ]; then \
         uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
-            --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+            --index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.') \
+        && uv pip install --system --no-deps flashinfer-cubin==${FLASHINFER_VERSION} \
+            --index-url https://flashinfer.ai/whl/; \
     fi
 
 # ============================================================

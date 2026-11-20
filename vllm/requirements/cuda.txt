@@ -11,11 +11,10 @@ torchvision==0.29.0 # Required for phi3v processor. See https://github.com/pytor
 torchcodec >= 0.14
 PyNvVideoCodec==2.0.4
 # FlashInfer should be updated together with the Dockerfile
-# flashinfer-cubin is not on PyPI since 0.6.14; setup.py excludes it from
-# install_requires so the published wheel does not carry an unresolvable pin
---extra-index-url https://flashinfer.ai/whl/
+# flashinfer-cubin is not on PyPI since 0.6.14: the Dockerfile installs it from
+# flashinfer.ai on its own. An index line here would apply to every package, and
+# that index answers 503 for names it does not host.
 flashinfer-python==0.6.18.post1
-flashinfer-cubin==0.6.18.post1
 apache-tvm-ffi==0.1.11
 tilelang==0.1.12
 # >=1.31.0 keeps execution plans alive for the CUDA graphs recorded from them
