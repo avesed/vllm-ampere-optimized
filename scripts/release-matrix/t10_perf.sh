@@ -61,6 +61,7 @@ if serve t10-mtp 8190 Qwen3.6-27B-W4A16 --ARGS-- --max-model-len 20000 --max-num
      --no-enable-prefix-caching \
      --speculative-config '{"method":"mtp","num_speculative_tokens":2}'; then
   bench 8190 decode 150 400; bench 8190 decode 14000 400
+  echo "  FA2 verify engaged: $(docker logs t10-mtp 2>&1 | grep -ac 'FA2 fwd_kvcache verify engaged.*capturing=True') capture lines (expect >0)" >> "$LOG"
 fi
 matrix_rm t10-mtp
 

@@ -61,7 +61,7 @@ PY
 
 say "T9.1 soak ${MINUTES}min -- 27B-W4A16 + DFlash K=7, famp on, W=16"
 if serve t9-soak 8186 Qwen3.6-27B-W4A16 \
-     -e VLLM_FLASHAMPERE=1 -e VLLM_USE_V2_MODEL_RUNNER=0 -e VLLM_FLASHAMPERE_XQA_VERIFY=1 \
+     -e VLLM_FLASHAMPERE=1 -e VLLM_FLASHAMPERE_XQA_VERIFY=1 \
      --ARGS-- --max-num-seqs 128 \
      --speculative-config '{"method":"dflash","model":"/models/Qwen3.6-27B-DFlash","num_speculative_tokens":7}'; then
   soak dflash "$MINUTES"

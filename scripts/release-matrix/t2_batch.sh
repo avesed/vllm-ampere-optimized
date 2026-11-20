@@ -22,7 +22,7 @@ PY
 
 say "T2.1/T2.3 batch prefill ON, fp16-served -- gate boundary (FAMP_BP_MIN_TOKENS=512)"
 if serve t2-on 8184 Qwen3.6-27B-W4A16 \
-     -e VLLM_FLASHAMPERE=1 -e VLLM_USE_V2_MODEL_RUNNER=0 -e VLLM_FAMP_BATCH_PREFILL=1 \
+     -e VLLM_FLASHAMPERE=1 -e VLLM_FAMP_BATCH_PREFILL=1 \
      --ARGS-- --dtype float16; then
   ask 8184 40  "short ~416tok (must stay on the per-request leg)"
   ask 8184 200 "long ~2016tok (batch path expected)"
@@ -32,7 +32,7 @@ matrix_rm t2-on
 
 say "T2.5/T2.6 FAMP_BP_NOZERO=1 + concurrency W=8"
 if serve t2-nozero 8184 Qwen3.6-27B-W4A16 \
-     -e VLLM_FLASHAMPERE=1 -e VLLM_USE_V2_MODEL_RUNNER=0 -e VLLM_FAMP_BATCH_PREFILL=1 -e FAMP_BP_NOZERO=1 \
+     -e VLLM_FLASHAMPERE=1 -e VLLM_FAMP_BATCH_PREFILL=1 -e FAMP_BP_NOZERO=1 \
      --ARGS-- --dtype float16; then
   ask 8184 200 "long, NOZERO=1"
   python3 - <<'PY' >> "$LOG" 2>&1

@@ -40,7 +40,7 @@ fi
 matrix_rm t12-int8
 
 say "T12.3 27B W4A16 + famp (bf16-served -> bf16cvt prefill leg on the hd256 layers)"
-if serve t12-famp $P Qwen3.6-27B-W4A16 -e VLLM_FLASHAMPERE=1 -e VLLM_USE_V2_MODEL_RUNNER=0; then
+if serve t12-famp $P Qwen3.6-27B-W4A16 -e VLLM_FLASHAMPERE=1; then
   probe battery --video "$VID"; probe concurrency 8 48; fired t12-famp; backends t12-famp; dead t12-famp
 fi
 matrix_rm t12-famp
@@ -52,7 +52,7 @@ spec_mm(){ # id name method draft|- K
   cfg+="}"
   say "$id spec $method K=$K + images (verification is lossless, so answers must match T12.1)"
   if serve "$name" $P Qwen3.6-27B-W4A16 \
-       -e VLLM_FLASHAMPERE=1 -e VLLM_USE_V2_MODEL_RUNNER=0 -e VLLM_FLASHAMPERE_XQA_VERIFY=1 \
+       -e VLLM_FLASHAMPERE=1 -e VLLM_FLASHAMPERE_XQA_VERIFY=1 \
        --ARGS-- --max-num-seqs 128 --speculative-config "$cfg"; then
     probe battery --video "$VID"; probe concurrency 8 48; accept "$name"; dead "$name"
   fi
@@ -69,7 +69,7 @@ fi
 matrix_rm t12-moe
 
 say "T12.8 gemma-4-12B + famp profile -- bidirectional image prefix on the hd256 sliding layers"
-if serve t12-gemma $P gemma-4-12B-it-bf16 -e VLLM_FLASHAMPERE=1 -e VLLM_USE_V2_MODEL_RUNNER=0; then
+if serve t12-gemma $P gemma-4-12B-it-bf16 -e VLLM_FLASHAMPERE=1; then
   probe battery; probe concurrency 8 48; backends t12-gemma; fired t12-gemma; dead t12-gemma
 fi
 matrix_rm t12-gemma

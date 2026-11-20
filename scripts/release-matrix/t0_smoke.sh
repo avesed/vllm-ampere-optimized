@@ -31,12 +31,10 @@ if serve t0-def 8180 Qwen3-8B; then
 fi
 matrix_rm t0-def
 
-say "T0.4 V2 escape hatch (VLLM_USE_V2_MODEL_RUNNER=1)"
-if serve t0-v2 8180 Qwen3-8B -e VLLM_USE_V2_MODEL_RUNNER=1; then
-  docker logs t0-v2 2>&1 | grep -aiE "model runner v2|GPUModelRunnerV2|gpu/model_runner" | head -2 >> "$LOG"
-  canary 8180
-fi
-matrix_rm t0-v2
+say "T0.4 runner: MRv2 is the only runner since vLLM 0.34; the image must not pin VLLM_USE_V2_MODEL_RUNNER"
+# Any value but 1 aborts startup on 0.34, so a stale ENV left in a Dockerfile kills every serve.
+echo "  image env pin: $(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$IMG" \
+  | grep -c '^VLLM_USE_V2_MODEL_RUNNER=') (expect 0)" >> "$LOG"
 
 say "T0.7 famp dispatch unit tests against the in-image flashampere"
 # The tests import the repo-root `flashampere` package; in the image famp lives inside vLLM and

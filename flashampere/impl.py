@@ -33,15 +33,14 @@ def _caps() -> capability.FlashAmpereCaps:
 
 
 def _verify_upper_bound() -> int:
-    """Max query length treated as spec-decode verify (= reorder_batch_threshold = 1 + K). A
-    prefill chunk has q_len above this; a verify step at or below it. 1 means no spec -> no verify."""
+    """Max query length treated as spec-decode verify (= the builders' decode threshold, 1 + K plus
+    any drafting slots). A prefill chunk has q_len above this; a verify step at or below it. 1 means
+    no spec -> no verify."""
     try:
         from vllm.config import get_current_vllm_config
+        from vllm.v1.attention.backend import max_decode_query_len
 
-        sc = get_current_vllm_config().speculative_config
-        if sc is not None and sc.num_speculative_tokens is not None:
-            mult = 2 if getattr(sc, "parallel_drafting", False) else 1
-            return 1 + mult * sc.num_speculative_tokens
+        return max_decode_query_len(get_current_vllm_config())
     except Exception:
         pass
     return 1
@@ -95,8 +94,11 @@ class FlashAmpereImpl(FlashAttentionImpl):
             sw = None if tuple(sw) == (-1, -1) else sw
         elif sw == -1:
             sw = None
+        causal = getattr(m, "causal", True)
         return (
-            isinstance(getattr(m, "causal", True), torch.Tensor)
+            isinstance(causal, torch.Tensor)
+            # Non-causal batches (DFlash/DSpark drafters) -- the legs and xqa_verify are causal-only.
+            or causal is False
             or getattr(m, "mm_prefix_query_range_tensor", None) is not None
             or sw is not None
             or getattr(m, "rswa_prefix_lens", None) is not None
@@ -139,6 +141,8 @@ class FlashAmpereImpl(FlashAttentionImpl):
         # guard -> stock FA/TRITON handles their real mm_prefix/SWA.)
         if (
             m is None
+            # KV-update bypass (key=None): the legs write the KV cache themselves.
+            or key is None
             or output_scale is not None
             or output_block_scale is not None
             or getattr(self, "dcp_world_size", 1) > 1

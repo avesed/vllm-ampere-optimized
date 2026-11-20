@@ -38,6 +38,8 @@ say "T6.1 MTP 27B K=2 (FULL graphs, FA2 kvcache verify default-on)"
 if serve t6m-mtp 8187 Qwen3.6-27B-W4A16 --ARGS-- --max-model-len 20000 --max-num-seqs 64 \
      --speculative-config '{"method":"mtp","num_speculative_tokens":2}'; then
   docker logs t6m-mtp 2>&1 | grep -aE "Capturing CUDA graphs|cudagraph_mode|CUDAGraphMode" | tail -2 >> "$LOG"
+  # MRv2 bakes the verify route into each FULL graph once; no "capturing=True" line = dead gate.
+  echo "  FA2 verify engaged: $(docker logs t6m-mtp 2>&1 | grep -ac 'FA2 fwd_kvcache verify engaged.*capturing=True') capture lines (expect >0)" >> "$LOG"
   echo "  K+1 trigger (expect prompt_tokens=3, coherent continuation):" >> "$LOG"
   complete 8187 "The sky is" 40
   complete 8187 "Paris is the" 40
