@@ -20,7 +20,7 @@ name would silently change KV cache behaviour. Only``supports_sink`` and the
 two kernel wrappers differ from the parent.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -33,6 +33,7 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
+    get_mla_metadata,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -50,6 +51,10 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
     FlashMLA kernels, which fold it into the softmax denominator:
     ``out *= exp(lse) / (exp(lse) + exp(sink))``.
     """
+
+    # The sinks are sharded by head with TP, and ShardQ runs every head on
+    # each rank.
+    supports_shardq: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -178,10 +183,11 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         kv_c_and_k_pe_cache: torch.Tensor,
         topk_indices: torch.Tensor,
         kernel_metadata: FlashMLASparseMetadata.FP8KernelMetadata,
+        topk_length: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # q shape: (batch, seq_len, num_heads, head_dim)
         actual_num_heads = q.size(2)
-        padded_num_heads = self.fp8_decode_padded_heads
+        padded_num_heads = self._compute_fp8_decode_padded_heads(actual_num_heads)
         attn_sink = self._sinks_for_query(q, head_dim=2, kernel_heads=padded_num_heads)
 
         # Pad query if needed (kernel only supports h_q = 64 or 128)
@@ -200,11 +206,17 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             block_table=kernel_metadata.dummy_block_table,
             head_dim_v=512,
             cache_seqlens=kernel_metadata.cache_lens,
-            tile_scheduler_metadata=kernel_metadata.scheduler_metadata,
+            # The shared schedule is only valid without `topk_length`.
+            tile_scheduler_metadata=(
+                kernel_metadata.scheduler_metadata
+                if topk_length is None
+                else get_mla_metadata()[0]
+            ),
             is_fp8_kvcache=True,
             indices=topk_indices,
             softmax_scale=self.softmax_scale,
             attn_sink=attn_sink,
+            topk_length=topk_length,
         )
 
         # Slice output and lse back to actual head count if we padded
@@ -228,9 +240,9 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             -1, 1, kv_c_and_k_pe_cache.shape[-1]
         )
 
-        # NOTE(Chen): kernel requires num_local_head to be a multiple of
-        # 64 on hopper and 128 on blackwell. Pad from q's head count, not
-        # self.num_heads: under DCP the heads are all-gathered before this.
+        # NOTE(Chen): kernel requires num_local_head to be a multiple of 64.
+        # Pad from q's head count, not self.num_heads: under DCP the heads are
+        # all-gathered before this.
         if actual_num_heads is None:
             actual_num_heads = q.shape[1]
         padded_num_heads = (

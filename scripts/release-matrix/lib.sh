@@ -53,6 +53,11 @@ serve(){ # name port model [extra docker args...] [--ARGS-- extra server args...
   echo "TIMEOUT (container alive but never served)" >> "$LOG"; return 1
 }
 
+# W4A8 on 0.34+: Marlin no longer takes 8-bit activations; Humming serves a W4A16 checkpoint with
+# int8 per-token activations. Usage: serve <name> <port> <model> "${HUM_ENV[@]}" --ARGS-- "${HUM_ARGS[@]}"
+HUM_ENV=(-e 'VLLM_HUMMING_INPUT_QUANT_CONFIG={"dtype":"int8","group_size":0}')
+HUM_ARGS=(--quantization humming)
+
 # GSM8K over the API with one fixed protocol (sampled -- never greedy on these thinking models,
 # 0.6/0.95/20, \boxed{} answers). Only ever compare a number to the same call on another image.
 gsm8k(){ # port tag [n]
@@ -102,7 +107,5 @@ print(f"  canary: {hits}/{len(qs)} degenerate")
 PY
 }
 
-fired(){ echo "  famp fired: $(docker logs "$1" 2>&1 | grep -ac 'FLASHAMPERE .* FIRED')" >> "$LOG"
-         docker logs "$1" 2>&1 | grep -a 'FLASHAMPERE .* FIRED' | tail -2 >> "$LOG"; }
 backends(){ docker logs "$1" 2>&1 | grep -aE "Using .*attention backend" | grep -avi all-reduce | sort -u >> "$LOG"; }
 accept(){ docker logs "$1" 2>&1 | grep -a "acceptance length" | tail -1 >> "$LOG"; }

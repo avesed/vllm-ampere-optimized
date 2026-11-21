@@ -4,16 +4,18 @@ The maintainer's mental model. Why this repo is shaped the way it is.
 
 ## Vendored fork, built from source
 
-This repo vendors the **complete** modified source — `vllm/` and `flashinfer/`, at the upstream tags
-recorded in `UPSTREAM_VLLM_VERSION` and `flashinfer/version.txt` — with every edit baked in, plus the
-fork-owned `flashampere/` package (attention backend +
-vendored XQA / FA2-prefill / Marlin kernels). It is **not** a patch-overlay, because the native work is
-`.cu`/`.cuh` kernels (the fp16-PV FlashInfer prefill kernel, the vendored famp_marlin GEMM — which
-now carries the int8 8-row Marlin decode tile — and the XQA kernels) that a pip-overlay onto an official
-wheel/image physically cannot carry. Native code ships only from a real source build — which is exactly
-why the source is vendored rather than patched at build time. (The old int8-QK attention backend was
-removed 2026-06-25 — measured net-negative; its kernel edits remain inert in the vendored `flashinfer/`
-tree because they share files with the fp16-PV patch.)
+This repo vendors the **complete** modified vLLM source — `vllm/`, at the upstream tag recorded in
+`UPSTREAM_VLLM_VERSION` — with every edit baked in. It is **not** a patch-overlay, because the image also
+pins a flash-attention fork commit (the capture-safe paged-KV bounds check the FA2 spec-verify route
+needs) that is compiled into vLLM's `_vllm_fa2_C`, which a pip-overlay onto an official wheel/image
+physically cannot carry. Native code ships only from a real source build — which is exactly why the
+source is vendored rather than patched at build time.
+
+The fork used to carry more native code; all of it was retired with the vLLM 0.34 move once upstream
+caught up: the famp_marlin W4A8 GEMM (upstream `--quantization humming` serves int8 activations on
+Ampere faster), the flashampere attention backend (+1.5% prefill at 32k, nothing below), and with it
+the vendored FlashInfer tree (the image now uses the FlashInfer wheel vLLM pins). They remain in git
+history.
 
 `patches/` is applied by **nothing** — not at build time, not at re-vendor time. It is the written
 record of what the fork changed and why; the tree is the fork, and every change is a hand edit in it.
@@ -22,9 +24,8 @@ See `docs/PATCHING.md` and `patches/README.md`.
 
 ## One build path: local, from source
 
-The image is built **from the vendored source on a local GPU box** (`scripts/build_image_source.sh`,
-three stages: vLLM → sm_80+sm_86 fatbin, the vendored FlashInfer overlay, then the famp_marlin `.so`
-compiled from `flashampere/marlin/csrc`) and pushed to ghcr **by the maintainer**. There is **no CI build**: a from-source vLLM CUDA build needs a GPU, and a self-hosted
+The image is built **from the vendored source on a local GPU box** (`scripts/build_image_source.sh`)
+and pushed to ghcr **by the maintainer**. There is **no CI build**: a from-source vLLM CUDA build needs a GPU, and a self-hosted
 GPU runner on a **public** repo is a security risk — a malicious PR could run arbitrary code on the
 runner. The only CI is one github-hosted canary (`watch-upstream`) that opens a one-time reminder issue
 per new upstream release; it never builds or pushes. See `docs/RELEASE.md`.

@@ -11,6 +11,13 @@ Status legend: ✅ shipped · 🔨 build-now · ⏳ gated on measurement · 🧪
 
 ---
 
+## v0.5.0 (2026-11-21): moved to vLLM 0.34, retired what upstream now covers
+vLLM 0.34 is Model Runner V2 only and dropped Marlin W4A8. Retired from the fork: the W4A8 Marlin un-gate and the
+vendored famp_marlin kernel (upstream Humming W4A8 is faster on sm_86), the flashampere attention backend and its
+vendored FlashInfer/XQA kernels (+1.5% prefill at 32k only on 0.34), and the V1 DSpark/DFlash serving code (upstream
+V2 serves the heads). Still carried: the FA2 split-KV spec-decode verify route and its capture-safe flash-attention
+pin. The items below are the historical record.
+
 ## Already shipped ✅
 - **W4A8-int8 Marlin un-gate** (patch 0001) + int8 8-row decode tile (patch 0002). The flagship.
   Measured: decode = W4A16 parity (weight-bandwidth-bound); prefill **+19-49% on consumer sm_86**

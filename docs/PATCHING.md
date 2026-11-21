@@ -2,27 +2,23 @@
 
 ## There is no patch-apply step
 
-`scripts/build_image_source.sh` builds the vendored `vllm/` and `flashinfer/` trees **exactly as they
-sit in git**. No Dockerfile, no build stage, nothing applies `patches/*.patch`.
+`scripts/build_image_source.sh` builds the vendored `vllm/` tree **exactly as it sits in git**. No Dockerfile, no build stage, nothing applies `patches/*.patch`.
 
-So: **to change fork behaviour, edit `vllm/…`, `flashinfer/…` or `flashampere/…` directly and commit.**
+So: **to change fork behaviour, edit `vllm/…` directly and commit.**
 Writing or refreshing a `.patch` file changes nothing.
 
 `patches/` is a *historical record* of what the fork changed and why — worth reading, and worth
 appending to when you add something substantial, but it is not executable. Most of it no longer
-applies to a current upstream tag, and at least one entry (`0002`) describes a kernel edit that now
-lives somewhere else entirely (`flashampere/marlin/`).
-
-`flashampere/` at the project root is the source of truth for the attention backend; its copy under
-`vllm/vllm/v1/attention/backends/flashampere/` must be kept in sync by hand.
+applies to a current upstream tag, and several entries describe code the fork has since retired
+(famp_marlin, flashampere, the FlashInfer fp16-PV kernel).
 
 ## Moving to a new upstream tag
 
 Because the tree *is* the fork, an upstream bump is a **3-way merge**, not a replay:
 
 ```bash
-scripts/revendor.sh v0.28.0 v0.6.16.post3   # merges both trees in .revendor/, stops on conflicts
-# ... resolve any conflicts in .revendor/<tree>, `git add` the results (do NOT commit) ...
+scripts/revendor.sh v0.35.0                 # merges the tree in .revendor/, stops on conflicts
+# ... resolve any conflicts in .revendor/vllm, `git add` the results (do NOT commit) ...
 scripts/revendor.sh --sync-back             # copies the merged trees into the repo, bumps the marker
 git diff && git commit
 ```
@@ -55,7 +51,7 @@ conflicted):
 
 ## Native code ships from source
 
-The fork carries native (`.cu`/`.cuh`) edits — the fp16-PV FlashInfer prefill kernel, the vendored
-famp Marlin GEMM and XQA kernels — which a pip overlay onto an official wheel or image cannot carry.
+The fork pins a flash-attention fork commit (`vllm/cmake/external_projects/vllm_flash_attn.cmake`),
+which is compiled into vLLM and which a pip overlay onto an official wheel or image cannot carry.
 That is why the whole fork is vendored and built from source (`scripts/build_image_source.sh`, run on
 a local GPU box; there is no overlay path and no CI build).

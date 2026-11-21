@@ -6,7 +6,7 @@ upstream tag. The native side had no equivalent, so a merge that left one stray 
 csrc/libtorch_stable/ops.h was only discovered ~4 hours into a from-source build. Conditional
 nesting is an absolute property -- no upstream reference needed -- so this runs in seconds.
 
-    python3 scripts/check_native_guards.py [tree ...]      # default: vllm/csrc flashampere
+    python3 scripts/check_native_guards.py [tree ...]      # default: vllm/csrc
 """
 
 import pathlib
@@ -38,10 +38,7 @@ def check(path: pathlib.Path) -> str | None:
 
 
 def main() -> int:
-    roots = [pathlib.Path(a) for a in sys.argv[1:]] or [
-        pathlib.Path("vllm/csrc"),
-        pathlib.Path("flashampere"),
-    ]
+    roots = [pathlib.Path(a) for a in sys.argv[1:]] or [pathlib.Path("vllm/csrc")]
     files = [p for r in roots if r.exists() for p in r.rglob("*") if p.suffix in EXTS]
     bad = [msg for p in sorted(files) if (msg := check(p))]
     for msg in bad:

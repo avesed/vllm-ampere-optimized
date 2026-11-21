@@ -9,7 +9,7 @@
 # abnormal starts ("Here for's for 9 the") but only 0.16% fully degenerate outputs. Expected rate
 # with spec decode off, or on a healthy spec path, is 0 in thousands.
 #
-# Two serves: the flagship DFlash K=7 with flashampere on, and the default env (flashampere off)
+# Two serves: the flagship DFlash K=7, and MTP K=2 in the default env
 # with MTP K=2 -- the README's recommended config. Both keep prefix caching and async scheduling on
 # (the defaults), with identical prompts recurring so prefix-cache hits are constant.
 set -u
@@ -59,10 +59,8 @@ for r in bad[:5]: print("   ", repr(r["head"][:60]))
 PY
 }
 
-say "T9.1 soak ${MINUTES}min -- 27B-W4A16 + DFlash K=7, famp on, W=16"
-if serve t9-soak 8186 Qwen3.6-27B-W4A16 \
-     -e VLLM_FLASHAMPERE=1 -e VLLM_USE_V2_MODEL_RUNNER=0 -e VLLM_FLASHAMPERE_XQA_VERIFY=1 \
-     --ARGS-- --max-num-seqs 128 \
+say "T9.1 soak ${MINUTES}min -- 27B-W4A16 + DFlash K=7, W=16"
+if serve t9-soak 8186 Qwen3.6-27B-W4A16 --ARGS-- --max-num-seqs 128 \
      --speculative-config '{"method":"dflash","model":"/models/Qwen3.6-27B-DFlash","num_speculative_tokens":7}'; then
   soak dflash "$MINUTES"
   echo "engine alive at end: $(docker ps --filter 'name=^t9-soak$' --format '{{.Names}}' | grep -cx t9-soak)" >> "$LOG"
@@ -71,7 +69,7 @@ if serve t9-soak 8186 Qwen3.6-27B-W4A16 \
 fi
 matrix_rm t9-soak
 
-say "T9.2 soak ${MINUTES}min -- 27B-W4A16 + MTP K=2, default env (famp off), W=16"
+say "T9.2 soak ${MINUTES}min -- 27B-W4A16 + MTP K=2, default env, W=16"
 if serve t9-soak 8186 Qwen3.6-27B-W4A16 --ARGS-- --max-num-seqs 128 \
      --speculative-config '{"method":"mtp","num_speculative_tokens":2}'; then
   soak mtp "$MINUTES"
